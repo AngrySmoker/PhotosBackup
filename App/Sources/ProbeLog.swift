@@ -2,7 +2,7 @@ import Foundation
 import SwiftUI
 
 /// One line in the feasibility checklist.
-struct ProbeStep: Identifiable {
+struct ProbeStep: Identifiable, Equatable {
     enum State: Equatable {
         case pending
         case running

@@ -1,5 +1,5 @@
 import XCTest
-@testable import GPMCAuthProbe
+@testable import PhotosBackup
 
 /// Hits the real android.clients.google.com/auth endpoint. Skipped unless
 /// GPMC_LIVE=1 is set, because it needs the network and (for a full pass) a

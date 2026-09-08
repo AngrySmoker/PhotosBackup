@@ -1,6 +1,6 @@
 import XCTest
 import CryptoKit
-@testable import GPMCAuthProbe
+@testable import PhotosBackup
 
 final class GPMCClientTests: XCTestCase {
 

@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "GPMC Connect",
+  "name": "Photos Backup Connect",
   "version": "0.1.0",
-  "description": "Feasibility probe: capture the Google EmbeddedSetup oauth_token cookie and hand it to the GPMC Auth Probe app.",
+  "description": "Securely connect your Google Photos account to the Photos Backup app.",
   "icons": {
     "48": "icon-48.png",
     "96": "icon-96.png",
@@ -24,7 +24,7 @@
   "optional_host_permissions": ["*://*/*"],
   "action": {
     "default_popup": "popup.html",
-    "default_title": "GPMC Connect",
+    "default_title": "Photos Backup Connect",
     "default_icon": {
       "48": "icon-48.png",
       "96": "icon-96.png"

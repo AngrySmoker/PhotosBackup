@@ -1,4 +1,4 @@
-# GPMCAuthProbe — Safari authentication feasibility probe
+# PhotosBackup — Safari authentication feasibility probe
 
 Purpose: decide whether GPMC account onboarding can happen **entirely on an
 iPhone** via a bundled Safari web extension, or whether it needs a one-time
@@ -30,24 +30,24 @@ good, it just cannot be written down.
 ```sh
 export DEVELOPER_DIR=/Applications/Xcode-16.4.0.app/Contents/Developer
 xcodegen generate
-xcodebuild -project GPMCAuthProbe.xcodeproj -scheme GPMCAuthProbe \
+xcodebuild -project PhotosBackup.xcodeproj -scheme PhotosBackup \
   -sdk iphonesimulator \
   -destination 'platform=iOS Simulator,name=iPhone 16 Pro,OS=18.6' \
   -configuration Debug CODE_SIGNING_ALLOWED=NO build
 
-DD="$(xcodebuild -project GPMCAuthProbe.xcodeproj -scheme GPMCAuthProbe \
+DD="$(xcodebuild -project PhotosBackup.xcodeproj -scheme PhotosBackup \
   -showBuildSettings -sdk iphonesimulator 2>/dev/null \
   | awk -F' = ' '/ BUILT_PRODUCTS_DIR /{print $2; exit}')"
-xcrun simctl install "iPhone 16 Pro" "$DD/GPMCAuthProbe.app"
+xcrun simctl install "iPhone 16 Pro" "$DD/PhotosBackup.app"
 xcrun simctl launch "iPhone 16 Pro" dev.gpmc.authprobe
 ```
 
 Unit tests (offline, wire-format assertions):
 
 ```sh
-xcodebuild -project GPMCAuthProbe.xcodeproj -scheme GPMCAuthProbe \
+xcodebuild -project PhotosBackup.xcodeproj -scheme PhotosBackup \
   -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 16 Pro,OS=18.6' \
-  CODE_SIGNING_ALLOWED=NO test -only-testing:GPMCAuthProbeTests/TokenExchangeTests
+  CODE_SIGNING_ALLOWED=NO test -only-testing:PhotosBackupTests/TokenExchangeTests
 ```
 
 Live network test (reaches Google; proves the request path from iOS):
@@ -55,18 +55,18 @@ Live network test (reaches Google; proves the request path from iOS):
 ```sh
 # Rejection path — no account needed:
 TEST_RUNNER_GPMC_LIVE=1 xcodebuild ... test \
-  -only-testing:GPMCAuthProbeTests/LiveExchangeTests/testInvalidTokenIsRejectedByGoogleNotByUs
+  -only-testing:PhotosBackupTests/LiveExchangeTests/testInvalidTokenIsRejectedByGoogleNotByUs
 
 # Full path — needs a fresh oauth_token:
 TEST_RUNNER_GPMC_LIVE=1 TEST_RUNNER_GPMC_OAUTH_TOKEN=oauth_XXXX xcodebuild ... test \
-  -only-testing:GPMCAuthProbeTests/LiveExchangeTests/testFullExchangeWithRealToken
+  -only-testing:PhotosBackupTests/LiveExchangeTests/testFullExchangeWithRealToken
 ```
 
 ## Checklist status (2026-09-08 attempt 2, iOS 18.6 simulator, Xcode 16.4, unsigned)
 
 | # | Checklist step | Status | Evidence / note |
 |---|---|---|---|
-| 1 | App + Safari extension build & launch | **PASS** | `BUILD SUCCEEDED`; app launched (screenshot); `.appex` embedded in `GPMCAuthProbe.app/PlugIns/`. |
+| 1 | App + Safari extension build & launch | **PASS** | `BUILD SUCCEEDED`; app launched (screenshot); `.appex` embedded in `PhotosBackup.app/PlugIns/`. |
 | — | Extension registered with iOS | **PASS** | `simctl spawn "iPhone 16 Pro" pluginkit -mv` lists `dev.gpmc.authprobe.Extension(0.1.0)`. |
 | — | Web extension bundle shape | **PASS** | `manifest.json` at bundle root, MV3, `NSExtensionPointIdentifier = com.apple.Safari.web-extension`, `permissions: [cookies, nativeMessaging, activeTab]`, `host_permissions: [https://accounts.google.com/*]`, `optional_host_permissions: [*://*/*]`. |
 | 2 | Extension enabled in Safari settings | **PASS** | User enabled it manually in Safari settings. |
@@ -252,7 +252,7 @@ both fixed:
 
 ## Manual test script (re-running the whole flow)
 
-1. Rebuild + reinstall (commands above), launch `GPMCAuthProbe`.
+1. Rebuild + reinstall (commands above), launch `PhotosBackup`.
 2. **Open Google EmbeddedSetup in Safari** → sign in → **I agree**. The page
    then hangs on a spinner; expected.
 3. **GPMC Connect** popup → **Connect account**, **once**. Accept the
@@ -277,7 +277,7 @@ Whether `TokenEncrypted=1` shows up there determines if token binding
 ## Building an IPA for SideStore
 
 ```sh
-./Scripts/make-ipa.sh          # -> build/GPMCAuthProbe.ipa
+./Scripts/make-ipa.sh          # -> build/PhotosBackup.ipa
 ```
 
 The IPA is **deliberately unsigned**. SideStore re-signs it on device with the
@@ -307,7 +307,7 @@ cookie read work.
 
 ```
 App/Sources/
-  GPMCAuthProbeApp.swift   @main; onOpenURL + scenePhase drain the handoff
+  PhotosBackupApp.swift   @main; onOpenURL + scenePhase drain the handoff
   ContentView.swift        checklist UI + "paste an oauth_token" advanced path
   ProbeLog.swift           the 9-step observable checklist
   HandoffStore.swift       App Group drain + gpmcprobe:// ingest, single use
@@ -322,5 +322,5 @@ Extension/WebResources/
   popup.html/js   Connect account · Check for token · Dump all cookies
 GPMC/Core/                 pre-existing sketches; GPMCClient gained
                            validateReadAccess() + TokenEncrypted detection
-Tests/GPMCAuthProbeTests/  TokenExchangeTests (offline, 7), LiveExchangeTests (gated)
+Tests/PhotosBackupTests/  TokenExchangeTests (offline, 7), LiveExchangeTests (gated)
 ```

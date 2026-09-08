@@ -6,7 +6,7 @@ build/
 *.xcodeproj/project.xcworkspace/xcuserdata/
 
 # XcodeGen output is regenerated from project.yml; keep it out of history.
-GPMCAuthProbe.xcodeproj/
+PhotosBackup.xcodeproj/
 
 # SwiftPM
 .build/

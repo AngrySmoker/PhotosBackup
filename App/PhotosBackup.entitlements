@@ -6,8 +6,8 @@
 	  The production handoff path: the Safari extension process writes the
 	  captured oauth_token into this App Group container as a single-use,
 	  timestamped file; the app consumes and deletes it on next foreground.
-	  Requires a Development Team (free personal team is enough) to take effect.
-	  On an unsigned simulator build this entitlement is inert and the probe
+	  Requires a paid Development Team to take effect; free Personal Teams do
+	  not provision App Groups. When unavailable, the extension
 	  falls back to the gpmcprobe:// URL handoff (see HandoffStore.swift).
 	-->
 	<key>com.apple.security.application-groups</key>

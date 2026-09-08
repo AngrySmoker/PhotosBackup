@@ -1,4 +1,4 @@
-name: GPMCAuthProbe
+name: PhotosBackup
 
 options:
   bundleIdPrefix: dev.gpmc.authprobe
@@ -14,14 +14,13 @@ settings:
     SWIFT_VERSION: "5.9"
     TARGETED_DEVICE_FAMILY: "1"
     IPHONEOS_DEPLOYMENT_TARGET: "16.0"
-    # No paid Apple Developer account is configured on this machine, so the
-    # simulator build turns signing off. Fill DEVELOPMENT_TEAM in and flip
-    # CODE_SIGNING_ALLOWED to YES to run on a physical device.
-    DEVELOPMENT_TEAM: ""
+    # The configured Personal Team signs device builds. Simulator builds use
+    # Xcode's local signing identity, which is sufficient for Keychain access.
+    DEVELOPMENT_TEAM: QCXRK5J98S
     CODE_SIGN_STYLE: Automatic
 
 targets:
-  GPMCAuthProbe:
+  PhotosBackup:
     type: application
     platform: iOS
     sources:
@@ -33,15 +32,15 @@ targets:
       base:
         INFOPLIST_FILE: App/Resources/Info.plist
         PRODUCT_BUNDLE_IDENTIFIER: dev.gpmc.authprobe
-        CODE_SIGN_ENTITLEMENTS: App/GPMCAuthProbe.entitlements
+        CODE_SIGN_ENTITLEMENTS: App/PhotosBackup.entitlements
         GENERATE_INFOPLIST_FILE: NO
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_GENERATE_ASSET_SYMBOLS: NO
     dependencies:
-      - target: GPMCAuthProbeExtension
+      - target: PhotosBackupExtension
         embed: true
 
-  GPMCAuthProbeExtension:
+  PhotosBackupExtension:
     type: app-extension
     platform: iOS
     sources:
@@ -56,27 +55,27 @@ targets:
       base:
         INFOPLIST_FILE: Extension/Resources/Info.plist
         PRODUCT_BUNDLE_IDENTIFIER: dev.gpmc.authprobe.Extension
-        CODE_SIGN_ENTITLEMENTS: Extension/GPMCAuthProbeExtension.entitlements
+        CODE_SIGN_ENTITLEMENTS: Extension/PhotosBackupExtension.entitlements
         GENERATE_INFOPLIST_FILE: NO
 
-  GPMCAuthProbeTests:
+  PhotosBackupTests:
     type: bundle.unit-test
     platform: iOS
     sources:
-      - path: Tests/GPMCAuthProbeTests
+      - path: Tests/PhotosBackupTests
     settings:
       base:
         GENERATE_INFOPLIST_FILE: YES
         PRODUCT_BUNDLE_IDENTIFIER: dev.gpmc.authprobe.Tests
     dependencies:
-      - target: GPMCAuthProbe
+      - target: PhotosBackup
 
 schemes:
-  GPMCAuthProbe:
+  PhotosBackup:
     build:
       targets:
-        GPMCAuthProbe: all
-        GPMCAuthProbeTests: [test]
+        PhotosBackup: all
+        PhotosBackupTests: [test]
     test:
       targets:
-        - GPMCAuthProbeTests
+        - PhotosBackupTests

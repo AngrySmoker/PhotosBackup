@@ -1,5 +1,5 @@
 import XCTest
-@testable import GPMCAuthProbe
+@testable import PhotosBackup
 
 final class CredentialStoreTests: XCTestCase {
 

@@ -37,7 +37,7 @@ Concrete parameters:
 
 Does mobile Safari on `accounts.google.com/EmbeddedSetup` receive an
 `oauth_token` cookie, and does the exchange succeed from an iOS-originated
-request? The `GPMCAuthProbe` target exists to answer exactly this. If the
+request? The `PhotosBackup` target exists to answer exactly this. If the
 answer is no, the fallback is a one-time manual `oauth_token` / `auth_data`
 import under advanced setup (already sketched in `GPMCClient.AuthData`).
 

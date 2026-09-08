@@ -14,21 +14,21 @@ export DEVELOPER_DIR
 
 CONFIG="${1:-Release}"
 BUILD_DIR="$(mktemp -d)"
-OUT="$PWD/build/GPMCAuthProbe.ipa"
+OUT="$PWD/build/PhotosBackup.ipa"
 
 command -v xcodegen >/dev/null || { echo "xcodegen not found" >&2; exit 1; }
 xcodegen generate
 
-xcodebuild -project GPMCAuthProbe.xcodeproj -scheme GPMCAuthProbe \
+xcodebuild -project PhotosBackup.xcodeproj -scheme PhotosBackup \
   -sdk iphoneos -configuration "$CONFIG" \
   CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
   -derivedDataPath "$BUILD_DIR" build
 
-APP="$BUILD_DIR/Build/Products/$CONFIG-iphoneos/GPMCAuthProbe.app"
+APP="$BUILD_DIR/Build/Products/$CONFIG-iphoneos/PhotosBackup.app"
 [ -d "$APP" ] || { echo "no .app at $APP" >&2; exit 1; }
-[ -d "$APP/PlugIns/GPMCAuthProbeExtension.appex" ] \
+[ -d "$APP/PlugIns/PhotosBackupExtension.appex" ] \
   || { echo "the Safari extension is missing from the bundle" >&2; exit 1; }
-[ -f "$APP/PlugIns/GPMCAuthProbeExtension.appex/manifest.json" ] \
+[ -f "$APP/PlugIns/PhotosBackupExtension.appex/manifest.json" ] \
   || { echo "manifest.json is not at the extension bundle root" >&2; exit 1; }
 
 STAGE="$BUILD_DIR/stage"

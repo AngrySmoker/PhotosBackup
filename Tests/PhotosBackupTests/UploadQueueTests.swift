@@ -1,5 +1,5 @@
 import XCTest
-@testable import GPMCAuthProbe
+@testable import PhotosBackup
 
 /// A scripted `UploadWorker`. Each call pops the next instruction, so a test
 /// can say "fail twice, then succeed" without any network.

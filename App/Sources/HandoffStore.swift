@@ -90,6 +90,13 @@ final class HandoffStore: ObservableObject {
         return handoff
     }
 
+    /// The signed App Group flow opens this lightweight URL only to bring the
+    /// containing app to the foreground; the actual credential remains in the
+    /// protected handoff file and is drained once the scene becomes active.
+    func isReturnURL(_ url: URL) -> Bool {
+        url.scheme == "gpmcprobe" && url.host == "return"
+    }
+
     /// Call once the exchange has finished with the token (success or failure).
     func consume() {
         pending = nil

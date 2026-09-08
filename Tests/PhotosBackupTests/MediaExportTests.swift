@@ -1,5 +1,5 @@
 import XCTest
-@testable import GPMCAuthProbe
+@testable import PhotosBackup
 
 /// Only the file-backed paths are exercised here — the `PHAsset` and
 /// `PhotosPickerItem` paths need a real photo library and a user tap, so they

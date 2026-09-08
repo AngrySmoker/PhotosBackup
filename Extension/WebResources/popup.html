@@ -3,38 +3,129 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>GPMC Connect</title>
+<title>Photos Backup Connect</title>
 <style>
-  :root { color-scheme: light dark; }
+  :root {
+    color-scheme: light dark;
+    --blue: #0a84ff;
+    --green: #30b057;
+    --red: #e5484d;
+    --text: #17191c;
+    --secondary: #697079;
+    --surface: #ffffff;
+    --subtle: #f2f4f7;
+    --line: rgba(20, 24, 31, .09);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --text: #f6f7f8;
+      --secondary: #a9afb8;
+      --surface: #1c1d20;
+      --subtle: #292b30;
+      --line: rgba(255,255,255,.10);
+    }
+  }
+  * { box-sizing: border-box; }
   body {
-    font: -apple-system-body, system-ui, sans-serif;
-    margin: 0; padding: 16px; min-width: 260px;
-    background: Canvas; color: CanvasText;
+    width: 100%;
+    min-width: 0;
+    margin: 0;
+    padding: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+    background: var(--surface);
+    color: var(--text);
+    -webkit-font-smoothing: antialiased;
   }
-  h1 { font-size: 15px; margin: 0 0 4px; }
-  p { font-size: 12px; margin: 4px 0 12px; opacity: 0.8; }
+  main { padding: 20px 20px 14px; }
+  .hero { text-align: center; }
+  .state-icon {
+    display: grid; place-items: center;
+    width: 52px; height: 52px;
+    margin: 0 auto 12px;
+    border-radius: 17px;
+    background: rgba(10,132,255,.11);
+    color: var(--blue);
+  }
+  .state-icon svg { width: 27px; height: 27px; }
+  h1 { margin: 0; font-size: 19px; line-height: 24px; letter-spacing: -.25px; }
+  .description {
+    max-width: 260px;
+    margin: 6px auto 16px;
+    font-size: 13px;
+    line-height: 18px;
+    color: var(--secondary);
+  }
   button {
-    width: 100%; padding: 10px 12px; font-size: 14px; font-weight: 600;
-    border: 0; border-radius: 10px; background: #1a73e8; color: #fff;
+    width: 100%;
+    min-height: 46px;
+    padding: 11px 14px;
+    border: 0;
+    border-radius: 12px;
+    background: var(--blue);
+    color: #fff;
+    font: 600 14px/18px -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+    cursor: pointer;
+    transition: transform .12s ease, opacity .12s ease, background .12s ease;
   }
-  button:disabled { opacity: 0.5; }
-  #status {
-    margin-top: 12px; font-size: 12px; white-space: pre-wrap;
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  button:active { transform: scale(.985); }
+  button:disabled { opacity: .58; cursor: default; }
+  button.secondary { margin-top: 9px; background: var(--subtle); color: var(--blue); }
+  .status {
+    display: none;
+    margin-top: 14px;
+    padding: 12px;
+    border-radius: 11px;
+    background: var(--subtle);
+    font-size: 12px;
+    line-height: 17px;
+    text-align: left;
+    color: var(--secondary);
   }
-  .ok { color: #1e8e3e; }
-  .err { color: #d93025; }
+  .status.visible { display: block; }
+  .status.err { color: var(--red); background: color-mix(in srgb, var(--red) 10%, transparent); }
+  .spinner {
+    display: inline-block; width: 13px; height: 13px; margin-right: 7px;
+    border: 2px solid rgba(255,255,255,.45); border-top-color: #fff; border-radius: 50%;
+    vertical-align: -2px; animation: spin .75s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #open-app { display: none; background: var(--green); }
+  body.success .state-icon { color: var(--green); background: rgba(48,176,87,.12); }
+  body.success #connect { display: none; }
+  body.success #open-app { display: block; }
+  details { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 10px; }
+  summary { color: var(--secondary); font-size: 11px; text-align: center; cursor: pointer; list-style: none; }
+  summary::-webkit-details-marker { display: none; }
+  .diagnostic-actions { margin-top: 10px; display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
+  .diagnostic-actions button { min-height: 34px; padding: 7px; border-radius: 9px; background: var(--subtle); color: var(--secondary); font-size: 10px; }
 </style>
 </head>
 <body>
-  <h1>Connect to GPMC</h1>
-  <p>Sign in on the Google&nbsp;EmbeddedSetup page and tap&nbsp;<b>I&nbsp;agree</b> first, then use the button below.</p>
-  <button id="connect">Connect account</button>
-  <button id="peek" style="background:#5f6368;margin-top:8px">Check for token</button>
-  <button id="dump" style="background:#5f6368;margin-top:8px">Dump all cookies</button>
-  <button id="grant" style="background:#5f6368;margin-top:8px">Request all-sites access</button>
-  <button id="selftest" style="background:#5f6368;margin-top:8px">Self-test capture path</button>
-  <div id="status"></div>
+  <main>
+    <section class="hero">
+      <div class="state-icon" id="state-icon" aria-hidden="true">
+        <svg id="link-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M10 13a5 5 0 0 0 7.1.1l2-2a5 5 0 0 0-7.1-7.1l-1.1 1.1"/>
+          <path d="M14 11a5 5 0 0 0-7.1-.1l-2 2A5 5 0 0 0 12 20l1.1-1.1"/>
+        </svg>
+      </div>
+      <h1 id="title">Connect to the app</h1>
+      <p class="description" id="description">After signing in and tapping <strong>I agree</strong>, connect your Google Photos account securely.</p>
+      <button id="connect">Connect to App</button>
+      <button id="open-app">Open Photos Backup</button>
+      <div id="status" class="status" role="status" aria-live="polite"></div>
+    </section>
+
+    <details>
+      <summary>Having trouble?</summary>
+      <div class="diagnostic-actions">
+        <button id="peek">Check sign-in</button>
+        <button id="grant">Website access</button>
+        <button id="dump">Diagnostics</button>
+        <button id="selftest">Self-test</button>
+      </div>
+    </details>
+  </main>
   <script src="popup.js"></script>
 </body>
 </html>

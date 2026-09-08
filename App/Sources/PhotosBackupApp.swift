@@ -1,12 +1,14 @@
 import SwiftUI
 
 @main
-struct GPMCAuthProbeApp: App {
+struct PhotosBackupApp: App {
     @StateObject private var log: ProbeLog
     @StateObject private var handoff = HandoffStore()
     @StateObject private var probe: AuthProbe
     @StateObject private var account: PhotosAccount
     @StateObject private var queue: UploadQueue
+    @StateObject private var preferences: BackupPreferences
+    @StateObject private var albums: PhotoAlbumStore
     @Environment(\.scenePhase) private var scenePhase
     private let photos: PhotosStack
 
@@ -22,6 +24,8 @@ struct GPMCAuthProbeApp: App {
         photos = stack
         _account = StateObject(wrappedValue: stack.account)
         _queue = StateObject(wrappedValue: stack.queue)
+        _preferences = StateObject(wrappedValue: BackupPreferences())
+        _albums = StateObject(wrappedValue: PhotoAlbumStore())
     }
 
     var body: some Scene {
@@ -32,9 +36,15 @@ struct GPMCAuthProbeApp: App {
                 .environmentObject(probe)
                 .environmentObject(account)
                 .environmentObject(queue)
+                .environmentObject(preferences)
+                .environmentObject(albums)
                 .task { await photos.start() }
                 .onOpenURL { url in
-                    if let h = handoff.ingest(url: url) {
+                    if handoff.isReturnURL(url) {
+                        if let h = handoff.drainAppGroup() {
+                            Task { await probe.handle(h) { handoff.consume() } }
+                        }
+                    } else if let h = handoff.ingest(url: url) {
                         Task { await probe.handle(h) { handoff.consume() } }
                     }
                 }

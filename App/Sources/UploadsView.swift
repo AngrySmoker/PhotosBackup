@@ -1,136 +1,124 @@
 import PhotosUI
 import SwiftUI
 
-/// The Google Photos half of the app: account state, a picker, and the activity
-/// queue. Self-contained so it can be dropped into the probe's `List` as one
-/// section or pushed as its own screen.
 struct UploadsView: View {
-    @EnvironmentObject var account: PhotosAccount
-    @EnvironmentObject var queue: UploadQueue
-
+    @EnvironmentObject private var account: PhotosAccount
+    @EnvironmentObject private var queue: UploadQueue
     @State private var selection: [PhotosPickerItem] = []
 
     var body: some View {
-        List {
-            accountSection
-            pickerSection
-            if !queue.items.isEmpty { activitySection }
-        }
-        .navigationTitle("Uploads")
-        .navigationBarTitleDisplayMode(.inline)
-        .onChange(of: selection) { items in
-            guard !items.isEmpty else { return }
-            selection = []
-            Task {
-                await MediaLibrary.requestReadAccess()
-                queue.enqueue(MediaLibrary.sources(for: items))
+        NavigationStack {
+            List {
+                manualBackupSection
+                if let halt = queue.haltReason { pausedSection(halt) }
+                if queue.items.isEmpty { emptySection }
+                else { activitySection }
+            }
+            .listStyle(.insetGrouped)
+            .navigationTitle("Activity")
+            .toolbar {
+                if queue.items.contains(where: { $0.state.isFinished }) {
+                    ToolbarItem(placement: .navigationBarTrailing) {
+                        Button("Clear") { queue.clearFinished() }
+                    }
+                }
+            }
+            .onChange(of: selection) { items in
+                guard !items.isEmpty else { return }
+                selection = []
+                Task {
+                    await MediaLibrary.requestReadAccess()
+                    queue.enqueue(MediaLibrary.sources(for: items))
+                }
             }
         }
     }
 
-    // MARK: - Account
-
-    private var accountSection: some View {
-        Section("Account") {
-            switch account.status {
-            case .loading:
-                HStack { ProgressView(); Text("Checking saved credential…").foregroundStyle(.secondary) }
-            case .disconnected:
-                Text("No account connected. Complete the auth flow to connect one.")
-                    .font(.footnote).foregroundStyle(.secondary)
-            case .connected(let email, let since):
-                LabeledContent("Connected", value: email)
-                LabeledContent("Since", value: since.formatted(date: .abbreviated, time: .shortened))
-                Button("Check the credential") { Task { await account.verify() } }
-                    .disabled(account.verifying)
-                Button("Disconnect", role: .destructive) { Task { await account.disconnect() } }
-            case .rejected(let email, let reason):
-                Label(email.isEmpty ? "Credential rejected" : email, systemImage: "exclamationmark.triangle.fill")
-                    .foregroundStyle(.orange)
-                Text(reason).font(.footnote).foregroundStyle(.secondary)
-                Button("Disconnect", role: .destructive) { Task { await account.disconnect() } }
-            }
-            if let warning = account.persistenceWarning {
-                // Same underlying cause, two different situations: an account
-                // already connected this session, or no account at all.
-                let connected = account.status.isUsable
-                Label(connected ? "Not saved to the Keychain" : "Keychain unavailable",
-                      systemImage: "exclamationmark.triangle")
-                    .foregroundStyle(.orange)
-                Text(warning + (connected
-                        ? " The account works for this session but will be gone after a relaunch."
-                        : " Credentials cannot be stored on this build, so a connected account will not survive a relaunch.")
-                     + " A signed build with a real team fixes it.")
-                    .font(.footnote).foregroundStyle(.secondary)
-            }
-            if let halt = queue.haltReason {
-                Text(halt).font(.footnote).foregroundStyle(.red)
-                Button("Resume the queue") { queue.resume() }
-                    .disabled(!account.status.isUsable)
-            }
-        }
-    }
-
-    // MARK: - Picker
-
-    private var pickerSection: some View {
-        Section("Upload") {
-            PhotosPicker(selection: $selection, maxSelectionCount: 50, matching: .any(of: [.images, .videos]),
-                         photoLibrary: .shared()) {
-                Label("Choose photos or videos", systemImage: "photo.on.rectangle.angled")
+    private var manualBackupSection: some View {
+        Section {
+            PhotosPicker(selection: $selection, maxSelectionCount: 50, matching: .any(of: [.images, .videos]), photoLibrary: .shared()) {
+                HStack(spacing: 12) {
+                    FeatureIcon(symbol: "photo.badge.plus", size: 42)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Choose Photos or Videos").font(.headline).foregroundStyle(.primary)
+                        Text("Back up up to 50 items at once").font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                .padding(.vertical, 4)
             }
             .disabled(!account.status.isUsable)
-            Toggle("Count against storage quota", isOn: $queue.options.useQuota)
-            Toggle("Storage saver (re-encode)", isOn: $queue.options.storageSaver)
-            Text("Live Photos upload as the still image only; the motion track is a follow-up.")
-                .font(.footnote).foregroundStyle(.secondary)
+        } footer: {
+            if !account.status.isUsable { Text("Connect a Google Photos account before starting a backup.") }
         }
     }
 
-    // MARK: - Activity
+    private func pausedSection(_ reason: String) -> some View {
+        Section {
+            Label("Backup Paused", systemImage: "pause.circle.fill").foregroundStyle(.orange)
+            Text(reason).font(.footnote).foregroundStyle(.secondary)
+            Button("Resume Backup") { queue.resume() }.disabled(!account.status.isUsable)
+        }
+    }
+
+    private var emptySection: some View {
+        Section {
+            EmptyState(symbol: "tray", title: "No backup activity", message: "Photos you back up manually or from selected albums will appear here.")
+                .listRowBackground(Color.clear)
+        }
+    }
 
     private var activitySection: some View {
         Section {
-            ForEach(queue.items) { item in row(item) }
+            if !queue.isIdle {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("Overall Progress").font(.subheadline.weight(.semibold))
+                        Spacer()
+                        Text(queue.overallFraction, format: .percent.precision(.fractionLength(0)))
+                            .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                    }
+                    ProgressView(value: queue.overallFraction).tint(BackupTheme.blue)
+                }
+                .padding(.vertical, 6)
+            }
+            ForEach(queue.items) { item in activityRow(item) }
         } header: {
             HStack {
-                Text("Activity")
+                Text("Uploads")
                 Spacer()
-                if !queue.isIdle { Text("\(queue.activeCount) left").font(.caption) }
+                if !queue.isIdle { Text("\(queue.activeCount) remaining") }
             }
         } footer: {
-            HStack(spacing: 16) {
-                if queue.failedCount > 0 { Button("Retry failed") { queue.retryAllFailed() } }
-                if !queue.isIdle { Button("Cancel all", role: .destructive) { queue.cancelAll() } }
-                Button("Clear finished") { queue.clearFinished() }
+            HStack(spacing: 18) {
+                if queue.failedCount > 0 { Button("Retry Failed") { queue.retryAllFailed() } }
+                if !queue.isIdle { Button("Cancel All", role: .destructive) { queue.cancelAll() } }
             }
-            .font(.footnote)
         }
     }
 
-    private func row(_ item: UploadItem) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(alignment: .firstTextBaseline) {
-                Text(item.name).lineLimit(1).truncationMode(.middle)
-                Spacer()
-                if item.byteCount > 0 {
-                    Text(item.byteCount.formatted(.byteCount(style: .file)))
-                        .font(.caption).foregroundStyle(.secondary)
+    private func activityRow(_ item: UploadItem) -> some View {
+        HStack(spacing: 12) {
+            FeatureIcon(symbol: symbol(item.state), color: tint(item.state), size: 42)
+            VStack(alignment: .leading, spacing: 5) {
+                HStack {
+                    Text(item.name).font(.subheadline.weight(.medium)).lineLimit(1).truncationMode(.middle)
+                    Spacer()
+                    if item.byteCount > 0 {
+                        Text(item.byteCount.formatted(.byteCount(style: .file)))
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                Text(item.state.label).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                if let fraction = item.state.fraction, item.state.isWorking {
+                    ProgressView(value: fraction).tint(BackupTheme.blue)
                 }
             }
-            HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Image(systemName: symbol(item.state)).foregroundStyle(tint(item.state))
-                Text(item.state.label).font(.caption).foregroundStyle(.secondary)
-            }
-            if let fraction = item.state.fraction, item.state.isWorking {
-                ProgressView(value: fraction)
-            }
         }
-        .padding(.vertical, 2)
+        .padding(.vertical, 4)
         .swipeActions {
             if item.state.isFinished {
                 if item.state != .done && item.state != .alreadyBackedUp {
-                    Button("Retry") { queue.retry(item.id) }
+                    Button("Retry") { queue.retry(item.id) }.tint(BackupTheme.blue)
                 }
             } else {
                 Button("Cancel", role: .destructive) { queue.cancel(item.id) }
@@ -140,12 +128,11 @@ struct UploadsView: View {
 
     private func symbol(_ state: UploadItem.State) -> String {
         switch state {
-        case .done: return "checkmark.circle.fill"
-        case .alreadyBackedUp: return "checkmark.circle"
-        case .failed: return "xmark.octagon.fill"
-        case .cancelled: return "minus.circle"
+        case .done, .alreadyBackedUp: return "checkmark"
+        case .failed: return "exclamationmark"
+        case .cancelled: return "xmark"
         case .queued, .waitingToRetry: return "clock"
-        default: return "arrow.up.circle"
+        default: return "arrow.up"
         }
     }
 
@@ -154,7 +141,7 @@ struct UploadsView: View {
         case .done, .alreadyBackedUp: return .green
         case .failed: return .red
         case .cancelled, .waitingToRetry: return .orange
-        default: return .blue
+        default: return BackupTheme.blue
         }
     }
 }
