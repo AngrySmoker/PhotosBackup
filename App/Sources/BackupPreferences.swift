@@ -29,7 +29,7 @@ final class BackupPreferences: ObservableObject {
         static let automaticBackup = "backup.automatic"
         static let connection = "backup.connection"
         static let completedOnboarding = "app.completedOnboarding"
-        static let backedUpCount = "backup.completedCount"
+        static let concurrentUploads = "backup.concurrentUploads"
         static let storageSaver = "backup.storageSaver"
         static let useQuota = "backup.useQuota"
     }
@@ -38,9 +38,9 @@ final class BackupPreferences: ObservableObject {
     @Published var automaticBackup: Bool { didSet { defaults.set(automaticBackup, forKey: Key.automaticBackup) } }
     @Published var connection: BackupConnection { didSet { defaults.set(connection.rawValue, forKey: Key.connection) } }
     @Published var completedOnboarding: Bool { didSet { defaults.set(completedOnboarding, forKey: Key.completedOnboarding) } }
+    @Published var concurrentUploads: Int { didSet { defaults.set(concurrentUploads, forKey: Key.concurrentUploads) } }
     @Published var storageSaver: Bool { didSet { defaults.set(storageSaver, forKey: Key.storageSaver) } }
     @Published var useQuota: Bool { didSet { defaults.set(useQuota, forKey: Key.useQuota) } }
-    @Published private(set) var backedUpCount: Int
 
     private let defaults: UserDefaults
 
@@ -50,26 +50,17 @@ final class BackupPreferences: ObservableObject {
         automaticBackup = defaults.object(forKey: Key.automaticBackup) as? Bool ?? true
         connection = BackupConnection(rawValue: defaults.string(forKey: Key.connection) ?? "") ?? .wifiOnly
         completedOnboarding = defaults.bool(forKey: Key.completedOnboarding)
+        // `object(forKey:)` rather than `integer(forKey:)`: an unset key reads
+        // as 0, which is not a legal concurrency and would clamp to 1.
+        concurrentUploads = UploadQueue.clampedConcurrency(
+            defaults.object(forKey: Key.concurrentUploads) as? Int ?? 2)
         storageSaver = defaults.bool(forKey: Key.storageSaver)
         useQuota = defaults.bool(forKey: Key.useQuota)
-        backedUpCount = defaults.integer(forKey: Key.backedUpCount)
     }
 
     func toggle(albumID: String) {
         if selectedAlbumIDs.contains(albumID) { selectedAlbumIDs.remove(albumID) }
         else { selectedAlbumIDs.insert(albumID) }
-    }
-
-    /// Called by `UploadQueue` the moment an item reaches a backed-up state.
-    ///
-    /// This deliberately does not observe the queue's published items from a
-    /// view: SwiftUI does not update views for a backgrounded scene, and
-    /// completed rows are dropped from the durable snapshot, so anything
-    /// uploaded during a processing window that ends in process termination
-    /// would never be counted at all.
-    func recordCompletedUpload() {
-        backedUpCount += 1
-        defaults.set(backedUpCount, forKey: Key.backedUpCount)
     }
 
     func resetOnboarding() { completedOnboarding = false }

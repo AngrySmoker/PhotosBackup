@@ -124,12 +124,17 @@ struct SettingsView: View {
                     .font(.footnote)
                     .foregroundStyle(.orange)
             }
+            Picker("Simultaneous Uploads", selection: $preferences.concurrentUploads) {
+                ForEach(Array(UploadQueue.concurrencyRange), id: \.self) { count in
+                    Text(count.formatted()).tag(count)
+                }
+            }
             Toggle("Storage Saver", isOn: $preferences.storageSaver)
             Toggle("Count Against Storage Quota", isOn: $preferences.useQuota)
         } header: {
             Text("Backup")
         } footer: {
-            Text("Storage Saver asks Google Photos to reduce file size. Live Photos currently back up as still images.")
+            Text("More simultaneous uploads finish a large backup sooner. Each one stages a full-size copy on the device while it runs, so high values use more storage, battery and data at once — 2 suits most phones. Lowering it lets uploads already running finish first.\n\nStorage Saver asks Google Photos to reduce file size. Live Photos currently back up as still images.")
         }
     }
 

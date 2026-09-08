@@ -22,6 +22,7 @@ struct PhotosBackupApp: App {
         let network = NetworkPolicyMonitor()
         stack.queue.options.storageSaver = preferences.storageSaver
         stack.queue.options.useQuota = preferences.useQuota
+        stack.queue.setMaxConcurrent(preferences.concurrentUploads)
         let automaticBackup = AutomaticBackupCoordinator(
             photos: stack,
             account: stack.account,
@@ -33,11 +34,6 @@ struct PhotosBackupApp: App {
         BackgroundFileUploadTransport.shared.setEventsDrainer { [weak automaticBackup] in
             await automaticBackup?.handleBackgroundURLSessionEvents()
         }
-        // Count completions at the queue, not from a view. SwiftUI does not
-        // update views for a backgrounded scene, and completed rows are dropped
-        // from the durable snapshot, so a view-driven counter loses every
-        // upload finished in a processing window that ends in termination.
-        stack.queue.onItemBackedUp = { [weak preferences] in preferences?.recordCompletedUpload() }
         // A successful exchange is what connects the account; the connector owns
         // the token, the stack owns everything downstream of it.
         sharedConnector.onExchange = { [weak stack] result in await stack?.connect(result) }
@@ -78,6 +74,7 @@ struct PhotosBackupApp: App {
                 .onChange(of: preferences.connection) { _ in automaticBackup.connectionPreferenceDidChange() }
                 .onChange(of: preferences.storageSaver) { value in queue.options.storageSaver = value }
                 .onChange(of: preferences.useQuota) { value in queue.options.useQuota = value }
+                .onChange(of: preferences.concurrentUploads) { value in queue.setMaxConcurrent(value) }
                 .onChange(of: preferences.automaticBackup) { _ in automaticBackup.backupConfigurationDidChange() }
                 .onChange(of: preferences.selectedAlbumIDs) { _ in automaticBackup.backupConfigurationDidChange() }
                 .onChange(of: preferences.completedOnboarding) { _ in automaticBackup.backupConfigurationDidChange() }

@@ -132,11 +132,15 @@ final class UploadQueue: ObservableObject {
 
     /// Called once when Google refuses the credential, so the account state can follow.
     var onCredentialRejected: ((Error) -> Void)?
-    /// Called exactly once per item that reaches a backed-up state, including
-    /// during a background window where no view is observing the queue.
-    var onItemBackedUp: (() -> Void)?
 
-    let maxConcurrent: Int
+    /// How many uploads the user may run at once. Bounded at the top because
+    /// each in-flight item stages a full-size copy on disk and hashes it end to
+    /// end, so the ceiling costs real disk and CPU, and because the background
+    /// session's per-host connection limit is fixed when that session is
+    /// created — going wider than that limit would not widen the transfers.
+    static let concurrencyRange = 1...10
+
+    private(set) var maxConcurrent: Int
     let maxAttempts: Int
     private let worker: UploadWorker
     private let sleeper: @Sendable (Double) async -> Void
@@ -146,7 +150,9 @@ final class UploadQueue: ObservableObject {
     private var userCancelled: Set<UUID> = []
     private var requeueCancelled: Set<UUID> = []
     private var accountIdentifier: String?
-    private var completedSourceKeys: Set<String> = []
+    /// The durable per-account set of sources known to be backed up. Published
+    /// because the dashboard's "Backed up" metric is derived from its count.
+    @Published private(set) var completedSourceKeys: Set<String> = []
     private var completionLedgerHealthy = true
     private var drainsBackgroundCompletionsOnly = false
     /// Set while a `cancelAll` is settling, so the rows it cancels are dropped
@@ -163,7 +169,7 @@ final class UploadQueue: ObservableObject {
              try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
          }) {
         self.worker = worker
-        self.maxConcurrent = max(1, maxConcurrent)
+        self.maxConcurrent = Self.clampedConcurrency(maxConcurrent)
         self.maxAttempts = max(1, maxAttempts)
         self.persistence = persistence
         self.checkpointCleaner = checkpointCleaner
@@ -267,6 +273,21 @@ final class UploadQueue: ObservableObject {
         persistNow()
     }
 
+    static func clampedConcurrency(_ value: Int) -> Int {
+        min(concurrencyRange.upperBound, max(concurrencyRange.lowerBound, value))
+    }
+
+    /// Change how many uploads run at once. Raising it starts more immediately;
+    /// lowering it never cancels work already in flight, it just stops the queue
+    /// starting replacements until the count falls back within the new limit.
+    func setMaxConcurrent(_ value: Int) {
+        let clamped = Self.clampedConcurrency(value)
+        guard clamped != maxConcurrent else { return }
+        maxConcurrent = clamped
+        objectWillChange.send()
+        pump()
+    }
+
     /// Stop scheduling new work without throwing away queue state or staged
     /// files. The pause is durable: it survives the queue draining and a
     /// relaunch, and only an explicit resume or stop clears it. Anything else
@@ -322,8 +343,11 @@ final class UploadQueue: ObservableObject {
         persistNow()
     }
 
-    /// Number of sources the queue considers already backed up. Used by the
-    /// Settings verify action to explain what will be re-checked.
+    /// Number of distinct sources the queue knows are backed up for the
+    /// connected account. This is the count the dashboard shows and the one the
+    /// Settings verify action uses to explain what will be re-checked: it is a
+    /// set, so re-verifying an item that is already in the cloud re-records the
+    /// same key and the total does not move.
     var completedSourceCount: Int { completedSourceKeys.count }
 
     /// A snapshot test for "is this library asset already backed up", safe to
@@ -615,7 +639,6 @@ final class UploadQueue: ObservableObject {
             items[index].checkpoint = nil
             recordCompletion(for: items[index])
             persist()
-            onItemBackedUp?()
         case .failure(let error):
             if userCancelled.remove(id) != nil {
                 requeueCancelled.remove(id)

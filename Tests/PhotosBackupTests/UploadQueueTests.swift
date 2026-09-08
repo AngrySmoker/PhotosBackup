@@ -676,16 +676,23 @@ final class UploadQueueTests: XCTestCase {
         XCTAssertFalse(complete.reachedLimit)
     }
 
-    /// A completed item must be counted where it happens, not from a view: a
-    /// background window that ends in process termination never renders.
-    func testCompletionCallbackFiresOncePerBackedUpItem() async {
-        let script = WorkerScript([], fallback: .succeed(.uploaded(mediaKey: "ABC")))
+    /// The dashboard metric reads this count, so it has to be a count of
+    /// distinct sources rather than of completion events: re-verifying a
+    /// library that is already in the cloud must leave the number where it was.
+    func testCompletedSourceCountCountsDistinctSourcesNotCompletions() async {
+        // Upload three, then report every later call as already in the cloud.
+        let script = WorkerScript(Array(repeating: .succeed(.uploaded(mediaKey: "ABC")), count: 3),
+                                  fallback: .succeed(.alreadyBackedUp(mediaKey: "ABC")))
         let queue = makeQueue(script, maxConcurrent: 1)
-        var completions = 0
-        queue.onItemBackedUp = { completions += 1 }
         queue.enqueue(sources(3))
         await settle(queue) { queue.items.allSatisfy { $0.state == .done } }
-        XCTAssertEqual(completions, 3)
+        XCTAssertEqual(queue.completedSourceCount, 3)
+
+        // What Settings' verify action does: forget the ledger, re-enqueue, and
+        // let the worker's hash lookup short-circuit each item.
+        queue.reverify(sources(3))
+        await settle(queue) { queue.items.allSatisfy { $0.state == .alreadyBackedUp } }
+        XCTAssertEqual(queue.completedSourceCount, 3)
     }
 
     /// Losing an allowed transport has to stop a background PUT too: iOS keeps
@@ -788,6 +795,43 @@ final class UploadQueueTests: XCTestCase {
 
         XCTAssertEqual(queue.retryRetryableFailures(), 1)
         await settle(queue) { queue.items.first?.state == .done }
+    }
+
+    /// Raising the limit has to start the extra work immediately rather than
+    /// waiting for something else to nudge the queue.
+    func testRaisingConcurrencyStartsMoreWorkAtOnce() async {
+        let script = WorkerScript([], fallback: .block)
+        let queue = makeQueue(script, maxConcurrent: 1)
+        queue.enqueue(sources(6))
+        await settle(queue) { script.peakInFlight == 1 }
+        try? await Task.sleep(nanoseconds: 20_000_000)
+        XCTAssertEqual(script.peakInFlight, 1)
+
+        queue.setMaxConcurrent(UploadQueue.concurrencyRange.upperBound)
+        await settle(queue) { script.peakInFlight == 6 }
+        XCTAssertEqual(queue.maxConcurrent, UploadQueue.concurrencyRange.upperBound)
+    }
+
+    /// Lowering it must not cancel work already in flight — those uploads have
+    /// staged files and, for a background transfer, bytes already on the wire.
+    func testLoweringConcurrencyLetsRunningUploadsFinish() async {
+        let script = WorkerScript([], fallback: .block)
+        let queue = makeQueue(script, maxConcurrent: 3)
+        queue.enqueue(sources(4))
+        await settle(queue) { script.peakInFlight == 3 }
+
+        queue.setMaxConcurrent(1)
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        XCTAssertEqual(queue.maxConcurrent, 1)
+        XCTAssertEqual(queue.items.filter { $0.state.isWorking }.count, 3)
+    }
+
+    func testConcurrencyIsClampedToTheOfferedRange() {
+        let queue = makeQueue(WorkerScript([], fallback: .block), maxConcurrent: 1)
+        queue.setMaxConcurrent(0)
+        XCTAssertEqual(queue.maxConcurrent, UploadQueue.concurrencyRange.lowerBound)
+        queue.setMaxConcurrent(99)
+        XCTAssertEqual(queue.maxConcurrent, UploadQueue.concurrencyRange.upperBound)
     }
 
     func testProgressFractionsAreMonotonicAcrossTheStates() {

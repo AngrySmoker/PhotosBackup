@@ -42,7 +42,10 @@ final class BackgroundFileUploadTransport: NSObject, FileUploadTransport, @unche
         configuration.waitsForConnectivity = true
         configuration.timeoutIntervalForRequest = 7 * 24 * 60 * 60
         configuration.timeoutIntervalForResource = 7 * 24 * 60 * 60
-        configuration.httpMaximumConnectionsPerHost = 2
+        // A background session's configuration is fixed once the session
+        // exists, so this has to allow for the widest concurrency the user can
+        // choose. The queue is what actually limits how many run at a time.
+        configuration.httpMaximumConnectionsPerHost = UploadQueue.concurrencyRange.upperBound
         return URLSession(configuration: configuration, delegate: self, delegateQueue: delegateQueue)
     }()
 

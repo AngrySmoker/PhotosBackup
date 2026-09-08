@@ -66,7 +66,7 @@ struct DashboardView: View {
             }
             .onChange(of: preferences.selectedAlbumIDs) { _ in refreshBackedUpCounts() }
             .onChange(of: albums.albums) { _ in refreshBackedUpCounts() }
-            .onChange(of: preferences.backedUpCount) { _ in refreshBackedUpCounts() }
+            .onChange(of: queue.completedSourceKeys) { _ in refreshBackedUpCounts() }
         }
         .navigationViewStyle(.stack)
     }
@@ -123,7 +123,7 @@ struct DashboardView: View {
             Divider()
 
             HStack {
-                metric(value: preferences.backedUpCount.formatted(), label: "Backed up")
+                metric(value: queue.completedSourceCount.formatted(), label: "Backed up")
                 Divider().frame(height: 38)
                 metric(value: selectedAlbums.count.formatted(), label: "Albums")
                 Divider().frame(height: 38)
@@ -336,7 +336,7 @@ struct DashboardView: View {
         if queue.pauseReason != nil { return "Backup paused" }
         if !queue.isIdle { return "Backing up…" }
         if queue.failedCount > 0 { return "Backup needs attention" }
-        if preferences.backedUpCount == 0 { return "Ready to back up" }
+        if queue.completedSourceCount == 0 { return "Ready to back up" }
         return "Backup complete"
     }
 
