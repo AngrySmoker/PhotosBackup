@@ -88,6 +88,7 @@ protocol UploadQueuePersisting {
     var storesCompletionLedgerSeparately: Bool { get }
     func loadCompletedSourceKeys(for accountIdentifier: String) throws -> [String]
     func recordCompletedSourceKey(_ key: String, for accountIdentifier: String) throws
+    func removeCompletedSourceKeys(_ keys: Set<String>, for accountIdentifier: String) throws
 }
 
 extension UploadQueuePersisting {
@@ -97,6 +98,7 @@ extension UploadQueuePersisting {
         return snapshot.completedSourceKeys
     }
     func recordCompletedSourceKey(_ key: String, for accountIdentifier: String) throws {}
+    func removeCompletedSourceKeys(_ keys: Set<String>, for accountIdentifier: String) throws {}
 }
 
 /// Stores one account-scoped queue atomically in Application Support. The file
@@ -174,6 +176,46 @@ struct FileUploadQueuePersistence: UploadQueuePersisting {
             ofItemAtPath: ledgerURL.path
         )
     }
+
+    func removeCompletedSourceKeys(_ keys: Set<String>, for accountIdentifier: String) throws {
+        guard !keys.isEmpty else { return }
+        // Snapshot may still carry keys written before the separate ledger existed.
+        if let snapshot = try load(), snapshot.accountIdentifier == accountIdentifier,
+           !snapshot.completedSourceKeys.isEmpty {
+            let remaining = snapshot.completedSourceKeys.filter { !keys.contains($0) }
+            if remaining.count != snapshot.completedSourceKeys.count {
+                try save(UploadQueueSnapshot(version: snapshot.version,
+                                            accountIdentifier: snapshot.accountIdentifier,
+                                            items: snapshot.items,
+                                            completedSourceKeys: remaining,
+                                            isUserPaused: snapshot.isUserPaused))
+            }
+        }
+        guard FileManager.default.fileExists(atPath: ledgerURL.path) else { return }
+        let account = Data(accountIdentifier.utf8).base64EncodedString()
+        let contents = try String(contentsOf: ledgerURL, encoding: .utf8)
+        var kept: [String] = []
+        var removed = false
+        for line in contents.split(whereSeparator: \.isNewline) {
+            let parts = line.split(separator: "\t", maxSplits: 1)
+            guard parts.count == 2, parts[0] == Substring(account),
+                  let data = Data(base64Encoded: String(parts[1])) else {
+                kept.append(String(line))
+                continue
+            }
+            if keys.contains(String(decoding: data, as: UTF8.self)) { removed = true }
+            else { kept.append(String(line)) }
+        }
+        guard removed else { return }
+        let directory = ledgerURL.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let output = kept.isEmpty ? "" : kept.joined(separator: "\n") + "\n"
+        try output.write(to: ledgerURL, atomically: true, encoding: .utf8)
+        try? FileManager.default.setAttributes(
+            [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+            ofItemAtPath: ledgerURL.path
+        )
+    }
 }
 
 final class MemoryUploadQueuePersistence: UploadQueuePersisting {
@@ -193,6 +235,17 @@ final class MemoryUploadQueuePersistence: UploadQueuePersisting {
                                             accountIdentifier: snapshot.accountIdentifier,
                                             items: snapshot.items,
                                             completedSourceKeys: snapshot.completedSourceKeys + [key],
+                                            isUserPaused: snapshot.isUserPaused)
+    }
+
+    func removeCompletedSourceKeys(_ keys: Set<String>, for accountIdentifier: String) throws {
+        guard !keys.isEmpty, let snapshot, snapshot.accountIdentifier == accountIdentifier else { return }
+        let remaining = snapshot.completedSourceKeys.filter { !keys.contains($0) }
+        guard remaining.count != snapshot.completedSourceKeys.count else { return }
+        self.snapshot = UploadQueueSnapshot(version: snapshot.version,
+                                            accountIdentifier: snapshot.accountIdentifier,
+                                            items: snapshot.items,
+                                            completedSourceKeys: remaining,
                                             isUserPaused: snapshot.isUserPaused)
     }
 }

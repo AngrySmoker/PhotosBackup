@@ -271,6 +271,49 @@ final class UploadQueue: ObservableObject {
         persist()
     }
 
+    /// Number of sources the queue considers already backed up. Used by the
+    /// Settings verify action to explain what will be re-checked.
+    var completedSourceCount: Int { completedSourceKeys.count }
+
+    /// Forget remembered completions so the next enqueue re-checks them against
+    /// Google (hash lookup) and re-uploads anything deleted in the cloud.
+    /// Finished rows for the same sources are removed as well, otherwise the
+    /// in-memory dedup in `enqueue(skippingExisting:)` would skip them again.
+    /// Returns the number of sources forgotten.
+    @discardableResult
+    func forgetCompletedSources(for sources: [MediaSource]) -> Int {
+        let keys = Set(sources.compactMap(\.queueDeduplicationKey)).intersection(completedSourceKeys)
+        guard !keys.isEmpty else { return 0 }
+        completedSourceKeys.subtract(keys)
+        items.removeAll { item in
+            guard item.state.isFinished,
+                  let key = item.source.queueDeduplicationKey else { return false }
+            return keys.contains(key)
+        }
+        if let accountIdentifier, let persistence {
+            do {
+                try persistence.removeCompletedSourceKeys(keys, for: accountIdentifier)
+                if completionLedgerHealthy { persistenceWarning = nil }
+            } catch {
+                completionLedgerHealthy = false
+                persistenceWarning = "Upload completion could not be saved: \(error.localizedDescription)"
+            }
+        }
+        persist()
+        return keys.count
+    }
+
+    /// Forget + re-enqueue in one step for Settings. The worker's hash lookup
+    /// short-circuits items still in the cloud to `alreadyBackedUp`; only
+    /// genuinely missing bytes are uploaded again.
+    /// Returns `(forgotten, enqueued)`.
+    @discardableResult
+    func reverify(_ sources: [MediaSource]) -> (forgotten: Int, enqueued: Int) {
+        let forgotten = forgetCompletedSources(for: sources)
+        let enqueued = enqueue(sources, skippingExisting: true).count
+        return (forgotten, enqueued)
+    }
+
     /// Select and restore the durable queue for the connected account. A queue
     /// is never reused for a different Google account.
     func activateAccount(_ identifier: String?) {

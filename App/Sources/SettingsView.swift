@@ -5,10 +5,13 @@ struct SettingsView: View {
     @EnvironmentObject private var account: PhotosAccount
     @EnvironmentObject private var queue: UploadQueue
     @EnvironmentObject private var preferences: BackupPreferences
+    @EnvironmentObject private var albums: PhotoAlbumStore
 
     let showTutorial: () -> Void
     @State private var confirmDisconnect = false
     @State private var connectionCheckResult: PhotosAccount.VerificationOutcome?
+    @State private var verifyMessage: String?
+    @State private var isVerifying = false
     private let gpmcURL = URL(string: "https://github.com/xob0t/gpmc")!
 
     var body: some View {
@@ -16,6 +19,7 @@ struct SettingsView: View {
             Form {
                 accountSection
                 backupSection
+                verifySection
                 safariSection
                 supportSection
                 aboutSection
@@ -137,6 +141,60 @@ struct SettingsView: View {
         } footer: {
             Text("Sign in to Google in a secure in-app window to connect your Google Photos account.")
         }
+    }
+
+    private var verifySection: some View {
+        Section {
+            Button {
+                runVerification()
+            } label: {
+                HStack {
+                    Text(isVerifying ? "Verifying…" : "Verify Backup")
+                    Spacer()
+                    if isVerifying { ProgressView() }
+                }
+            }
+            .disabled(!canVerify)
+            if let verifyMessage {
+                Text(verifyMessage)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        } header: {
+            Text("Verify")
+        } footer: {
+            Text("Re-checks selected albums against Google Photos. Items still in the cloud finish quickly; anything deleted there is queued for upload again.")
+        }
+    }
+
+    private var canVerify: Bool {
+        account.status.isUsable && !isVerifying && !preferences.selectedAlbumIDs.isEmpty
+    }
+
+    private func runVerification() {
+        guard canVerify else { return }
+        isVerifying = true
+        verifyMessage = nil
+        albums.refresh()
+        guard albums.canRead else {
+            verifyMessage = "Allow photo library access to verify your backup."
+            isVerifying = false
+            return
+        }
+        let sources = albums.sources(for: preferences.selectedAlbumIDs)
+        guard !sources.isEmpty else {
+            verifyMessage = "No items in the selected albums to verify."
+            isVerifying = false
+            return
+        }
+        let result = queue.reverify(sources)
+        if result.enqueued == 0, result.forgotten == 0 {
+            verifyMessage = "Everything is already queued or up to date."
+        } else {
+            verifyMessage = "Re-checking \(result.enqueued) items against Google Photos. Watch progress in Activity."
+        }
+        isVerifying = false
     }
 
     private var supportSection: some View {
