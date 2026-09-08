@@ -72,11 +72,18 @@ final class BackupPreferences: ObservableObject {
 }
 
 struct PhotoAlbum: Identifiable, Equatable {
+    /// Stable id for the synthetic album that backs up the entire library.
+    static let allPhotosID = "photosbackup.all-photos"
+
     let id: String
     let title: String
     let count: Int
     let symbol: String
-    let collection: PHAssetCollection
+    /// `nil` for the synthetic "All Photos" album, which spans the whole
+    /// library rather than a single collection.
+    let collection: PHAssetCollection?
+
+    var isAllPhotos: Bool { id == Self.allPhotosID }
 
     static func == (lhs: PhotoAlbum, rhs: PhotoAlbum) -> Bool {
         lhs.id == rhs.id && lhs.title == rhs.title && lhs.count == rhs.count
@@ -121,23 +128,54 @@ final class PhotoAlbumStore: ObservableObject {
         let user = PHAssetCollection.fetchAssetCollections(with: .album, subtype: .any, options: nil)
         user.enumerateObjects { collection, _, _ in append(collection) }
 
-        albums = result.sorted { lhs, rhs in
+        var ordered = result.sorted { lhs, rhs in
             if lhs.symbol == "camera.fill" { return true }
             if rhs.symbol == "camera.fill" { return false }
             return lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending
         }
+
+        // A synthetic album for the entire library, always pinned to the top.
+        let allCount = PHAsset.fetchAssets(with: Self.allPhotosOptions()).count
+        if allCount > 0 {
+            ordered.insert(PhotoAlbum(
+                id: PhotoAlbum.allPhotosID,
+                title: "All Photos",
+                count: allCount,
+                symbol: "photo.on.rectangle.angled",
+                collection: nil
+            ), at: 0)
+        }
+
+        albums = ordered
         isLoading = false
     }
 
     func sources(for albumIDs: Set<String>) -> [MediaSource] {
-        albums.filter { albumIDs.contains($0.id) }.flatMap { album in
-            let assets = PHAsset.fetchAssets(in: album.collection, options: nil)
+        albums.filter { albumIDs.contains($0.id) }.flatMap { album -> [MediaSource] in
+            let assets: PHFetchResult<PHAsset>
+            if let collection = album.collection {
+                assets = PHAsset.fetchAssets(in: collection, options: nil)
+            } else {
+                assets = PHAsset.fetchAssets(with: Self.allPhotosOptions())
+            }
             var sources: [MediaSource] = []
             assets.enumerateObjects { asset, _, _ in
                 sources.append(.asset(localIdentifier: asset.localIdentifier))
             }
             return sources
         }
+    }
+
+    /// Images and videos across the whole library, newest first, for the
+    /// synthetic "All Photos" album.
+    static func allPhotosOptions() -> PHFetchOptions {
+        let options = PHFetchOptions()
+        options.predicate = NSPredicate(
+            format: "mediaType == %d OR mediaType == %d",
+            PHAssetMediaType.image.rawValue, PHAssetMediaType.video.rawValue
+        )
+        options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+        return options
     }
 
     static func symbol(for collection: PHAssetCollection) -> String {
