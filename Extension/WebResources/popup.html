@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GPMC Connect</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font: -apple-system-body, system-ui, sans-serif;
+    margin: 0; padding: 16px; min-width: 260px;
+    background: Canvas; color: CanvasText;
+  }
+  h1 { font-size: 15px; margin: 0 0 4px; }
+  p { font-size: 12px; margin: 4px 0 12px; opacity: 0.8; }
+  button {
+    width: 100%; padding: 10px 12px; font-size: 14px; font-weight: 600;
+    border: 0; border-radius: 10px; background: #1a73e8; color: #fff;
+  }
+  button:disabled { opacity: 0.5; }
+  #status {
+    margin-top: 12px; font-size: 12px; white-space: pre-wrap;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  .ok { color: #1e8e3e; }
+  .err { color: #d93025; }
+</style>
+</head>
+<body>
+  <h1>Connect to GPMC</h1>
+  <p>Sign in on the Google&nbsp;EmbeddedSetup page and tap&nbsp;<b>I&nbsp;agree</b> first, then use the button below.</p>
+  <button id="connect">Connect account</button>
+  <button id="peek" style="background:#5f6368;margin-top:8px">Check for token</button>
+  <button id="dump" style="background:#5f6368;margin-top:8px">Dump all cookies</button>
+  <button id="grant" style="background:#5f6368;margin-top:8px">Request all-sites access</button>
+  <div id="status"></div>
+  <script src="popup.js"></script>
+</body>
+</html>

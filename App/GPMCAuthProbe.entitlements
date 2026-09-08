@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  The production handoff path: the Safari extension process writes the
+	  captured oauth_token into this App Group container as a single-use,
+	  timestamped file; the app consumes and deletes it on next foreground.
+	  Requires a Development Team (free personal team is enough) to take effect.
+	  On an unsigned simulator build this entitlement is inert and the probe
+	  falls back to the gpmcprobe:// URL handoff (see HandoffStore.swift).
+	-->
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.dev.gpmc.authprobe</string>
+	</array>
+</dict>
+</plist>

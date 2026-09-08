@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "GPMC Connect",
+  "version": "0.1.0",
+  "description": "Feasibility probe: capture the Google EmbeddedSetup oauth_token cookie and hand it to the GPMC Auth Probe app.",
+  "icons": {
+    "48": "icon-48.png",
+    "96": "icon-96.png",
+    "128": "icon-128.png"
+  },
+  "background": {
+    "scripts": ["background.js"],
+    "persistent": false
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://accounts.google.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "permissions": ["cookies", "nativeMessaging", "activeTab"],
+  "host_permissions": ["https://accounts.google.com/*"],
+  "optional_host_permissions": ["*://*/*"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "GPMC Connect",
+    "default_icon": {
+      "48": "icon-48.png",
+      "96": "icon-96.png"
+    }
+  }
+}

@@ -1,0 +1,79 @@
+name: GPMCAuthProbe
+
+options:
+  bundleIdPrefix: dev.gpmc.authprobe
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+  minimumXcodeGenVersion: "2.40.0"
+
+settings:
+  base:
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    SWIFT_VERSION: "5.9"
+    TARGETED_DEVICE_FAMILY: "1"
+    IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+    # No paid Apple Developer account is configured on this machine, so the
+    # simulator build turns signing off. Fill DEVELOPMENT_TEAM in and flip
+    # CODE_SIGNING_ALLOWED to YES to run on a physical device.
+    DEVELOPMENT_TEAM: ""
+    CODE_SIGN_STYLE: Automatic
+
+targets:
+  GPMCAuthProbe:
+    type: application
+    platform: iOS
+    sources:
+      - path: App/Sources
+      - path: GPMC/Core
+    settings:
+      base:
+        INFOPLIST_FILE: App/Resources/Info.plist
+        PRODUCT_BUNDLE_IDENTIFIER: dev.gpmc.authprobe
+        CODE_SIGN_ENTITLEMENTS: App/GPMCAuthProbe.entitlements
+        GENERATE_INFOPLIST_FILE: NO
+        ASSETCATALOG_COMPILER_GENERATE_ASSET_SYMBOLS: NO
+    dependencies:
+      - target: GPMCAuthProbeExtension
+        embed: true
+
+  GPMCAuthProbeExtension:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: Extension/Sources
+      - path: Extension/WebResources
+        # Listed as a source dir with the resources build phase so each web
+        # extension file (manifest.json, *.js, *.html, icons) is added as a
+        # plain file reference and lands at the extension bundle root, which is
+        # where Safari looks for manifest.json.
+        buildPhase: resources
+    settings:
+      base:
+        INFOPLIST_FILE: Extension/Resources/Info.plist
+        PRODUCT_BUNDLE_IDENTIFIER: dev.gpmc.authprobe.Extension
+        CODE_SIGN_ENTITLEMENTS: Extension/GPMCAuthProbeExtension.entitlements
+        GENERATE_INFOPLIST_FILE: NO
+
+  GPMCAuthProbeTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: Tests/GPMCAuthProbeTests
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: dev.gpmc.authprobe.Tests
+    dependencies:
+      - target: GPMCAuthProbe
+
+schemes:
+  GPMCAuthProbe:
+    build:
+      targets:
+        GPMCAuthProbe: all
+        GPMCAuthProbeTests: [test]
+    test:
+      targets:
+        - GPMCAuthProbeTests

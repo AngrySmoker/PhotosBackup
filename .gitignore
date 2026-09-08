@@ -1,0 +1,23 @@
+# Xcode / build
+DerivedData/
+build/
+*.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+*.xcodeproj/project.xcworkspace/xcuserdata/
+
+# XcodeGen output is regenerated from project.yml; keep it out of history.
+GPMCAuthProbe.xcodeproj/
+
+# SwiftPM
+.build/
+.swiftpm/
+
+# macOS
+.DS_Store
+
+# Local secrets / probe scratch
+*.oauth_token
+scratch/
+
+# Local test account credentials — never commit.
+acc.txt
