@@ -42,7 +42,7 @@ Photos credential, and an authenticated `photosdata-pa` request succeeds.
 The Xcode project, app target, and scheme are named `PhotosBackup`; the
 user-facing app is named **Photos Backup**.
 
-Latest release: **0.1.0** ([releases](https://github.com/g8row/PhotosBackup/releases)).
+Latest release: **0.2.0** ([releases](https://github.com/g8row/PhotosBackup/releases)).
 75 offline unit tests pass (2 live tests skipped) on iPhone 16 Pro simulator.
 
 ### App identity (since 0.0.2)
@@ -61,7 +61,7 @@ Latest release: **0.1.0** ([releases](https://github.com/g8row/PhotosBackup/rele
 
 - macOS with Xcode 16.4 and an installed iOS Simulator runtime
 - [XcodeGen](https://github.com/yonaskolb/XcodeGen) 2.40 or newer
-- iOS 16.0 or newer
+- iOS 15.0 or newer
 - A Google account for the live connection flow
 - For a physical device: an Apple signing identity, or a sideloading tool such
   as SideStore or AltStore
