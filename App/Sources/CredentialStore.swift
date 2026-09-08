@@ -81,7 +81,10 @@ actor CredentialStore {
         var errorDescription: String? {
             switch self {
             case .keychain(let status):
-                let detail = SecCopyErrorMessageString(status, nil) as String? ?? "OSStatus \(status)"
+                // SecCopyErrorMessageString already ends its sentence, so
+                // don't add a second full stop.
+                let detail = (SecCopyErrorMessageString(status, nil) as String? ?? "OSStatus \(status)")
+                    .trimmingCharacters(in: CharacterSet(charactersIn: " ."))
                 return "The Keychain refused the credential: \(detail)."
             case .bound:
                 return "Google issued a bound (encrypted) token. This build cannot use it; connect an account whose token is unbound."

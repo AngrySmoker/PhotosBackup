@@ -7,6 +7,9 @@ import Foundation
 final class AuthProbe: ObservableObject {
     let log: ProbeLog
     @Published var running = false
+    /// Called with a usable exchange result so the Photos side can adopt the
+    /// credential. Set by the app entry point.
+    var onExchange: ((TokenExchange.Result) async -> Void)?
 
     init(log: ProbeLog) {
         self.log = log
@@ -60,6 +63,8 @@ final class AuthProbe: ObservableObject {
             log.set(ProbeLog.readAccess, .skipped, "skipped: no usable access token")
             return
         }
+
+        await onExchange?(result)
 
         log.set(ProbeLog.readAccess, .running)
         do {

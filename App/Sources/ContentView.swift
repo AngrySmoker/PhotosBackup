@@ -16,6 +16,7 @@ struct ContentView: View {
                 environmentSection
                 flowSection
                 checklistSection
+                uploadsSection
                 advancedSection
             }
             .navigationTitle("GPMC Auth Probe")
@@ -101,6 +102,14 @@ struct ContentView: View {
 
     // MARK: - Advanced
 
+    private var uploadsSection: some View {
+        Section {
+            NavigationLink { UploadsView() } label: {
+                Label("Uploads", systemImage: "arrow.up.doc")
+            }
+        }
+    }
+
     private var advancedSection: some View {
         Section {
             DisclosureGroup("Advanced: paste an oauth_token", isExpanded: $showAdvanced) {
@@ -139,4 +148,6 @@ struct ContentView: View {
         .environmentObject(ProbeLog())
         .environmentObject(HandoffStore())
         .environmentObject(AuthProbe(log: ProbeLog()))
+        .environmentObject(PhotosStack().account)
+        .environmentObject(PhotosStack().queue)
 }
