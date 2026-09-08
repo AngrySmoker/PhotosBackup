@@ -21,3 +21,6 @@ scratch/
 
 # Local test account credentials — never commit.
 acc.txt
+
+# Per-worktree derived data (agents build in parallel).
+.dd/
