@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Install Photos Backup</title>
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; max-width: 560px; margin: 2rem auto; padding: 0 1rem; }
+  a.btn { display: block; text-align: center; padding: 1rem; margin: 0.75rem 0;
+          border-radius: 12px; text-decoration: none; font-weight: 600; color: #fff; }
+  a.sidestore { background: #007aff; }
+  a.altstore { background: #222; }
+  code { word-break: break-all; }
+</style>
+</head>
+<body>
+<h1>Install Photos Backup</h1>
+<p>Tap a button <strong>on your iPhone</strong> (with SideStore or AltStore installed). Open this page in Safari on the iPhone — the buttons do nothing on a Mac or PC.</p>
+<a class="btn sidestore" id="sidestore" href="#">Install with SideStore</a>
+<a class="btn altstore" id="altstore" href="#">Install with AltStore</a>
+<p>Latest unsigned IPA:<br><code id="ipa"></code></p>
+<h2>Manual install</h2>
+<ol>
+  <li>AirDrop the IPA to the iPhone and save it in Files.</li>
+  <li>Turn on LocalDevVPN.</li>
+  <li>In SideStore, tap +, choose <code>PhotosBackup.ipa</code>, and install it.</li>
+  <li>If asked whether to retain app extensions, keep Photos Backup Connect.</li>
+</ol>
+<script>
+  var ipa = "https://github.com/g8row/PhotosBackup/releases/latest/download/PhotosBackup.ipa";
+  document.getElementById("ipa").textContent = ipa;
+  document.getElementById("sidestore").href = "sidestore://install?url=" + encodeURIComponent(ipa);
+  document.getElementById("altstore").href = "altstore://install?url=" + encodeURIComponent(ipa);
+</script>
+</body>
+</html>
