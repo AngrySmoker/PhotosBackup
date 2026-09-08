@@ -7,12 +7,21 @@ manual credential import.
 The probe is a small app + Safari web extension that runs the checklist from
 the handoff plan's Step 2 and reports each step pass/fail on screen.
 
-**Current bottom line (2026-09-08):** blocked on an earlier step than expected.
-The Safari extension is not getting *any* cookie access on the unsigned
-simulator build (`browser.cookies.getAll({})` returns 0 cookies for every
-site), so we cannot yet observe whether Google's EmbeddedSetup page issues an
-`oauth_token` cookie to mobile Safari. Next attempt: grant the extension
-all-sites access and/or retest on a signed build. See **Test log** below.
+**Current bottom line (2026-09-08, after attempt 2):** the route works as far as
+we can currently test it. The step-3 blocker was **not** permissions and **not**
+code signing — iOS Safari exposes more than one cookie store, and a
+`cookies.get()` / `getAll()` that omits `storeId` searches only the default
+store, which is not the one the browsing tabs use. Sweeping every store from
+`cookies.getAllCookieStores()` fixed it. With that fix, **Google's EmbeddedSetup
+page does issue an `oauth_token` cookie to mobile Safari** (80 chars, domain
+`accounts.google.com`, `httpOnly`, session) and the extension reads it, hands it
+to the app, and the app ingests it single-use. Steps 1-6 pass on an **unsigned
+simulator build**.
+
+Step 7 (the exchange) is **not yet cleanly measured**: the token was consumed
+twice by two operators driving the simulator at once, so the run that reached
+Google saw an already-spent token and returned `BadAuthentication`. This says
+nothing about the exchange itself — it needs one clean run on a fresh token.
 
 ## Build & run
 
@@ -51,7 +60,7 @@ TEST_RUNNER_GPMC_LIVE=1 TEST_RUNNER_GPMC_OAUTH_TOKEN=oauth_XXXX xcodebuild ... t
   -only-testing:GPMCAuthProbeTests/LiveExchangeTests/testFullExchangeWithRealToken
 ```
 
-## Checklist status (2026-09-08, iOS 18.6 simulator, Xcode 16.4, unsigned)
+## Checklist status (2026-09-08 attempt 2, iOS 18.6 simulator, Xcode 16.4, unsigned)
 
 | # | Checklist step | Status | Evidence / note |
 |---|---|---|---|
@@ -59,11 +68,11 @@ TEST_RUNNER_GPMC_LIVE=1 TEST_RUNNER_GPMC_OAUTH_TOKEN=oauth_XXXX xcodebuild ... t
 | — | Extension registered with iOS | **PASS** | `simctl spawn "iPhone 16 Pro" pluginkit -mv` lists `dev.gpmc.authprobe.Extension(0.1.0)`. |
 | — | Web extension bundle shape | **PASS** | `manifest.json` at bundle root, MV3, `NSExtensionPointIdentifier = com.apple.Safari.web-extension`, `permissions: [cookies, nativeMessaging, activeTab]`, `host_permissions: [https://accounts.google.com/*]`, `optional_host_permissions: [*://*/*]`. |
 | 2 | Extension enabled in Safari settings | **PASS** | User enabled it manually in Safari settings. |
-| 3 | Host permission effective for accounts.google.com | **FAIL (so far)** | With the site set to Allow, `browser.cookies.getAll({domain:"accounts.google.com"})` and `getAll({})` both return **0 cookies**. The extension has no cookie visibility at all. Cause not yet isolated — see Test log. |
-| 4 | Extension reads the `oauth_token` cookie | **BLOCKED** | Cannot be reached until step 3 works. `No token yet (cookie-absent)` observed, but that is a consequence of step 3, not evidence about Google's page. |
-| 5 | Cookie handed to native code | **NOT RUN** (unsigned) | `sendNativeMessage` → `SafariWebExtensionHandler` is wired; App Group persistence is inert without a team (probe falls back to `gpmcprobe://`). |
-| 6 | App ingests the token, single use | **PASS (logic only)** | `HandoffStore` consumes the source file on read; construction-level, no integration run yet. |
-| 7 | Exchange `oauth_token` → master token | **PARTIAL** | Request/body match gotohp (`TokenExchangeTests`, 7/7). Live: a bogus token returns `Error=BadAuthentication`, parsed and surfaced correctly — the request path from iOS works. Happy path needs a real token. |
+| 3 | Host permission effective for accounts.google.com | **PASS** | Root cause was cookie-store partitioning, not permission and not signing. `cookies.getAllCookieStores()` returns multiple stores; queries omitting `storeId` hit the wrong one. `background.js` now sweeps every store. |
+| 4 | Extension reads the `oauth_token` cookie | **PASS** | `Found oauth_token` — length 80, domain `accounts.google.com`, `httpOnly: true`, `session: true`. `httpOnly` matters: no content script could have read it, only the `cookies` API. Screenshot `07-oauth-token-found-live.png`. |
+| 5 | Cookie handed to native code | **PASS** (via URL channel) | Delivered over the `gpmcprobe://` fallback (`channel: url, captured 12 sec ago`). The App Group path remains inert on an unsigned build, as designed. |
+| 6 | App ingests the token, single use | **PASS** | Live: `token length 80; source cleared after read`. |
+| 7 | Exchange `oauth_token` → master token | **INCONCLUSIVE** | Request/body match gotohp (`TokenExchangeTests`, 7/7). Live run returned `BadAuthentication` on an **already-spent** token (consumed twice — see Test log attempt 2), so the happy path is still unmeasured. Needs one clean run on a fresh token. |
 | 8 | Exchange master token → Photos access token | **NOT RUN** | Needs a real master token. `TokenEncrypted=1` is detected and rejected (not mishandled). |
 | 9 | Read-only Photos request succeeds | **NOT RUN** | `GPMCClient.validateReadAccess()` — dummy hash lookup, mirrors gotohp's `FindRemoteMediaByHash`. |
 
@@ -102,40 +111,84 @@ prints `typeof browser.cookies`, `browser.permissions.getAll()`, and
 be granted; plus content-script logging of the landed URL, page title, and
 non-HttpOnly cookie names.
 
-## Manual test script (next attempt — needs your Google account)
+### 2026-09-08 — attempt 2 (unsigned simulator build, storeId fix)
 
-1. Rebuild + reinstall (commands above). Launch `GPMCAuthProbe`.
-2. **Grant the extension access to every website.** `ᴀA` / puzzle menu on any
-   page → **GPMC Connect** → **Always Allow on Every Website** (or Settings →
-   Apps → Safari → Extensions → GPMC Connect → **All Websites → Allow**).
-   Enabling the extension is not enough — this is the step that grants cookie
-   access.
-3. **Sanity-check the cookies API first**, before touching EmbeddedSetup:
-   open `https://myaccount.google.com` (already signed in), open the **GPMC
-   Connect** popup → **Dump all cookies**. Read the top lines:
-   - `cookies API: object / getAll: function` and a non-empty
-     `granted permissions:` with an `origins` list, **and** `google.com`
-     cookies listed → the API works. Proceed to step 4.
-   - Still `0 cookie(s)` everywhere and `granted permissions:` shows no
-     origins → iOS Safari is not giving this (unsigned) extension cookie
-     access. Stop; retest on a signed build (free personal team) before
-     drawing any conclusion about the route.
-4. (Optional, worth trying) In Safari, `ᴀA` menu → **Request Desktop
-   Website**, or add accounts.google.com under Settings → Apps → Safari →
-   Request Desktop Website. This sends a macOS UA — the environment gotohp is
-   known to work in.
-5. Tap **Open Google EmbeddedSetup in Safari** from the app. Sign in.
-   **Note whether an "I agree" / consent screen appears and tap it.** Expect
-   the page to hang afterward — that's normal.
-6. Open the **GPMC Connect** popup → **Dump all cookies**.
-   - `oauth_token IS present` → the route works. Tap **Connect account**,
-     return to the app, screenshot the checklist (steps 7–9 auto-run).
-   - Healthy `accounts.google.com` cookie list but **no `oauth_token`** →
-     EmbeddedSetup is not issuing it to this client. Route is likely dead on
-     iOS Safari → manual `oauth_token` import is the fallback.
-7. Report: the `granted permissions:` line, the cookie names listed for
-   `accounts.google.com`, whether "I agree" appeared, and any red-step
-   `detail` text.
+Isolating step 3 first, deliberately **without** any Google account: the failure
+reproduces on any cookie-setting site, so `wikipedia.org` was enough.
+
+- **Dump all cookies** on wikipedia.org with no `storeId` → `0 cookie(s)`, while
+  `browser.cookies` was a live object and `permissions.getAll()` listed granted
+  origins. Permission was never the problem
+  (`01-dump-no-storeid-wikipedia.png`).
+- `cookies.getAllCookieStores()` returned **more than one store**, and querying
+  each store explicitly returned the cookies (`02-cookiestore-partition-evidence.png`,
+  `03-both-contexts-storeid-confirmed.png`).
+
+**Root cause:** iOS Safari partitions cookies across multiple stores. A
+`cookies.get()` / `getAll()` that omits `storeId` searches only the default
+store, which is *not* the store the browsing tabs use, and returns zero cookies
+for every site. That is indistinguishable at the call site from a denied
+permission, which is what sent attempt 1 chasing permissions and code signing.
+
+**Fix:** `background.js` now enumerates `cookies.getAllCookieStores()` and
+sweeps every store in both `readOAuthToken()` and `dumpCookies()`
+(`04-self-test-pass.png`, `05-dump-after-fix.png`).
+
+This retires candidate causes 1-3 from attempt 1. Candidate 4 is also retired:
+the EmbeddedSetup consent screen **does** render on a mobile UA — no desktop-UA
+override was needed (`06-embeddedsetup-renders-on-mobile.png`).
+
+With a real account signed in on EmbeddedSetup:
+
+- **GPMC Connect → Check for token** → `Found oauth_token`, length 80, domain
+  `accounts.google.com`, `httpOnly: true`, `session: true`
+  (`07-oauth-token-found-live.png`). **This answers ADR-001's open question: yes,
+  mobile Safari receives the cookie.** `httpOnly: true` also confirms the
+  `cookies` API is load-bearing — a content script could never have read it.
+- **Connect account** → delivered over `gpmcprobe://` (`channel: url`), app
+  ingested it single-use, `source cleared after read`. Steps 1-6 green
+  (`08-app-checklist-top.png`).
+- Step 7 → `BadAuthentication — the oauth_token is invalid or already spent`
+  (`09-app-checklist-token-already-spent.png`).
+
+**Caveat on step 7, important:** two operators were driving the simulator
+concurrently and **Connect account ran twice**, so the token was consumed twice.
+`oauth_token` is single-use; the second exchange was always going to fail this
+way. Treat step 7 as *unmeasured*, not failed. It needs one clean run on a fresh
+token before any conclusion is drawn.
+
+**Consequence for ADR-001:** the claim that "a real Apple Developer team is
+probably needed even to evaluate this route" is **refuted**. Cookie access,
+capture, handoff and ingest all work unsigned. A team is still required for the
+App Group handoff channel (shipping), but not for evaluation.
+
+## Manual test script (next run — one clean shot at step 7)
+
+Steps 1-6 are settled. The only thing left to measure is the exchange, and it
+must be done on a **fresh** `oauth_token` with **exactly one** Connect account
+tap. Do not run two operators against the simulator at once.
+
+1. Launch `GPMCAuthProbe`. Confirm the extension is enabled and has All Websites
+   access (a reinstall wipes the grant).
+2. Tap **Open Google EmbeddedSetup in Safari**. EmbeddedSetup always starts a
+   full add-account sign-in — an existing Safari session is not reused, so the
+   account password is required here.
+3. Sign in and tap **I agree**. The page then hangs on a spinner; that is
+   expected and means the cookie has been written.
+4. Open the **GPMC Connect** popup → **Check for token** → expect
+   `Found oauth_token`.
+5. Tap **Connect account** **once**. Accept the `gpmcprobe://` dialog once.
+   If a second dialog appears, **cancel it** — accepting it re-ingests a spent
+   token and will paint step 7 red for no reason.
+6. Return to the app. Steps 7-9 run automatically. Screenshot the checklist.
+7. Report: the step 7 result, and if green, whether step 8 reported
+   `TokenEncrypted=1` — that decides whether token binding must be ported
+   before shipping.
+
+If step 7 fails again on a demonstrably fresh single-use token, the likely
+suspects are the `droidguard_results: "dummy123"` placeholder in
+`TokenExchange.oauthExchangeBody` and the `Email` placeholder, both inherited
+from gotohp.
 
 ## If the route is confirmed dead
 

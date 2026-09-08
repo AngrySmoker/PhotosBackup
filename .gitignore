@@ -21,3 +21,6 @@ scratch/
 
 # Local test account credentials — never commit.
 acc.txt
+
+# Agent worktrees
+.claude/worktrees/

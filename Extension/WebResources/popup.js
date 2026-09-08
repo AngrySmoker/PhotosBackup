@@ -5,6 +5,21 @@ const connectBtn = document.getElementById("connect");
 const peekBtn = document.getElementById("peek");
 const dumpBtn = document.getElementById("dump");
 const grantBtn = document.getElementById("grant");
+const selfTestBtn = document.getElementById("selftest");
+
+selfTestBtn.addEventListener("click", async () => {
+  show("Self-testing (plant → read → delete)…");
+  const res = await browser.runtime.sendMessage({ type: "probe:self-test" });
+  if (!res || !res.ok) {
+    show(`Self-test failed to run: ${JSON.stringify(res)}`, "err");
+    return;
+  }
+  show(
+    `${res.pass ? "SELF-TEST PASS" : "SELF-TEST FAIL"} (planted in ${res.planted} store(s))\n\n` +
+      res.steps.join("\n"),
+    res.pass ? "ok" : "err"
+  );
+});
 
 grantBtn.addEventListener("click", async () => {
   show("Requesting…");
@@ -24,8 +39,29 @@ grantBtn.addEventListener("click", async () => {
   }
 });
 
+// Same call, but made from the popup page instead of the background worker.
+// Safari's activeTab / temporary grants attach to the page the user actually
+// interacted with, so a difference between the two contexts is itself a result.
+async function localProbe() {
+  const lines = ["--- popup-context probe ---"];
+  try {
+    lines.push(`popup typeof browser.cookies: ${typeof browser.cookies}`);
+    const all = await browser.cookies.getAll({});
+    lines.push(`popup getAll({}): ${all.length} cookie(s)`);
+    const stores = await browser.cookies.getAllCookieStores();
+    for (const s of stores) {
+      const c = await browser.cookies.getAll({ storeId: s.id });
+      lines.push(`popup getAll({storeId:${s.id}}): ${c.length} cookie(s)`);
+    }
+  } catch (e) {
+    lines.push(`popup probe threw: ${String(e)}`);
+  }
+  return lines.join("\n");
+}
+
 dumpBtn.addEventListener("click", async () => {
   show("Dumping…");
+  const local = await localProbe();
   const res = await browser.runtime.sendMessage({ type: "probe:dump-cookies" });
   if (!res || !res.ok) {
     show(`Dump failed: ${JSON.stringify(res)}`, "err");
@@ -33,6 +69,9 @@ dumpBtn.addEventListener("click", async () => {
   }
   const lines = [];
   if (res.caps) {
+    lines.push(
+      `accounts.google.com across ALL stores: ${JSON.stringify(res.caps.accountsGoogleAcrossStores)}`
+    );
     lines.push(`cookies API: ${res.caps.cookiesApi} / getAll: ${res.caps.getAll}`);
     lines.push(`origin allowed (accounts.google.com): ${res.caps.originAllowed_accounts}`);
     lines.push(`origin allowed (*://*/*): ${res.caps.originAllowed_all}`);
@@ -40,6 +79,7 @@ dumpBtn.addEventListener("click", async () => {
     lines.push(`manifest: ${JSON.stringify(res.caps.manifest)}`);
     lines.push(`cookie stores: ${JSON.stringify(res.caps.cookieStores)}`);
     lines.push(`active tab: ${JSON.stringify(res.caps.activeTab)}`);
+    lines.push(`last accounts.google.com page seen: ${JSON.stringify(res.caps.lastPageSighting)}`);
     lines.push("");
   }
   for (const [label, entries] of Object.entries(res.groups)) {
@@ -52,7 +92,11 @@ dumpBtn.addEventListener("click", async () => {
       lines.push(`${label}: ${entries.error}`);
     }
   }
-  const hasOAuth = JSON.stringify(res.groups).includes('"oauth_token"');
+  lines.push("");
+  lines.push(local);
+  const hasOAuth =
+    JSON.stringify(res.groups).includes('"oauth_token"') ||
+    JSON.stringify(res.caps.accountsGoogleAcrossStores || []).includes("oauth_token");
   show((hasOAuth ? "oauth_token IS present below\n\n" : "oauth_token NOT in any group\n\n") + lines.join("\n"),
        hasOAuth ? "ok" : "err");
 });

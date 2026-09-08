@@ -40,13 +40,22 @@ request? The `GPMCAuthProbe` target exists to answer exactly this. If the
 answer is no, the fallback is a one-time manual `oauth_token` / `auth_data`
 import under advanced setup (already sketched in `GPMCClient.AuthData`).
 
-**Status 2026-09-08:** first probe run did not reach this question. On the
-unsigned simulator build the Safari extension gets no cookie access at all
-(`browser.cookies.getAll({})` → 0 for every site), which must be cleared
-first — likely by granting all-sites permission and/or building signed with a
-real team. See `feasibility-probe.md` → Test log. Consequence: **a real Apple
-Developer team is probably needed even to evaluate this route**, not only to
-ship it.
+**Status 2026-09-08 (attempt 2):** the open question is **answered: yes.**
+Google's EmbeddedSetup page issues an `oauth_token` cookie to mobile Safari (80
+chars, `accounts.google.com`, `httpOnly`, session), the extension reads it, and
+the app ingests it — all on an **unsigned simulator build**. The consent screen
+renders on a mobile UA; no desktop-UA override is needed.
+
+Attempt 1's conclusion that "a real Apple Developer team is probably needed even
+to evaluate this route" was **wrong**, and is retracted. The zero-cookies
+symptom was cookie-store partitioning, not entitlement: iOS Safari exposes
+several cookie stores and a query omitting `storeId` searches the wrong one. A
+team is still needed for the App Group handoff and to ship, but not to evaluate.
+
+Remaining unknown: the `oauth_token` → master token exchange (checklist step 7)
+has not had a clean run — the token was consumed twice in one session, so the
+only live attempt saw a spent token. See `feasibility-probe.md` → Test log,
+attempt 2.
 
 ## Consequences
 

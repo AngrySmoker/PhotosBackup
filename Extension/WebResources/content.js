@@ -27,10 +27,18 @@
     console.log(`[GPMC Connect] consent-like text on page: ${JSON.stringify(bodyText.slice(0, 200))}`);
   }
 
-  if (!isEmbeddedSetup) return;
   const notify = () => {
     try {
-      browser.runtime.sendMessage({ type: "probe:embeddedsetup-visible", href: location.href });
+      browser.runtime.sendMessage({
+        type: "probe:page-sighting",
+        href: location.href,
+        title: document.title,
+        embeddedSetup: isEmbeddedSetup,
+        consentLike: /agree|consent|terms/i.test(
+          (document.body && document.body.innerText) || ""
+        ),
+        visibleCookieNames,
+      });
     } catch (e) {
       console.log("[GPMC Connect] could not notify background:", String(e));
     }
