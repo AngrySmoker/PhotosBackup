@@ -28,7 +28,7 @@ Concrete parameters:
 |---|---|---|
 | Minimum iOS | 16.0 | Safari web extensions with MV3 + `browser.cookies`; `NavigationStack`. Revisit to 17 only if a needed API forces it. |
 | Auth route | Safari extension → `oauth_token` → gotohp exchange | Only route that keeps full GPMC functionality *and* can run on-device. Public Photos API scopes are not equivalent and are a separate product decision. |
-| Handoff (extension → app) | App Group when the signing team can provision it, `gpmcprobe://` URL otherwise | Both are implemented and selected at runtime. **Superseded 2026-09-08** — the original "URL handoff must not ship" no longer holds; see Distribution below. |
+| Handoff (extension → app) | App Group when the signing team can provision it, `photosbackup://` URL otherwise | Both are implemented and selected at runtime. **Superseded 2026-09-08** — the original "URL handoff must not ship" no longer holds; see Distribution below. |
 | Distribution | Unsigned `.ipa`, sideloaded with SideStore (`Scripts/make-ipa.sh`) | No App Store review, no paid membership required. SideStore re-signs on device with the user's Apple ID. |
 | Upstream refs | GPMC `94b1b267…` for protocol; gotohp `0637c745…` for auth + protocol fixes | Preserve MIT notices from both. |
 | First-release scope | Account connect + explicit photo/video upload + activity queue. Live Photos, background transfer hardening, Android-credential import (incl. token binding) are follow-ups. | Keep the first release provable end to end. |
@@ -68,12 +68,12 @@ push, iCloud, associated domains and Sign in with Apple.
 
 Consequences, in descending order of how much they hurt:
 
-1. **The `gpmcprobe://` URL handoff becomes the shipping channel**, not a probe
+1. **The `photosbackup://` URL handoff becomes the shipping channel**, not a probe
    fallback. The App Group path stays in the code and is preferred whenever the
    entitlement provisions, so a paid-team build is unaffected.
 2. **The URL channel is weaker than the App Group one.** It carries a live,
    single-use `oauth_token` through a custom scheme, and iOS scheme registration
-   is not exclusive: another installed app registering `gpmcprobe` could receive
+   is not exclusive: another installed app registering `photosbackup` could receive
    the token. The exposure is one single-use token that the app consumes
    immediately, but it is a real difference and is accepted deliberately for a
    personal sideload. It should be reconsidered before any wider distribution.

@@ -2,12 +2,14 @@ import PhotosUI
 import SwiftUI
 
 struct DashboardView: View {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @EnvironmentObject private var account: PhotosAccount
     @EnvironmentObject private var queue: UploadQueue
     @EnvironmentObject private var preferences: BackupPreferences
     @EnvironmentObject private var albums: PhotoAlbumStore
 
     let onConnect: () -> Void
+    let onAccount: () -> Void
     @State private var selection: [PhotosPickerItem] = []
 
     private var selectedAlbums: [PhotoAlbum] {
@@ -41,7 +43,7 @@ struct DashboardView: View {
                 selection = []
                 Task {
                     await MediaLibrary.requestReadAccess()
-                    queue.enqueue(MediaLibrary.sources(for: items))
+                    queue.enqueue(MediaLibrary.sources(for: items), skippingExisting: true)
                 }
             }
             .onAppear { albums.refresh() }
@@ -60,8 +62,8 @@ struct DashboardView: View {
         case .connected:
             if let warning = account.persistenceWarning {
                 banner(color: .orange, symbol: "key.slash", title: "Not saved to Keychain", message: warning, showsChevron: false)
-            } else if let halt = queue.haltReason {
-                banner(color: .orange, symbol: "pause.circle.fill", title: "Backup paused", message: halt, showsChevron: false)
+            } else if queue.activeCount > 0, let reason = queue.pauseReason {
+                banner(color: .orange, symbol: "pause.circle.fill", title: "Backup paused", message: reason, showsChevron: false)
             }
         case .rejected(_, let reason):
             Button(action: onConnect) {
@@ -80,14 +82,14 @@ struct DashboardView: View {
                 }
                 Spacer()
                 ZStack {
-                    Circle().stroke(BackupTheme.blue.opacity(0.14), lineWidth: 7)
+                    Circle().stroke(heroTint.opacity(0.14), lineWidth: 7)
                     Circle()
-                        .trim(from: 0, to: queue.isIdle ? 1 : max(queue.overallFraction, 0.04))
-                        .stroke(queue.isIdle ? Color.green : BackupTheme.blue, style: StrokeStyle(lineWidth: 7, lineCap: .round))
+                        .trim(from: 0, to: heroProgress)
+                        .stroke(heroTint, style: StrokeStyle(lineWidth: 7, lineCap: .round))
                         .rotationEffect(.degrees(-90))
-                    Image(systemName: queue.isIdle ? "checkmark" : "arrow.up")
+                    Image(systemName: heroSymbol)
                         .font(.title3.bold())
-                        .foregroundStyle(queue.isIdle ? .green : BackupTheme.blue)
+                        .foregroundStyle(heroTint)
                 }
                 .frame(width: 58, height: 58)
             }
@@ -106,25 +108,36 @@ struct DashboardView: View {
         .background(BackupTheme.secondaryBackground, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
     }
 
-    private var quickActions: some View {
-        HStack(spacing: 12) {
-            Button(action: backUpSelectedAlbums) {
-                quickActionLabel(symbol: "arrow.up.circle.fill", title: "Back Up Now", detail: selectedAlbums.isEmpty ? "Choose albums first" : "\(selectedItemCount.formatted()) items")
-            }
-            .disabled(!account.status.isUsable || selectedAlbums.isEmpty || !queue.isIdle)
-
-            PhotosPicker(selection: $selection, maxSelectionCount: 50, matching: .any(of: [.images, .videos]), photoLibrary: .shared()) {
-                quickActionLabel(symbol: "photo.badge.plus", title: "Pick Photos", detail: "Manual backup")
-            }
-            .disabled(!account.status.isUsable)
+    @ViewBuilder private var quickActions: some View {
+        if dynamicTypeSize.isAccessibilitySize {
+            VStack(spacing: 12) { albumBackupAction; photoPickerAction }
+                .buttonStyle(CardButtonStyle())
+        } else {
+            HStack(spacing: 12) { albumBackupAction; photoPickerAction }
+                .buttonStyle(CardButtonStyle())
         }
-        .buttonStyle(.plain)
+    }
+
+    private var albumBackupAction: some View {
+        let enabled = account.status.isUsable && !selectedAlbums.isEmpty && queue.isIdle
+        return Button(action: backUpSelectedAlbums) {
+            quickActionLabel(symbol: "arrow.up.circle.fill", title: "Back Up Now", detail: selectedAlbums.isEmpty ? "Choose albums first" : "\(selectedItemCount.formatted()) items", isEnabled: enabled)
+        }
+        .disabled(!enabled)
+    }
+
+    private var photoPickerAction: some View {
+        let enabled = account.status.isUsable
+        return PhotosPicker(selection: $selection, maxSelectionCount: 50, matching: .any(of: [.images, .videos]), photoLibrary: .shared()) {
+            quickActionLabel(symbol: "photo.badge.plus", title: "Pick Photos", detail: "Manual backup", isEnabled: enabled)
+        }
+        .disabled(!enabled)
     }
 
     private var folderSummary: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack {
-                Text("Backed Up Albums").font(.headline)
+                Text("Selected Albums").font(.headline)
                 Spacer()
                 if preferences.automaticBackup {
                     StatusPill(text: "Automatic", symbol: "arrow.triangle.2.circlepath", color: .green)
@@ -143,7 +156,7 @@ struct DashboardView: View {
                             Text("\(album.count.formatted()) items").font(.caption).foregroundStyle(.secondary)
                         }
                         Spacer()
-                        Image(systemName: "checkmark.icloud.fill").foregroundStyle(.green)
+                        Image(systemName: "checkmark.circle.fill").foregroundStyle(BackupTheme.blue)
                     }
                 }
                 if selectedAlbums.count > 4 {
@@ -175,13 +188,18 @@ struct DashboardView: View {
     }
 
     private var accountToolbarItem: some View {
-        ZStack {
-            Circle().fill(account.status.isUsable ? BackupTheme.blue : Color.secondary.opacity(0.18))
-            Image(systemName: account.status.isUsable ? "person.fill" : "person.crop.circle.badge.exclamationmark")
-                .font(.caption.weight(.bold)).foregroundStyle(account.status.isUsable ? .white : .secondary)
+        Button(action: onAccount) {
+            ZStack {
+                Circle().fill(account.status.isUsable ? BackupTheme.blue : Color.secondary.opacity(0.18))
+                Image(systemName: account.status.isUsable ? "person.fill" : "person.crop.circle.badge.exclamationmark")
+                    .font(.caption.weight(.bold)).foregroundStyle(account.status.isUsable ? .white : .secondary)
+            }
+            .frame(width: 32, height: 32)
+            .contentShape(Circle())
         }
-        .frame(width: 32, height: 32)
+        .buttonStyle(.plain)
         .accessibilityLabel(account.status.isUsable ? "Account connected" : "Account not connected")
+        .accessibilityHint("Opens account settings")
     }
 
     private func banner(color: Color, symbol: String, title: String, message: String, showsChevron: Bool = false) -> some View {
@@ -206,9 +224,9 @@ struct DashboardView: View {
         .frame(maxWidth: .infinity)
     }
 
-    private func quickActionLabel(symbol: String, title: String, detail: String) -> some View {
+    private func quickActionLabel(symbol: String, title: String, detail: String, isEnabled: Bool) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            Image(systemName: symbol).font(.title2).foregroundStyle(BackupTheme.blue)
+            Image(systemName: symbol).font(.title2).foregroundStyle(isEnabled ? BackupTheme.blue : Color.secondary)
             Text(title).font(.subheadline.weight(.semibold)).foregroundStyle(.primary)
             Text(detail).font(.caption).foregroundStyle(.secondary).lineLimit(1)
         }
@@ -218,7 +236,8 @@ struct DashboardView: View {
     }
 
     private var heroTitle: String {
-        if let _ = queue.haltReason { return "Backup paused" }
+        if !account.status.isUsable { return "Connect to back up" }
+        if queue.activeCount > 0, queue.pauseReason != nil { return "Backup paused" }
         if !queue.isIdle { return "Backing up…" }
         if preferences.backedUpCount == 0 { return "Ready to back up" }
         return "Backup complete"
@@ -231,9 +250,25 @@ struct DashboardView: View {
         return "Your selected albums are up to date"
     }
 
+    private var heroProgress: Double {
+        if !account.status.isUsable || (queue.activeCount > 0 && queue.pauseReason != nil) { return 0.18 }
+        return queue.isIdle ? 1 : max(queue.overallFraction, 0.04)
+    }
+
+    private var heroTint: Color {
+        if !account.status.isUsable || (queue.activeCount > 0 && queue.pauseReason != nil) { return .orange }
+        return queue.isIdle ? .green : BackupTheme.blue
+    }
+
+    private var heroSymbol: String {
+        if !account.status.isUsable { return "link" }
+        if queue.activeCount > 0, queue.pauseReason != nil { return "pause.fill" }
+        return queue.isIdle ? "checkmark" : "arrow.up"
+    }
+
     private func backUpSelectedAlbums() {
         let sources = albums.sources(for: preferences.selectedAlbumIDs)
-        queue.enqueue(sources)
+        queue.enqueue(sources, skippingExisting: true)
     }
 
     private func symbol(_ state: UploadItem.State) -> String {

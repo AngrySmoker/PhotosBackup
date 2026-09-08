@@ -10,6 +10,7 @@ struct SettingsView: View {
 
     let showTutorial: () -> Void
     @State private var confirmDisconnect = false
+    @State private var connectionCheckResult: PhotosAccount.VerificationOutcome?
     private let gpmcURL = URL(string: "https://github.com/xob0t/gpmc")!
 
     var body: some View {
@@ -33,17 +34,18 @@ struct SettingsView: View {
 
     private var accountSection: some View {
         Section("Google Photos Account") {
-            HStack(spacing: 12) {
+            HStack(alignment: .top, spacing: 12) {
                 FeatureIcon(symbol: "person.crop.circle.fill", size: 44)
                 VStack(alignment: .leading, spacing: 3) {
                     Text(accountTitle)
                         .font(.headline)
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.72)
-                    Label(accountSubtitle, systemImage: account.status.isUsable ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text(accountSubtitle)
                         .font(.caption)
                         .foregroundStyle(account.status.isUsable ? Color.green : Color.secondary)
-                        .lineLimit(1)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 .layoutPriority(1)
                 Spacer()
@@ -55,14 +57,42 @@ struct SettingsView: View {
             .padding(.vertical, 4)
 
             if account.status.isUsable {
-                Button("Check Connection") { Task { await account.verify() } }
+                Button {
+                    connectionCheckResult = nil
+                    Task {
+                        let result = await account.verify()
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            connectionCheckResult = result
+                        }
+                    }
+                } label: {
+                    HStack {
+                        Text(account.verifying ? "Checking Connection…" : "Check Connection")
+                        Spacer()
+                        if account.verifying {
+                            ProgressView()
+                        } else if connectionCheckResult == .succeeded {
+                            Label("Verified", systemImage: "checkmark.circle.fill")
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(.green)
+                                .transition(.scale.combined(with: .opacity))
+                        }
+                    }
+                }
                     .disabled(account.verifying)
                 Button("Disconnect Account", role: .destructive) { confirmDisconnect = true }
             } else {
                 Button("Connect Account") { showTutorial() }
             }
 
-            if let warning = account.persistenceWarning {
+            if case .failed(let reason) = connectionCheckResult, account.status.isUsable {
+                Label(reason, systemImage: "exclamationmark.circle.fill")
+                    .font(.footnote)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if account.status.isUsable, let warning = account.persistenceWarning {
                 VStack(alignment: .leading, spacing: 8) {
                     Label("Not saved to Keychain", systemImage: "key.slash")
                         .font(.subheadline.weight(.semibold))
@@ -75,6 +105,9 @@ struct SettingsView: View {
                 .padding(.vertical, 4)
             }
         }
+        .onChange(of: account.status) { status in
+            if !status.isUsable { connectionCheckResult = nil }
+        }
     }
 
     private var backupSection: some View {
@@ -82,6 +115,11 @@ struct SettingsView: View {
             Toggle("Automatic Backup", isOn: $preferences.automaticBackup)
             Picker("Use Connection", selection: $preferences.connection) {
                 ForEach(BackupConnection.allCases) { option in Text(option.title).tag(option) }
+            }
+            if let reason = queue.networkPauseReason {
+                Label(reason, systemImage: "wifi.exclamationmark")
+                    .font(.footnote)
+                    .foregroundStyle(.orange)
             }
             Toggle("Storage Saver", isOn: $queue.options.storageSaver)
             Toggle("Count Against Storage Quota", isOn: $queue.options.useQuota)
@@ -99,13 +137,13 @@ struct SettingsView: View {
                     .foregroundStyle(extensionReady ? Color.green : Color.orange)
             }
             Button("View Connection Tutorial") { showTutorial() }
-            Button("Open App Settings") {
+            Button("Open Settings") {
                 if let url = URL(string: UIApplication.openSettingsURLString) { openURL(url) }
             }
         } header: {
             Text("Safari Extension")
         } footer: {
-            Text("The extension securely passes your Google sign-in from Safari back to this app.")
+            Text("Enable it at Settings → Apps → Safari → Extensions → Photos Backup Connect. The extension securely passes your Google sign-in back to this app.")
         }
     }
 
@@ -162,7 +200,7 @@ struct SettingsView: View {
 
 struct ConnectionTutorialView: View {
     @EnvironmentObject private var account: PhotosAccount
-    @EnvironmentObject private var probe: AuthProbe
+    @EnvironmentObject private var probe: AccountConnector
     @Environment(\.dismiss) private var dismiss
     @Environment(\.openURL) private var openURL
     @State private var step = 0
@@ -173,7 +211,7 @@ struct ConnectionTutorialView: View {
         NavigationStack {
             VStack(spacing: 0) {
                 TabView(selection: $step) {
-                    tutorial(scene: .enableExtension, title: "Enable the extension first", detail: "In Settings, turn on Photos Backup Connect and allow access to accounts.google.com.", button: "Open App Settings") {
+                    tutorial(scene: .enableExtension, title: "Enable the extension first", detail: "Go to Settings → Apps → Safari → Extensions → Photos Backup Connect. Turn it on and allow accounts.google.com.", button: "Open Settings") {
                         if let url = URL(string: UIApplication.openSettingsURLString) { openURL(url) }
                     }.tag(0)
                     safariGuidePage.tag(1)
@@ -192,36 +230,52 @@ struct ConnectionTutorialView: View {
     }
 
     private var safariGuidePage: some View {
-        VStack(spacing: 18) {
-            Spacer()
-            SafariConnectionGuide().padding(.horizontal, 24)
-            Text("Finish the connection in Safari").font(.title.bold()).multilineTextAlignment(.center)
-            Text("Sign in, tap I agree, open Photos Backup Connect, then tap Connect to App.")
-                .font(.body).foregroundStyle(.secondary).multilineTextAlignment(.center).padding(.horizontal, 30)
-            Button("Open Safari & Sign In") {
-                step = 2
-                openURL(setupURL)
+        GeometryReader { geometry in
+            ScrollView {
+                VStack(spacing: 18) {
+                    Spacer(minLength: 24)
+                    SafariConnectionGuide().padding(.horizontal, 24)
+                    Text("Finish the connection in Safari").font(.title.bold()).multilineTextAlignment(.center)
+                    Text("Sign in, tap I agree, open Photos Backup Connect, then tap Connect to App.")
+                        .font(.body).foregroundStyle(.secondary).multilineTextAlignment(.center).padding(.horizontal, 30)
+                    Button("Open Safari & Sign In") {
+                        step = 2
+                        openURL(setupURL)
+                    }
+                    .buttonStyle(PrimaryButtonStyle()).padding(.horizontal, 24)
+                    Spacer(minLength: 24)
+                }
+                .padding(.bottom, 26)
+                .frame(minHeight: geometry.size.height)
             }
-            .buttonStyle(PrimaryButtonStyle()).padding(.horizontal, 24)
-            Spacer()
+            .scrollIndicators(.hidden)
         }
-        .padding(.bottom, 26)
     }
 
     private func tutorial(scene: SafariTutorialCard.Scene, title: String, detail: String, button: String, action: @escaping () -> Void) -> some View {
-        VStack(spacing: 18) {
-            Spacer()
-            SafariTutorialCard(scene: scene)
-            Text(title).font(.title.bold()).multilineTextAlignment(.center)
-            Text(detail).font(.body).foregroundStyle(.secondary).multilineTextAlignment(.center).padding(.horizontal, 30)
-            if probe.running {
-                HStack { ProgressView(); Text("Connecting…") }.font(.headline).frame(height: 52)
-            } else {
-                Button(button, action: action).buttonStyle(PrimaryButtonStyle()).padding(.horizontal, 24)
+        GeometryReader { geometry in
+            ScrollView {
+                VStack(spacing: 18) {
+                    Spacer(minLength: 24)
+                    SafariTutorialCard(scene: scene)
+                    Text(title).font(.title.bold()).multilineTextAlignment(.center)
+                    Text(detail).font(.body).foregroundStyle(.secondary).multilineTextAlignment(.center).padding(.horizontal, 30)
+                    if probe.running {
+                        HStack { ProgressView(); Text("Connecting…") }.font(.headline).frame(height: 52)
+                    } else {
+                        Button(button, action: action).buttonStyle(PrimaryButtonStyle()).padding(.horizontal, 24)
+                    }
+                    if step < 2 {
+                        Button("Next") { withAnimation { step += 1 } }
+                            .font(.headline)
+                            .frame(minHeight: 44)
+                    }
+                    Spacer(minLength: 24)
+                }
+                .padding(.bottom, 26)
+                .frame(minHeight: geometry.size.height)
             }
-            if step < 2 { Button("Next") { withAnimation { step += 1 } }.font(.headline) }
-            Spacer()
+            .scrollIndicators(.hidden)
         }
-        .padding(.bottom, 26)
     }
 }

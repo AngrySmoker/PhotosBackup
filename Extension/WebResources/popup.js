@@ -72,7 +72,7 @@ openAppBtn.addEventListener("click", async () => {
   openAppBtn.disabled = true;
   openAppBtn.innerHTML = '<span class="spinner"></span>Opening Photos Backup…';
   try {
-    await browser.tabs.create({ url: "gpmcprobe://return" });
+    await browser.tabs.create({ url: "photosbackup://return" });
   } catch (_) {
     showStatus("Return to the Photos Backup app from your Home Screen.", "");
     openAppBtn.disabled = false;
@@ -85,7 +85,7 @@ async function urlHandoff(token) {
     showStatus("The app handoff is unavailable on this build. Reopen Photos Backup and try again.", "err");
     return false;
   }
-  const url = `gpmcprobe://token?value=${encodeURIComponent(token)}&capturedAt=${encodeURIComponent(new Date().toISOString())}`;
+  const url = `photosbackup://token?value=${encodeURIComponent(token)}&capturedAt=${encodeURIComponent(new Date().toISOString())}`;
   try {
     await browser.tabs.create({ url });
     showSuccess();

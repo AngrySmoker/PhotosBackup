@@ -122,6 +122,35 @@ final class GPMCClientTests: XCTestCase {
         XCTAssertEqual(sent?.value(forHTTPHeaderField: "device"), "0123456789abcdef")
     }
 
+    func testWiFiOnlyPolicyIsAppliedToEveryRequest() async throws {
+        StubProtocol.handler = { _ in .text("Auth=ya29.token\nExpiry=\(Self.farFuture)\n") }
+        let policy = UploadRequestNetworkPolicy()
+        policy.setCellularAllowed(false)
+        let client = try GPMCClient(authData: Self.credential, session: StubProtocol.session(), networkPolicy: policy)
+
+        try await client.authenticate()
+
+        let sent = try XCTUnwrap(StubProtocol.seen.first)
+        XCTAssertFalse(sent.allowsCellularAccess)
+        XCTAssertFalse(sent.allowsExpensiveNetworkAccess)
+    }
+
+    func testCellularPolicyCanBeChangedWithoutRecreatingTheClient() async throws {
+        StubProtocol.handler = { _ in .text("Auth=ya29.token\nExpiry=\(Self.farFuture)\n") }
+        let policy = UploadRequestNetworkPolicy()
+        policy.setCellularAllowed(false)
+        let client = try GPMCClient(authData: Self.credential, session: StubProtocol.session(), networkPolicy: policy)
+        try await client.authenticate()
+
+        policy.setCellularAllowed(true)
+        try await client.authenticate()
+
+        XCTAssertEqual(StubProtocol.seen.count, 2)
+        XCTAssertFalse(StubProtocol.seen[0].allowsCellularAccess)
+        XCTAssertTrue(StubProtocol.seen[1].allowsCellularAccess)
+        XCTAssertTrue(StubProtocol.seen[1].allowsExpensiveNetworkAccess)
+    }
+
     func testBoundTokenIsDetectedAndRejectedRatherThanUsed() async throws {
         StubProtocol.handler = { _ in .text("Auth=ya29.token\nTokenEncrypted=1\nExpiry=\(Self.farFuture)\n") }
         let client = try GPMCClient(authData: Self.credential, session: StubProtocol.session())

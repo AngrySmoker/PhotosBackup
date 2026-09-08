@@ -4,28 +4,44 @@ import SwiftUI
 struct PhotosBackupApp: App {
     @StateObject private var log: ProbeLog
     @StateObject private var handoff = HandoffStore()
-    @StateObject private var probe: AuthProbe
+    @StateObject private var connector: AccountConnector
     @StateObject private var account: PhotosAccount
     @StateObject private var queue: UploadQueue
     @StateObject private var preferences: BackupPreferences
     @StateObject private var albums: PhotoAlbumStore
     @Environment(\.scenePhase) private var scenePhase
-    private let photos: PhotosStack
+    private let network: NetworkPolicyMonitor
+    private let automaticBackup: AutomaticBackupCoordinator
 
     init() {
         let sharedLog = ProbeLog()
-        let sharedProbe = AuthProbe(log: sharedLog)
+        let sharedConnector = AccountConnector(log: sharedLog)
         let stack = PhotosStack()
-        // A successful exchange is what connects the account; the probe owns
+        let preferences = BackupPreferences()
+        let albums = PhotoAlbumStore()
+        let network = NetworkPolicyMonitor()
+        let automaticBackup = AutomaticBackupCoordinator(
+            photos: stack,
+            account: stack.account,
+            queue: stack.queue,
+            preferences: preferences,
+            albums: albums,
+            network: network
+        )
+        // A successful exchange is what connects the account; the connector owns
         // the token, the stack owns everything downstream of it.
-        sharedProbe.onExchange = { [weak stack] result in await stack?.connect(result) }
+        sharedConnector.onExchange = { [weak stack] result in await stack?.connect(result) }
         _log = StateObject(wrappedValue: sharedLog)
-        _probe = StateObject(wrappedValue: sharedProbe)
-        photos = stack
+        _connector = StateObject(wrappedValue: sharedConnector)
         _account = StateObject(wrappedValue: stack.account)
         _queue = StateObject(wrappedValue: stack.queue)
-        _preferences = StateObject(wrappedValue: BackupPreferences())
-        _albums = StateObject(wrappedValue: PhotoAlbumStore())
+        _preferences = StateObject(wrappedValue: preferences)
+        _albums = StateObject(wrappedValue: albums)
+        self.network = network
+        self.automaticBackup = automaticBackup
+        network.onStatusChange = { [weak automaticBackup] _ in automaticBackup?.networkDidChange() }
+        network.start()
+        automaticBackup.applyNetworkPolicy()
     }
 
     var body: some Scene {
@@ -33,27 +49,39 @@ struct PhotosBackupApp: App {
             ContentView()
                 .environmentObject(log)
                 .environmentObject(handoff)
-                .environmentObject(probe)
+                .environmentObject(connector)
                 .environmentObject(account)
                 .environmentObject(queue)
                 .environmentObject(preferences)
                 .environmentObject(albums)
-                .task { await photos.start() }
+                .task { await automaticBackup.start() }
                 .onOpenURL { url in
                     if handoff.isReturnURL(url) {
                         if let h = handoff.drainAppGroup() {
-                            Task { await probe.handle(h) { handoff.consume() } }
+                            Task { await connector.handle(h) { handoff.consume() } }
                         }
                     } else if let h = handoff.ingest(url: url) {
-                        Task { await probe.handle(h) { handoff.consume() } }
+                        Task { await connector.handle(h) { handoff.consume() } }
                     }
                 }
                 .onChange(of: scenePhase) { phase in
-                    guard phase == .active else { return }
-                    if let h = handoff.drainAppGroup() {
-                        Task { await probe.handle(h) { handoff.consume() } }
+                    switch phase {
+                    case .active:
+                        automaticBackup.applicationDidBecomeActive()
+                        if let h = handoff.drainAppGroup() {
+                            Task { await connector.handle(h) { handoff.consume() } }
+                        }
+                    case .background:
+                        automaticBackup.applicationDidEnterBackground()
+                    default:
+                        break
                     }
                 }
+                .onChange(of: preferences.connection) { _ in automaticBackup.connectionPreferenceDidChange() }
+                .onChange(of: preferences.automaticBackup) { _ in automaticBackup.backupConfigurationDidChange() }
+                .onChange(of: preferences.selectedAlbumIDs) { _ in automaticBackup.backupConfigurationDidChange() }
+                .onChange(of: preferences.completedOnboarding) { _ in automaticBackup.backupConfigurationDidChange() }
+                .onChange(of: account.status) { _ in automaticBackup.accountDidChange() }
         }
     }
 }

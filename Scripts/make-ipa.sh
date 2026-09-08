@@ -4,7 +4,7 @@
 # The output is deliberately unsigned: SideStore re-signs it on device with the
 # user's own Apple ID and applies whatever entitlements that account can
 # provision. A free personal team cannot provision App Groups, so the extension
-# -> app handoff falls back to the gpmcprobe:// URL channel; see
+# -> app handoff falls back to the photosbackup:// URL channel; see
 # docs/ADR-001-auth-route.md.
 set -euo pipefail
 

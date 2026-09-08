@@ -25,7 +25,11 @@ desktop companion or hosted service.
 - Show hashing, duplicate-check, upload, and finalization progress per item.
 - Avoid re-uploading media already present in Google Photos.
 - Retry transient failures, cancel work, and resume after reconnecting.
+- Restore pending album uploads after an app restart and remember completed
+  library assets per Google account.
 - Upload in original quality or request Google's Storage Saver processing.
+- Enforce Wi-Fi-only or Wi-Fi-and-cellular policy both at queue and request level.
+- Request recurring iOS background-processing windows for selected-album backup.
 - Store usable long-lived credentials in the iOS Keychain when signing permits.
 
 ## Current status
@@ -114,7 +118,7 @@ Safari EmbeddedSetup
 Photos Backup Connect extension
         │  oauth_token
         ▼
-App Group handoff, or gpmcprobe:// fallback
+App Group handoff, or photosbackup:// fallback
         │
         ▼
 Android master token → Photos access token → private Photos API
@@ -136,10 +140,14 @@ Android master token → Photos access token → private Photos API
 - Google can change or disable the private authentication and Photos endpoints.
 - Live Photos currently upload only their still image; the motion component is
   ignored.
-- Automatic album backup is triggered while the app is active. Background
-  transfer and continuous background scheduling are not hardened yet.
-- The Wi-Fi-only/cellular preference is saved in the UI but network-policy
-  enforcement is not implemented yet.
+- Background album backup is opportunistic: iOS decides when each processing
+  request runs and may delay it based on usage, battery, and system policy.
+- Automatic work is split into bounded batches (25 items per background window,
+  250 per foreground activation) and unfinished durable items resume later.
+- Uploads must finish inside the granted background-processing window. If iOS
+  expires it, in-flight items and iCloud resource downloads are cancelled and
+  requeued for the next run. A background `URLSession` could further improve
+  large-file transfers by letting iOS own the byte transfer between app runs.
 - Unsigned simulator builds cannot persist the credential in the Keychain.
   Free personal-team builds cannot provision App Groups and normally expire
   after seven days.

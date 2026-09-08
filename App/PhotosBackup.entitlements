@@ -8,11 +8,11 @@
 	  timestamped file; the app consumes and deletes it on next foreground.
 	  Requires a paid Development Team to take effect; free Personal Teams do
 	  not provision App Groups. When unavailable, the extension
-	  falls back to the gpmcprobe:// URL handoff (see HandoffStore.swift).
+	  falls back to the photosbackup:// URL handoff (see HandoffStore.swift).
 	-->
 	<key>com.apple.security.application-groups</key>
 	<array>
-		<string>group.dev.gpmc.authprobe</string>
+		<string>group.com.g8row.photosbackup</string>
 	</array>
 </dict>
 </plist>

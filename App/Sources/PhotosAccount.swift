@@ -9,6 +9,11 @@ import SwiftUI
 /// refused (revoked elsewhere, password changed, bound token).
 @MainActor
 final class PhotosAccount: ObservableObject {
+    enum VerificationOutcome: Equatable {
+        case succeeded
+        case failed(String)
+    }
+
     enum Status: Equatable {
         case loading
         case disconnected
@@ -32,10 +37,19 @@ final class PhotosAccount: ObservableObject {
     @Published private(set) var persistenceWarning: String?
 
     private let store: CredentialStore
+    private let requestNetworkPolicy: UploadRequestNetworkPolicy
     private var credential: StoredCredential?
     private var client: GPMCClient?
 
-    init(store: CredentialStore = CredentialStore()) { self.store = store }
+    init(store: CredentialStore = CredentialStore(),
+         requestNetworkPolicy: UploadRequestNetworkPolicy = UploadRequestNetworkPolicy()) {
+        self.store = store
+        self.requestNetworkPolicy = requestNetworkPolicy
+    }
+
+    func setCellularUploadsAllowed(_ allowed: Bool) {
+        requestNetworkPolicy.setCellularAllowed(allowed)
+    }
 
     /// Call once at launch. Restores the account without hitting the network —
     /// the first upload (or an explicit `verify()`) is what proves the token.
@@ -74,15 +88,19 @@ final class PhotosAccount: ObservableObject {
 
     /// Optional round trip to Google. Only worth running when the user asks —
     /// uploads report rejection on their own through `report(_:)`.
-    func verify() async {
-        guard let client, !verifying else { return }
+    @discardableResult
+    func verify() async -> VerificationOutcome {
+        guard let client else { return .failed("Connect an account before checking it.") }
+        guard !verifying else { return .failed("A connection check is already running.") }
         verifying = true
         defer { verifying = false }
         do {
             try await client.validateReadAccess()
             if let credential { status = .connected(email: credential.email, since: credential.connectedAt) }
+            return .succeeded
         } catch {
             report(error)
+            return .failed(Self.describe(error))
         }
     }
 
@@ -103,7 +121,7 @@ final class PhotosAccount: ObservableObject {
     private func adopt(_ credential: StoredCredential) {
         self.credential = credential
         do {
-            client = try GPMCClient(authData: credential.authData)
+            client = try GPMCClient(authData: credential.authData, networkPolicy: requestNetworkPolicy)
             status = .connected(email: credential.email, since: credential.connectedAt)
         } catch {
             client = nil

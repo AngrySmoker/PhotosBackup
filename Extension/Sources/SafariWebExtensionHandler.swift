@@ -12,13 +12,13 @@ import os.log
 /// If no App Group is available — an unsigned build, or any build signed by a
 /// free personal team, which cannot provision the entitlement — it returns
 /// `channel: "none"` plus the raw token so the popup can fall back to the
-/// `gpmcprobe://` URL handoff. On a free-account sideload that fallback is the
+/// `photosbackup://` URL handoff. On a free-account sideload that fallback is the
 /// only channel there is.
 final class SafariWebExtensionHandler: NSObject, NSExtensionRequestHandling {
 
-    private static let appGroupID = "group.dev.gpmc.authprobe"
+    private static let appGroupID = "group.com.g8row.photosbackup"
     private static let handoffFilename = "handoff.json"
-    private let log = OSLog(subsystem: "dev.gpmc.authprobe.Extension", category: "handoff")
+    private let log = OSLog(subsystem: "com.g8row.photosbackup.extension", category: "handoff")
 
     func beginRequest(with context: NSExtensionContext) {
         let request = context.inputItems.first as? NSExtensionItem

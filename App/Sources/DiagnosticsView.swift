@@ -4,7 +4,7 @@ import SwiftUI
 struct DiagnosticsView: View {
     @EnvironmentObject private var log: ProbeLog
     @EnvironmentObject private var handoff: HandoffStore
-    @EnvironmentObject private var probe: AuthProbe
+    @EnvironmentObject private var probe: AccountConnector
     @State private var manualToken = ""
     @State private var showAdvanced = false
     private let setupURL = URL(string: "https://accounts.google.com/EmbeddedSetup")!

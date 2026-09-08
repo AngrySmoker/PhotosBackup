@@ -15,12 +15,12 @@ struct Handoff: Equatable {
 ///   - App Group file, written by `SafariWebExtensionHandler`. Preferred, but
 ///     the entitlement needs a **paid** team — a free personal team cannot
 ///     provision App Groups at all.
-///   - `gpmcprobe://token?value=…` URL. The fallback, and therefore the *only*
+///   - `photosbackup://token?value=…` URL. The fallback, and therefore the *only*
 ///     channel on a free-account sideload (SideStore / AltStore).
 ///
 /// The URL channel carries a live single-use `oauth_token` through a custom
 /// scheme, and iOS does not make scheme registration exclusive: another
-/// installed app registering `gpmcprobe` could receive it instead. That is an
+/// installed app registering `photosbackup` could receive it instead. That is an
 /// accepted risk for a personally sideloaded build, not a good idea for general
 /// distribution — see docs/ADR-001-auth-route.md.
 ///
@@ -28,7 +28,7 @@ struct Handoff: Equatable {
 /// source (file or nothing) is cleared immediately on read.
 @MainActor
 final class HandoffStore: ObservableObject {
-    static let appGroupID = "group.dev.gpmc.authprobe"
+    static let appGroupID = "group.com.g8row.photosbackup"
     private static let filename = "handoff.json"
 
     @Published private(set) var pending: Handoff?
@@ -69,10 +69,10 @@ final class HandoffStore: ObservableObject {
         return handoff
     }
 
-    /// Ingest the `gpmcprobe://token?value=…` URL handoff.
+    /// Ingest the `photosbackup://token?value=…` URL handoff.
     @discardableResult
     func ingest(url: URL) -> Handoff? {
-        guard url.scheme == "gpmcprobe", url.host == "token",
+        guard url.scheme == "photosbackup", url.host == "token",
               let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
               let value = comps.queryItems?.first(where: { $0.name == "value" })?.value,
               !value.isEmpty
@@ -94,7 +94,7 @@ final class HandoffStore: ObservableObject {
     /// containing app to the foreground; the actual credential remains in the
     /// protected handoff file and is drained once the scene becomes active.
     func isReturnURL(_ url: URL) -> Bool {
-        url.scheme == "gpmcprobe" && url.host == "return"
+        url.scheme == "photosbackup" && url.host == "return"
     }
 
     /// Call once the exchange has finished with the token (success or failure).

@@ -6,7 +6,7 @@
 <title>Photos Backup Connect</title>
 <style>
   :root {
-    color-scheme: light dark;
+    color-scheme: light;
     --blue: #0a84ff;
     --green: #30b057;
     --red: #e5484d;
@@ -15,15 +15,6 @@
     --surface: #ffffff;
     --subtle: #f2f4f7;
     --line: rgba(20, 24, 31, .09);
-  }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --text: #f6f7f8;
-      --secondary: #a9afb8;
-      --surface: #1c1d20;
-      --subtle: #292b30;
-      --line: rgba(255,255,255,.10);
-    }
   }
   * { box-sizing: border-box; }
   body {
@@ -94,10 +85,15 @@
   body.success #connect { display: none; }
   body.success #open-app { display: block; }
   details { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 10px; }
-  summary { color: var(--secondary); font-size: 11px; text-align: center; cursor: pointer; list-style: none; }
+  summary {
+    display: flex; align-items: center; justify-content: center;
+    min-height: 44px;
+    color: var(--secondary); font-size: 12px; text-align: center;
+    cursor: pointer; list-style: none;
+  }
   summary::-webkit-details-marker { display: none; }
   .diagnostic-actions { margin-top: 10px; display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
-  .diagnostic-actions button { min-height: 34px; padding: 7px; border-radius: 9px; background: var(--subtle); color: var(--secondary); font-size: 10px; }
+  .diagnostic-actions button { min-height: 44px; padding: 9px; border-radius: 10px; background: var(--subtle); color: var(--secondary); font-size: 12px; }
 </style>
 </head>
 <body>

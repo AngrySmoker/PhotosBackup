@@ -19,6 +19,18 @@ struct PrimaryButtonStyle: ButtonStyle {
     }
 }
 
+/// Keeps card content legible when disabled while preserving a clear pressed state.
+struct CardButtonStyle: ButtonStyle {
+    @Environment(\.isEnabled) private var isEnabled
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .opacity(configuration.isPressed ? 0.72 : 1)
+            .saturation(isEnabled ? 1 : 0.35)
+            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+    }
+}
+
 struct StatusPill: View {
     let text: String
     let symbol: String
@@ -121,7 +133,7 @@ struct SafariTutorialCard: View {
             .padding(.horizontal, 18)
             .padding(.vertical, 12)
         }
-        .frame(height: 300)
+        .frame(minHeight: 300)
         .background(Color(uiColor: .systemBackground))
         .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 24, style: .continuous).stroke(Color.black.opacity(0.08)))
@@ -153,9 +165,15 @@ struct SafariTutorialCard: View {
             HStack(spacing: 12) {
                 FeatureIcon(symbol: "photo.stack.fill", size: 38)
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("Photos Backup Connect").font(.subheadline.weight(.semibold))
-                    Text("Access on accounts.google.com").font(.caption).foregroundStyle(.secondary)
+                    Text("Photos Backup Connect")
+                        .font(.caption.weight(.semibold))
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text("Website access allowed")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
                 }
+                .layoutPriority(1)
                 Spacer()
                 Toggle("", isOn: .constant(true)).labelsHidden()
             }
@@ -240,7 +258,7 @@ struct SafariConnectionGuide: View {
             .padding(.horizontal, 16)
             .padding(.vertical, 7)
         }
-        .frame(height: 330)
+        .frame(minHeight: 330)
         .background(Color(uiColor: .systemBackground))
         .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 24, style: .continuous).stroke(Color.black.opacity(0.08)))

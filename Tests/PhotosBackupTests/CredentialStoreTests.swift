@@ -112,7 +112,7 @@ final class CredentialStoreTests: XCTestCase {
     }
 
     func testKeychainRoundTrip() throws {
-        let store = KeychainSecretStore(service: "dev.gpmc.authprobe.tests", account: UUID().uuidString)
+        let store = KeychainSecretStore(service: "com.g8row.photosbackup.tests", account: UUID().uuidString)
         addTeardownBlock { try? store.delete() }
         do {
             try store.write(Data("first".utf8))

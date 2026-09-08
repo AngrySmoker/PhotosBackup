@@ -156,6 +156,139 @@ final class UploadQueueTests: XCTestCase {
         XCTAssertNil(queue.haltReason)
     }
 
+    func testNetworkPolicyPauseHoldsNewWorkAndResumesAutomatically() async {
+        let script = WorkerScript([])
+        let queue = makeQueue(script, maxConcurrent: 1)
+        queue.setNetworkAccess(allowed: false, pauseReason: "Waiting for Wi-Fi")
+        queue.enqueue(oneSource)
+
+        try? await Task.sleep(nanoseconds: 20_000_000)
+        XCTAssertEqual(script.calls, 0)
+        XCTAssertEqual(queue.items.first?.state, .queued)
+        XCTAssertEqual(queue.networkPauseReason, "Waiting for Wi-Fi")
+
+        queue.setNetworkAccess(allowed: true)
+        await settle(queue) { queue.items.first?.state == .done }
+        XCTAssertEqual(script.calls, 1)
+        XCTAssertNil(queue.networkPauseReason)
+    }
+
+    func testLosingAllowedNetworkRequeuesInFlightWork() async {
+        let script = WorkerScript([.block], fallback: .succeed(.uploaded(mediaKey: "ABC")))
+        let queue = makeQueue(script, maxConcurrent: 1)
+        queue.enqueue(oneSource)
+        await settle(queue) { queue.items.first?.state.isWorking == true }
+
+        queue.setNetworkAccess(allowed: false, pauseReason: "Waiting for Wi-Fi")
+        await settle(queue) { queue.items.first?.state == .queued }
+        XCTAssertEqual(script.calls, 1)
+
+        queue.setNetworkAccess(allowed: true)
+        await settle(queue) { queue.items.first?.state == .done }
+        XCTAssertEqual(script.calls, 2)
+    }
+
+    func testBackgroundExpirationRequeuesWorkForTheNextExecutionWindow() async {
+        let script = WorkerScript([.block], fallback: .succeed(.uploaded(mediaKey: "ABC")))
+        let queue = makeQueue(script, maxConcurrent: 1)
+        queue.enqueue(oneSource)
+        await settle(queue) { queue.items.first?.state.isWorking == true }
+
+        queue.suspendForBackgroundExpiration()
+        await settle(queue) { queue.items.first?.state == .queued }
+        XCTAssertNotNil(queue.systemPauseReason)
+
+        queue.resumeSystemWork()
+        await settle(queue) { queue.items.first?.state == .done }
+        XCTAssertNil(queue.systemPauseReason)
+        XCTAssertEqual(script.calls, 2)
+    }
+
+    func testAutomaticEnqueueSkipsSourcesAlreadyTrackedOrRepeatedInOneBatch() async {
+        let script = WorkerScript([])
+        let queue = makeQueue(script, maxConcurrent: 1)
+        queue.setNetworkAccess(allowed: false, pauseReason: "Waiting")
+        let source = MediaSource.file(URL(fileURLWithPath: "/tmp/repeated"))
+
+        let first = queue.enqueue([source, source], skippingExisting: true)
+        let second = queue.enqueue([source], skippingExisting: true)
+
+        XCTAssertEqual(first.count, 1)
+        XCTAssertTrue(second.isEmpty)
+        XCTAssertEqual(queue.items.count, 1)
+    }
+
+    func testPendingAssetQueueRestoresAfterRelaunch() async {
+        let persistence = MemoryUploadQueuePersistence()
+        let firstScript = WorkerScript([])
+        let first = UploadQueue(worker: firstScript.worker(), maxConcurrent: 1, persistence: persistence)
+        first.setNetworkAccess(allowed: false, pauseReason: "Waiting")
+        first.activateAccount("person@gmail.com")
+        first.enqueue([.asset(localIdentifier: "asset-1")], skippingExisting: true)
+
+        let secondScript = WorkerScript([])
+        let restored = UploadQueue(worker: secondScript.worker(), maxConcurrent: 1, persistence: persistence)
+        restored.setNetworkAccess(allowed: false, pauseReason: "Waiting")
+        restored.activateAccount("PERSON@gmail.com")
+
+        XCTAssertEqual(restored.items.count, 1)
+        XCTAssertEqual(restored.items.first?.source, .asset(localIdentifier: "asset-1"))
+        XCTAssertEqual(restored.items.first?.state, .queued)
+        restored.setNetworkAccess(allowed: true)
+        await settle(restored) { restored.items.first?.state == .done }
+        XCTAssertEqual(secondScript.calls, 1)
+    }
+
+    func testCompletedAssetLedgerSurvivesRelaunchAndSkipsTheAsset() async {
+        let persistence = MemoryUploadQueuePersistence()
+        let first = UploadQueue(worker: WorkerScript([]).worker(), maxConcurrent: 1, persistence: persistence)
+        first.activateAccount("person@gmail.com")
+        first.enqueue([.asset(localIdentifier: "asset-1")], skippingExisting: true)
+        await settle(first) { first.items.first?.state == .done }
+
+        let restored = UploadQueue(worker: WorkerScript([]).worker(), maxConcurrent: 1, persistence: persistence)
+        restored.setNetworkAccess(allowed: false, pauseReason: "Waiting")
+        restored.activateAccount("person@gmail.com")
+        let accepted = restored.enqueue([.asset(localIdentifier: "asset-1")], skippingExisting: true)
+
+        XCTAssertTrue(accepted.isEmpty)
+        XCTAssertTrue(restored.items.isEmpty)
+    }
+
+    func testQueueDoesNotCrossGoogleAccounts() {
+        let persistence = MemoryUploadQueuePersistence()
+        let first = UploadQueue(worker: WorkerScript([]).worker(), persistence: persistence)
+        first.setNetworkAccess(allowed: false, pauseReason: "Waiting")
+        first.activateAccount("first@gmail.com")
+        first.enqueue([.asset(localIdentifier: "asset-1")])
+
+        let second = UploadQueue(worker: WorkerScript([]).worker(), persistence: persistence)
+        second.setNetworkAccess(allowed: false, pauseReason: "Waiting")
+        second.activateAccount("second@gmail.com")
+
+        XCTAssertTrue(second.items.isEmpty)
+    }
+
+    func testBatchLimitCountsAcceptedItemsAfterDurableDeduplication() async {
+        let persistence = MemoryUploadQueuePersistence()
+        let first = UploadQueue(worker: WorkerScript([]).worker(), maxConcurrent: 1, persistence: persistence)
+        first.activateAccount("person@gmail.com")
+        first.enqueue([.asset(localIdentifier: "old")], skippingExisting: true)
+        await settle(first) { first.items.first?.state == .done }
+
+        let restored = UploadQueue(worker: WorkerScript([]).worker(), persistence: persistence)
+        restored.setNetworkAccess(allowed: false, pauseReason: "Waiting")
+        restored.activateAccount("person@gmail.com")
+        let accepted = restored.enqueue(
+            [.asset(localIdentifier: "old"), .asset(localIdentifier: "new-1"), .asset(localIdentifier: "new-2")],
+            skippingExisting: true,
+            limit: 1
+        )
+
+        XCTAssertEqual(accepted.count, 1)
+        XCTAssertEqual(restored.items.map(\.source), [.asset(localIdentifier: "new-1")])
+    }
+
     func testCancellingAnInFlightItemMarksItCancelledAndFreesTheSlot() async {
         let script = WorkerScript([.block], fallback: .succeed(.uploaded(mediaKey: "ABC")))
         let queue = makeQueue(script, maxConcurrent: 1)

@@ -125,6 +125,7 @@ actor MediaExporter {
             try await PHAssetResourceManager.default().writeData(for: resource, toFile: destination, options: options)
         } catch {
             try? FileManager.default.removeItem(at: destination.deletingLastPathComponent())
+            if Task.isCancelled { throw CancellationError() }
             throw Failure.unreadable(error.localizedDescription)
         }
         return try describe(destination, filename: resource.originalFilename,
@@ -168,10 +169,69 @@ enum MediaLibrary {
 
 extension PHAssetResourceManager {
     func writeData(for resource: PHAssetResource, toFile url: URL, options: PHAssetResourceRequestOptions) async throws {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            self.writeData(for: resource, toFile: url, options: options) { error in
-                if let error { continuation.resume(throwing: error) } else { continuation.resume() }
-            }
+        guard FileManager.default.createFile(atPath: url.path, contents: nil) else {
+            throw CocoaError(.fileWriteUnknown)
         }
+        let handle = try FileHandle(forWritingTo: url)
+        defer { try? handle.close() }
+        let writeFailure = PhotoResourceWriteFailure()
+        let cancellation = PhotoResourceRequestCancellation(manager: self)
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                let requestID = self.requestData(for: resource, options: options) { data in
+                    do { try handle.write(contentsOf: data) }
+                    catch { writeFailure.record(error); cancellation.cancel() }
+                } completionHandler: { error in
+                    if let failure = writeFailure.error { continuation.resume(throwing: failure) }
+                    else if let error { continuation.resume(throwing: error) }
+                    else { continuation.resume() }
+                }
+                cancellation.setRequestID(requestID)
+            }
+        } onCancel: {
+            cancellation.cancel()
+        }
+        try Task.checkCancellation()
+    }
+}
+
+private final class PhotoResourceWriteFailure: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: Error?
+
+    var error: Error? {
+        lock.lock(); defer { lock.unlock() }
+        return stored
+    }
+
+    func record(_ error: Error) {
+        lock.lock()
+        if stored == nil { stored = error }
+        lock.unlock()
+    }
+}
+
+private final class PhotoResourceRequestCancellation: @unchecked Sendable {
+    private let manager: PHAssetResourceManager
+    private let lock = NSLock()
+    private var requestID: PHAssetResourceDataRequestID?
+    private var cancelled = false
+
+    init(manager: PHAssetResourceManager) { self.manager = manager }
+
+    func setRequestID(_ requestID: PHAssetResourceDataRequestID) {
+        lock.lock()
+        self.requestID = requestID
+        let shouldCancel = cancelled
+        lock.unlock()
+        if shouldCancel { manager.cancelDataRequest(requestID) }
+    }
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        let requestID = requestID
+        lock.unlock()
+        if let requestID { manager.cancelDataRequest(requestID) }
     }
 }

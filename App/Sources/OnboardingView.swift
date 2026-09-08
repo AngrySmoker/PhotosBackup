@@ -6,7 +6,7 @@ struct OnboardingView: View {
     @EnvironmentObject private var account: PhotosAccount
     @EnvironmentObject private var handoff: HandoffStore
     @EnvironmentObject private var log: ProbeLog
-    @EnvironmentObject private var probe: AuthProbe
+    @EnvironmentObject private var probe: AccountConnector
     @EnvironmentObject private var preferences: BackupPreferences
     @EnvironmentObject private var albums: PhotoAlbumStore
     @Environment(\.openURL) private var openURL
@@ -59,11 +59,11 @@ struct OnboardingView: View {
                 Button { withAnimation { step -= 1 } } label: {
                     Image(systemName: "chevron.left")
                         .font(.body.weight(.semibold))
-                        .frame(width: 34, height: 34)
+                        .frame(width: 44, height: 44)
                 }
                 .accessibilityLabel("Back")
             } else {
-                Color.clear.frame(width: 34, height: 34)
+                Color.clear.frame(width: 44, height: 44)
             }
             Spacer()
             HStack(spacing: 6) {
@@ -134,8 +134,8 @@ struct OnboardingView: View {
             scene: .enableExtension,
             eyebrow: "FIRST, ENABLE THE EXTENSION",
             title: "Turn on Photos Backup Connect",
-            message: "Open Settings, find Safari Extensions, and enable Photos Backup Connect. Allow it on accounts.google.com.",
-            primaryTitle: "Open App Settings",
+            message: "Go to Settings → Apps → Safari → Extensions → Photos Backup Connect. Turn it on and allow accounts.google.com.",
+            primaryTitle: "Open Settings",
             primaryAction: openAppSettings,
             secondaryTitle: "I’ve Enabled the Extension",
             secondaryAction: next
@@ -143,50 +143,65 @@ struct OnboardingView: View {
     }
 
     private var safariInstructions: some View {
-        VStack(spacing: 0) {
-            SafariConnectionGuide().padding(.top, 18)
-            Spacer(minLength: 16)
-            Text("BEFORE YOU OPEN SAFARI").font(.caption.weight(.bold)).tracking(1.3).foregroundStyle(BackupTheme.blue)
-            Text("Here’s what to do in Safari").font(.title.bold()).multilineTextAlignment(.center).padding(.top, 7)
-            Text("Finish every step before returning. The Google page may keep spinning after you tap I agree — that’s expected.")
-                .font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center).lineSpacing(2).padding(.top, 9)
-            Spacer(minLength: 16)
-            Button("Open Safari & Sign In") {
-                withAnimation { step = 3 }
-                openURL(setupURL)
+        GeometryReader { geometry in
+            ScrollView {
+                VStack(spacing: 0) {
+                    SafariConnectionGuide().padding(.top, 18)
+                    Spacer(minLength: 20)
+                    Text("BEFORE YOU OPEN SAFARI").font(.caption.weight(.bold)).tracking(1.3).foregroundStyle(BackupTheme.blue)
+                    Text("Here’s what to do in Safari").font(.title.bold()).multilineTextAlignment(.center).padding(.top, 7)
+                    Text("Finish every step before returning. The Google page may keep spinning after you tap I agree — that’s expected.")
+                        .font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center).lineSpacing(2).padding(.top, 9)
+                    Spacer(minLength: 20)
+                    Button("Open Safari & Sign In") {
+                        withAnimation { step = 3 }
+                        openURL(setupURL)
+                    }
+                    .buttonStyle(PrimaryButtonStyle())
+                }
+                .padding(.horizontal, 24)
+                .padding(.bottom, 22)
+                .frame(minHeight: geometry.size.height)
             }
-            .buttonStyle(PrimaryButtonStyle())
+            .scrollIndicators(.hidden)
         }
-        .padding(.horizontal, 24)
-        .padding(.bottom, 22)
     }
 
     private var connectionCheck: some View {
-        VStack(spacing: 0) {
-            Spacer()
-            ZStack {
-                Circle().fill(connectionTint.opacity(0.10)).frame(width: 220, height: 220)
-                Circle().stroke(connectionTint.opacity(0.18), lineWidth: 8).frame(width: 154, height: 154)
-                if probe.running {
-                    ProgressView().controlSize(.large).tint(connectionTint).scaleEffect(1.35)
-                } else {
-                    Image(systemName: connectionVerified ? "checkmark.icloud.fill" : connectionFailed ? "exclamationmark.icloud.fill" : "iphone.and.arrow.forward")
-                        .font(.system(size: 72, weight: .medium)).foregroundStyle(connectionTint)
+        GeometryReader { geometry in
+            ScrollView {
+                VStack(spacing: 0) {
+                    Spacer(minLength: 28)
+                    ZStack {
+                        Circle().fill(connectionTint.opacity(0.10)).frame(width: 220, height: 220)
+                        Circle().stroke(connectionTint.opacity(0.18), lineWidth: 8).frame(width: 154, height: 154)
+                        if probe.running {
+                            ProgressView().controlSize(.large).tint(connectionTint).scaleEffect(1.35)
+                        } else {
+                            Image(systemName: connectionVerified ? "checkmark.icloud.fill" : connectionFailed ? "exclamationmark.icloud.fill" : "iphone.and.arrow.forward")
+                                .font(.system(size: 72, weight: .medium)).foregroundStyle(connectionTint)
+                        }
+                    }
+                    Spacer(minLength: 28)
+                    Text(connectionEyebrow).font(.caption.weight(.bold)).tracking(1.3).foregroundStyle(connectionTint)
+                    Text(connectionTitle).font(.largeTitle.bold()).multilineTextAlignment(.center).padding(.top, 9)
+                    Text(connectionMessage).font(.body).foregroundStyle(.secondary).multilineTextAlignment(.center).lineSpacing(3).padding(.top, 12)
+                    Spacer(minLength: 28)
+                    if !connectionVerified {
+                        Button(probe.running ? "Checking Connection…" : "Check Again") { checkForHandoff() }
+                            .buttonStyle(PrimaryButtonStyle()).disabled(probe.running)
+                        Button("Return to Safari") { openURL(setupURL) }
+                            .font(.headline)
+                            .frame(minHeight: 44)
+                            .padding(.top, 8)
+                    }
                 }
+                .padding(.horizontal, 24)
+                .padding(.bottom, 8)
+                .frame(minHeight: geometry.size.height)
             }
-            Spacer()
-            Text(connectionEyebrow).font(.caption.weight(.bold)).tracking(1.3).foregroundStyle(connectionTint)
-            Text(connectionTitle).font(.largeTitle.bold()).multilineTextAlignment(.center).padding(.top, 9)
-            Text(connectionMessage).font(.body).foregroundStyle(.secondary).multilineTextAlignment(.center).lineSpacing(3).padding(.top, 12)
-            Spacer()
-            if !connectionVerified {
-                Button(probe.running ? "Checking Connection…" : "Check Again") { checkForHandoff() }
-                    .buttonStyle(PrimaryButtonStyle()).disabled(probe.running)
-                Button("Return to Safari") { openURL(setupURL) }.font(.headline).padding(.top, 14)
-            }
+            .scrollIndicators(.hidden)
         }
-        .padding(24)
-        .padding(.bottom, 8)
         .onAppear { checkForHandoff() }
     }
 
@@ -230,42 +245,48 @@ struct OnboardingView: View {
     }
 
     private var connectionPreference: some View {
-        VStack(spacing: 0) {
-            Spacer(minLength: 30)
-            FeatureIcon(symbol: "wifi", size: 76)
-            Text("When should we back up?")
-                .font(.largeTitle.bold()).multilineTextAlignment(.center).padding(.top, 24)
-            Text("Choose how Photos Backup uses your connection.")
-                .font(.body).foregroundStyle(.secondary).multilineTextAlignment(.center).padding(.top, 10)
+        GeometryReader { geometry in
+            ScrollView {
+                VStack(spacing: 0) {
+                    Spacer(minLength: 30)
+                    FeatureIcon(symbol: "wifi", size: 76)
+                    Text("When should we back up?")
+                        .font(.largeTitle.bold()).multilineTextAlignment(.center).padding(.top, 24)
+                    Text("Choose how Photos Backup uses your connection.")
+                        .font(.body).foregroundStyle(.secondary).multilineTextAlignment(.center).padding(.top, 10)
 
-            VStack(spacing: 12) {
-                ForEach(BackupConnection.allCases) { option in
-                    Button { preferences.connection = option } label: {
-                        HStack(spacing: 14) {
-                            FeatureIcon(symbol: option == .wifiOnly ? "wifi" : "antenna.radiowaves.left.and.right", size: 44)
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text(option.title).font(.headline).foregroundStyle(.primary)
-                                Text(option.detail).font(.subheadline).foregroundStyle(.secondary)
+                    VStack(spacing: 12) {
+                        ForEach(BackupConnection.allCases) { option in
+                            Button { preferences.connection = option } label: {
+                                HStack(spacing: 14) {
+                                    FeatureIcon(symbol: option == .wifiOnly ? "wifi" : "antenna.radiowaves.left.and.right", size: 44)
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        Text(option.title).font(.headline).foregroundStyle(.primary)
+                                        Text(option.detail).font(.subheadline).foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    Image(systemName: preferences.connection == option ? "checkmark.circle.fill" : "circle")
+                                        .font(.title3).foregroundStyle(preferences.connection == option ? BackupTheme.blue : .secondary)
+                                }
+                                .padding(16)
+                                .background(BackupTheme.secondaryBackground, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                                .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(preferences.connection == option ? BackupTheme.blue : .clear, lineWidth: 2))
                             }
-                            Spacer()
-                            Image(systemName: preferences.connection == option ? "checkmark.circle.fill" : "circle")
-                                .font(.title3).foregroundStyle(preferences.connection == option ? BackupTheme.blue : .secondary)
                         }
-                        .padding(16)
-                        .background(BackupTheme.secondaryBackground, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-                        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(preferences.connection == option ? BackupTheme.blue : .clear, lineWidth: 2))
                     }
-                }
-            }
-            .padding(.top, 28)
+                    .padding(.top, 28)
 
-            Toggle("Back up selected albums automatically", isOn: $preferences.automaticBackup)
-                .font(.subheadline.weight(.medium))
-                .padding(.top, 22)
-            Spacer()
-            Button("Continue") { next() }.buttonStyle(PrimaryButtonStyle())
+                    Toggle("Back up selected albums automatically", isOn: $preferences.automaticBackup)
+                        .font(.subheadline.weight(.medium))
+                        .padding(.top, 22)
+                    Spacer(minLength: 28)
+                    Button("Continue") { next() }.buttonStyle(PrimaryButtonStyle())
+                }
+                .padding(24)
+                .frame(minHeight: geometry.size.height)
+            }
+            .scrollIndicators(.hidden)
         }
-        .padding(24)
     }
 
     private var complete: some View {
@@ -297,29 +318,38 @@ struct OnboardingView: View {
         secondaryAction: @escaping () -> Void = {},
         credit: String? = nil
     ) -> some View {
-        VStack(spacing: 0) {
-            Spacer()
-            artwork
-            Spacer()
-            Text(eyebrow).font(.caption.weight(.bold)).tracking(1.3).foregroundStyle(BackupTheme.blue)
-            Text(title).font(.largeTitle.bold()).multilineTextAlignment(.center).padding(.top, 9)
-            Text(message).font(.body).foregroundStyle(.secondary).multilineTextAlignment(.center).lineSpacing(3).padding(.top, 12)
-            Spacer()
-            Button(primaryTitle, action: primaryAction).buttonStyle(PrimaryButtonStyle())
-            if let secondaryTitle {
-                Button(secondaryTitle, action: secondaryAction)
-                    .font(.headline).padding(.top, 14)
+        GeometryReader { geometry in
+            ScrollView {
+                VStack(spacing: 0) {
+                    Spacer(minLength: 28)
+                    artwork
+                    Spacer(minLength: 28)
+                    Text(eyebrow).font(.caption.weight(.bold)).tracking(1.3).foregroundStyle(BackupTheme.blue)
+                    Text(title).font(.largeTitle.bold()).multilineTextAlignment(.center).padding(.top, 9)
+                    Text(message).font(.body).foregroundStyle(.secondary).multilineTextAlignment(.center).lineSpacing(3).padding(.top, 12)
+                    Spacer(minLength: 28)
+                    Button(primaryTitle, action: primaryAction).buttonStyle(PrimaryButtonStyle())
+                    if let secondaryTitle {
+                        Button(secondaryTitle, action: secondaryAction)
+                            .font(.headline)
+                            .frame(minHeight: 44)
+                            .padding(.top, 8)
+                    }
+                    if let credit {
+                        Link(credit, destination: gpmcURL)
+                            .font(.footnote.weight(.medium))
+                            .foregroundStyle(.secondary)
+                            .frame(minHeight: 44)
+                            .padding(.top, 4)
+                            .accessibilityHint("Opens the GPMC project on GitHub")
+                    }
+                }
+                .padding(.horizontal, 24)
+                .padding(.bottom, 8)
+                .frame(minHeight: geometry.size.height)
             }
-            if let credit {
-                Link(credit, destination: gpmcURL)
-                    .font(.footnote.weight(.medium))
-                    .foregroundStyle(.secondary)
-                    .padding(.top, 18)
-                    .accessibilityHint("Opens the GPMC project on GitHub")
-            }
+            .scrollIndicators(.hidden)
         }
-        .padding(24)
-        .padding(.bottom, 8)
     }
 
     private func tutorialPage(
@@ -333,25 +363,34 @@ struct OnboardingView: View {
         secondaryAction: @escaping () -> Void = {},
         isWorking: Bool = false
     ) -> some View {
-        VStack(spacing: 0) {
-            SafariTutorialCard(scene: scene).padding(.top, 18)
-            Spacer(minLength: 18)
-            Text(eyebrow).font(.caption.weight(.bold)).tracking(1.3).foregroundStyle(BackupTheme.blue)
-            Text(title).font(.title.bold()).multilineTextAlignment(.center).padding(.top, 7)
-            Text(message).font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center).lineSpacing(2).padding(.top, 9)
-            Spacer(minLength: 16)
-            if isWorking {
-                HStack { ProgressView(); Text("Connecting securely…") }
-                    .font(.headline).foregroundStyle(.secondary).frame(height: 50)
-            } else {
-                Button(primaryTitle, action: primaryAction).buttonStyle(PrimaryButtonStyle())
+        GeometryReader { geometry in
+            ScrollView {
+                VStack(spacing: 0) {
+                    SafariTutorialCard(scene: scene).padding(.top, 18)
+                    Spacer(minLength: 20)
+                    Text(eyebrow).font(.caption.weight(.bold)).tracking(1.3).foregroundStyle(BackupTheme.blue)
+                    Text(title).font(.title.bold()).multilineTextAlignment(.center).padding(.top, 7)
+                    Text(message).font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center).lineSpacing(2).padding(.top, 9)
+                    Spacer(minLength: 20)
+                    if isWorking {
+                        HStack { ProgressView(); Text("Connecting securely…") }
+                            .font(.headline).foregroundStyle(.secondary).frame(height: 50)
+                    } else {
+                        Button(primaryTitle, action: primaryAction).buttonStyle(PrimaryButtonStyle())
+                    }
+                    if let secondaryTitle {
+                        Button(secondaryTitle, action: secondaryAction)
+                            .font(.headline)
+                            .frame(minHeight: 44)
+                            .padding(.top, 8)
+                    }
+                }
+                .padding(.horizontal, 24)
+                .padding(.bottom, 22)
+                .frame(minHeight: geometry.size.height)
             }
-            if let secondaryTitle {
-                Button(secondaryTitle, action: secondaryAction).font(.headline).padding(.top, 13)
-            }
+            .scrollIndicators(.hidden)
         }
-        .padding(.horizontal, 24)
-        .padding(.bottom, 22)
     }
 
     private var permissionButtonTitle: String {

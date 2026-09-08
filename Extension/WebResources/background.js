@@ -1,4 +1,4 @@
-// GPMC Connect — background service worker.
+// Photos Backup Connect — background service worker.
 //
 // Responsibilities:
 //   1. Answer popup requests for the current oauth_token cookie.
@@ -13,7 +13,7 @@ const COOKIE_URL = "https://accounts.google.com";
 const COOKIE_NAME = "oauth_token";
 // On iOS/macOS Safari the applicationIdentifier argument is ignored (messages
 // route to the bundled handler), but the API still requires a string.
-const NATIVE_APP_ID = "dev.gpmc.authprobe.Extension";
+const NATIVE_APP_ID = "com.g8row.photosbackup.extension";
 
 /// Every cookie store Safari exposes, plus `undefined` for "whatever the
 /// default is". iOS Safari hands out more than one persistent store, and a

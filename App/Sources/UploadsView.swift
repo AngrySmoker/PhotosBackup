@@ -10,7 +10,8 @@ struct UploadsView: View {
         NavigationStack {
             List {
                 manualBackupSection
-                if let halt = queue.haltReason { pausedSection(halt) }
+                if queue.activeCount > 0, let reason = queue.pauseReason { pausedSection(reason) }
+                if let warning = queue.persistenceWarning { persistenceWarningSection(warning) }
                 if queue.items.isEmpty { emptySection }
                 else { activitySection }
             }
@@ -28,7 +29,7 @@ struct UploadsView: View {
                 selection = []
                 Task {
                     await MediaLibrary.requestReadAccess()
-                    queue.enqueue(MediaLibrary.sources(for: items))
+                    queue.enqueue(MediaLibrary.sources(for: items), skippingExisting: true)
                 }
             }
         }
@@ -41,7 +42,7 @@ struct UploadsView: View {
                     FeatureIcon(symbol: "photo.badge.plus", size: 42)
                     VStack(alignment: .leading, spacing: 3) {
                         Text("Choose Photos or Videos").font(.headline).foregroundStyle(.primary)
-                        Text("Back up up to 50 items at once").font(.caption).foregroundStyle(.secondary)
+                        Text("Back up to 50 items at once").font(.caption).foregroundStyle(.secondary)
                     }
                 }
                 .padding(.vertical, 4)
@@ -56,7 +57,17 @@ struct UploadsView: View {
         Section {
             Label("Backup Paused", systemImage: "pause.circle.fill").foregroundStyle(.orange)
             Text(reason).font(.footnote).foregroundStyle(.secondary)
-            Button("Resume Backup") { queue.resume() }.disabled(!account.status.isUsable)
+            if queue.haltReason != nil {
+                Button("Resume Backup") { queue.resume() }.disabled(!account.status.isUsable)
+            }
+        }
+    }
+
+    private func persistenceWarningSection(_ warning: String) -> some View {
+        Section {
+            Label("Upload Progress Isn’t Saved", systemImage: "externaldrive.badge.exclamationmark")
+                .foregroundStyle(.orange)
+            Text(warning).font(.footnote).foregroundStyle(.secondary)
         }
     }
 

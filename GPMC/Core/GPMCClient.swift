@@ -80,13 +80,50 @@ private final class ProgressDelegate: NSObject, URLSessionTaskDelegate {
     }
 }
 
+/// Thread-safe request policy shared by every client created for an account.
+/// Queue-level path monitoring controls when work starts; these request flags
+/// are the second line of defence that prevents a task from moving to cellular.
+final class UploadRequestNetworkPolicy: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cellularAllowed = true
+
+    func setCellularAllowed(_ allowed: Bool) {
+        lock.lock()
+        cellularAllowed = allowed
+        lock.unlock()
+    }
+
+    func apply(to request: inout URLRequest) {
+        lock.lock()
+        let allowed = cellularAllowed
+        lock.unlock()
+        request.allowsCellularAccess = allowed
+        request.allowsExpensiveNetworkAccess = allowed
+    }
+}
+
 actor GPMCClient {
     private let auth: AuthData
     private let session: URLSession
+    private let networkPolicy: UploadRequestNetworkPolicy
     private var token = ""
     private var expiry = Date.distantPast
     private let userAgent = "com.google.android.apps.photos/49029607 (Linux; U; Android 9; en_US; Pixel XL; Build/PQ2A.190205.001; Cronet/127.0.6510.5) (gzip)"
-    init(authData: String, session: URLSession = .shared) throws { auth = try AuthData(authData); self.session = session }
+    init(authData: String,
+         session: URLSession? = nil,
+         networkPolicy: UploadRequestNetworkPolicy = UploadRequestNetworkPolicy()) throws {
+        auth = try AuthData(authData)
+        self.networkPolicy = networkPolicy
+        if let session {
+            self.session = session
+        } else {
+            let configuration = URLSessionConfiguration.default
+            configuration.waitsForConnectivity = true
+            configuration.timeoutIntervalForRequest = 120
+            configuration.timeoutIntervalForResource = 60 * 60
+            self.session = URLSession(configuration: configuration)
+        }
+    }
     var accountEmail: String { auth.values["Email"] ?? "" }
     private func checked(_ data: Data, _ response: URLResponse) throws -> (Data, HTTPURLResponse) {
         guard let http = response as? HTTPURLResponse else { throw GPMCError(message: "Invalid server response.") }
@@ -118,8 +155,10 @@ actor GPMCClient {
         }
         return detail.isEmpty ? "" : " Google said: \(detail)"
     }
-    private func send(_ request: URLRequest, file: URL?, delegate: URLSessionTaskDelegate?) async throws -> (Data, URLResponse) {
+    private func send(_ originalRequest: URLRequest, file: URL?, delegate: URLSessionTaskDelegate?) async throws -> (Data, URLResponse) {
         try Task.checkCancellation()
+        var request = originalRequest
+        networkPolicy.apply(to: &request)
         do {
             if let file { return try await session.upload(for: request, fromFile: file, delegate: delegate) }
             return try await session.data(for: request, delegate: delegate)

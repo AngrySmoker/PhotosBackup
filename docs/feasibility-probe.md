@@ -39,7 +39,7 @@ DD="$(xcodebuild -project PhotosBackup.xcodeproj -scheme PhotosBackup \
   -showBuildSettings -sdk iphonesimulator 2>/dev/null \
   | awk -F' = ' '/ BUILT_PRODUCTS_DIR /{print $2; exit}')"
 xcrun simctl install "iPhone 16 Pro" "$DD/PhotosBackup.app"
-xcrun simctl launch "iPhone 16 Pro" dev.gpmc.authprobe
+xcrun simctl launch "iPhone 16 Pro" com.g8row.photosbackup
 ```
 
 Unit tests (offline, wire-format assertions):
@@ -67,12 +67,12 @@ TEST_RUNNER_GPMC_LIVE=1 TEST_RUNNER_GPMC_OAUTH_TOKEN=oauth_XXXX xcodebuild ... t
 | # | Checklist step | Status | Evidence / note |
 |---|---|---|---|
 | 1 | App + Safari extension build & launch | **PASS** | `BUILD SUCCEEDED`; app launched (screenshot); `.appex` embedded in `PhotosBackup.app/PlugIns/`. |
-| — | Extension registered with iOS | **PASS** | `simctl spawn "iPhone 16 Pro" pluginkit -mv` lists `dev.gpmc.authprobe.Extension(0.1.0)`. |
+| — | Extension registered with iOS | **PASS** | `simctl spawn "iPhone 16 Pro" pluginkit -mv` lists `com.g8row.photosbackup.extension(0.1.0)`. |
 | — | Web extension bundle shape | **PASS** | `manifest.json` at bundle root, MV3, `NSExtensionPointIdentifier = com.apple.Safari.web-extension`, `permissions: [cookies, nativeMessaging, activeTab]`, `host_permissions: [https://accounts.google.com/*]`, `optional_host_permissions: [*://*/*]`. |
 | 2 | Extension enabled in Safari settings | **PASS** | User enabled it manually in Safari settings. |
 | 3 | Host permission effective for accounts.google.com | **PASS** | Root cause was cookie-store partitioning, not permission and not signing. `cookies.getAllCookieStores()` returns multiple stores; queries omitting `storeId` hit the wrong one. `background.js` now sweeps every store. |
 | 4 | Extension reads the `oauth_token` cookie | **PASS** | `Found oauth_token` — length 80, domain `accounts.google.com`, `httpOnly: true`, `session: true`. `httpOnly` matters: no content script could have read it, only the `cookies` API. Screenshot `07-oauth-token-found-live.png`. |
-| 5 | Cookie handed to native code | **PASS** (via URL channel) | Delivered over the `gpmcprobe://` fallback (`channel: url, captured 12 sec ago`). The App Group path remains inert on an unsigned build, as designed. |
+| 5 | Cookie handed to native code | **PASS** (via URL channel) | Delivered over the `photosbackup://` fallback (`channel: url, captured 12 sec ago`). The App Group path remains inert on an unsigned build, as designed. |
 | 6 | App ingests the token, single use | **PASS** | Live: `token length 80; source cleared after read`. |
 | 7 | Exchange `oauth_token` → master token | **PASS** | Live, on a fresh token: master token issued for `alexguroov@gmail.com`, androidId `636428d840be3e65`. |
 | 8 | Exchange master token → Photos access token | **PASS** | Access token issued, expires in 16 hr. **No `TokenEncrypted=1`** — this account's credential is unbound, so token binding does not need porting for it. |
@@ -147,7 +147,7 @@ With a real account signed in on EmbeddedSetup:
   (`07-oauth-token-found-live.png`). **This answers ADR-001's open question: yes,
   mobile Safari receives the cookie.** `httpOnly: true` also confirms the
   `cookies` API is load-bearing — a content script could never have read it.
-- **Connect account** → delivered over `gpmcprobe://` (`channel: url`), app
+- **Connect account** → delivered over `photosbackup://` (`channel: url`), app
   ingested it single-use, `source cleared after read`. Steps 1-6 green
   (`08-app-checklist-top.png`).
 - Step 7 → `BadAuthentication — the oauth_token is invalid or already spent`
@@ -256,7 +256,7 @@ both fixed:
 2. **Open Google EmbeddedSetup in Safari** → sign in → **I agree**. The page
    then hangs on a spinner; expected.
 3. **GPMC Connect** popup → **Connect account**, **once**. Accept the
-   `gpmcprobe://` dialog once; **cancel** any second one — `oauth_token` is
+   `photosbackup://` dialog once; **cancel** any second one — `oauth_token` is
    single-use, and a second ingest re-runs the exchange on a spent token.
 4. All nine steps should go green. **Re-run read-only check** repeats step 9
    against the in-memory credential without another sign-in.
@@ -269,7 +269,7 @@ before changing anything.
 ## If the route is confirmed dead
 
 The Advanced section of the app already accepts a pasted `oauth_token` and runs
-the full exchange (`ContentView` → `AuthProbe.runExchange`). That path plus
+the full exchange (`ContentView` → `AccountConnector.runExchange`). That path plus
 `GPMCClient.AuthData` (raw `auth_data` import) is the fallback onboarding.
 Whether `TokenEncrypted=1` shows up there determines if token binding
 (`gotohp backend/tokenbinding.go`) must be ported before shipping.
@@ -287,7 +287,7 @@ provision.
 What that means in practice, on a **free** Apple ID:
 
 - **No App Group.** The capability needs a paid membership, so the extension →
-  app handoff runs over `gpmcprobe://`. Both channels are implemented and chosen
+  app handoff runs over `photosbackup://`. Both channels are implemented and chosen
   at runtime, so nothing needs changing — but see ADR-001 for the security
   tradeoff, which is real.
 - **The Keychain works.** The `errSecMissingEntitlement` seen on the simulator
@@ -310,9 +310,9 @@ App/Sources/
   PhotosBackupApp.swift   @main; onOpenURL + scenePhase drain the handoff
   ContentView.swift        checklist UI + "paste an oauth_token" advanced path
   ProbeLog.swift           the 9-step observable checklist
-  HandoffStore.swift       App Group drain + gpmcprobe:// ingest, single use
+  HandoffStore.swift       App Group drain + photosbackup:// ingest, single use
   TokenExchange.swift      oauth_token → master token → Photos credential (gotohp port)
-  AuthProbe.swift          orchestrates steps 6–9
+  AccountConnector.swift   orchestrates steps 6–9
 Extension/Sources/
   SafariWebExtensionHandler.swift   native endpoint; writes App Group handoff
 Extension/WebResources/

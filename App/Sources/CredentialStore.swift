@@ -23,7 +23,7 @@ protocol SecretStore: Sendable {
 struct KeychainSecretStore: SecretStore {
     let service: String
     let account: String
-    init(service: String = "dev.gpmc.authprobe.credential", account: String = "photos") {
+    init(service: String = "com.g8row.photosbackup.credential", account: String = "photos") {
         self.service = service; self.account = account
     }
     private var base: [String: Any] {

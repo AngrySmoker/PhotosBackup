@@ -4,7 +4,7 @@
 <dict>
 	<key>com.apple.security.application-groups</key>
 	<array>
-		<string>group.dev.gpmc.authprobe</string>
+		<string>group.com.g8row.photosbackup</string>
 	</array>
 </dict>
 </plist>

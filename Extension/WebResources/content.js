@@ -1,4 +1,4 @@
-// GPMC Connect — content script on accounts.google.com.
+// Photos Backup Connect — content script on accounts.google.com.
 //
 // Cannot read the HttpOnly oauth_token cookie. It only reports, to the
 // extension console, what page the flow actually landed on and which
@@ -14,7 +14,7 @@
     .filter(Boolean);
 
   console.log(
-    `[GPMC Connect] on ${location.host}${path}` +
+    `[Photos Backup Connect] on ${location.host}${path}` +
       ` | embeddedSetup=${isEmbeddedSetup}` +
       ` | title=${JSON.stringify(document.title)}` +
       ` | non-HttpOnly cookies=[${visibleCookieNames.join(", ")}]`
@@ -24,7 +24,7 @@
   // whether "I agree" is even being rendered on a mobile UA.
   const bodyText = (document.body && document.body.innerText || "").slice(0, 400);
   if (/agree|consent|terms/i.test(bodyText)) {
-    console.log(`[GPMC Connect] consent-like text on page: ${JSON.stringify(bodyText.slice(0, 200))}`);
+    console.log(`[Photos Backup Connect] consent-like text on page: ${JSON.stringify(bodyText.slice(0, 200))}`);
   }
 
   const notify = () => {
@@ -40,7 +40,7 @@
         visibleCookieNames,
       });
     } catch (e) {
-      console.log("[GPMC Connect] could not notify background:", String(e));
+      console.log("[Photos Backup Connect] could not notify background:", String(e));
     }
   };
   if (document.readyState === "complete") notify();

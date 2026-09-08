@@ -4,7 +4,7 @@ import Foundation
 /// oauth_token onward. The Safari-side steps (enable, permission, cookie read,
 /// handoff) are marked by the app as evidence arrives.
 @MainActor
-final class AuthProbe: ObservableObject {
+final class AccountConnector: ObservableObject {
     let log: ProbeLog
     @Published var running = false
     /// Called with a usable exchange result so the Photos side can adopt the
@@ -60,7 +60,7 @@ final class AuthProbe: ObservableObject {
                 "account: \(result.email) · androidId: \(result.androidId)")
         log.set(ProbeLog.photosToken, result.encrypted ? .skipped : .passed,
                 result.encrypted
-                    ? "TokenEncrypted=1 — bound token, not decoded by this probe"
+                    ? "TokenEncrypted=1 — bound token, not decoded by this connector"
                     : "access token issued" + (result.photosTokenExpiry.map { ", expires \(Self.rel($0))" } ?? ""))
 
         if result.encrypted {
