@@ -278,6 +278,34 @@ final class UploadQueueTests: XCTestCase {
         XCTAssertEqual(script.calls, 2)
     }
 
+    /// The foreground run waits on this rather than `activeCount`. A row parked
+    /// on an iCloud download never finishes on its own, so counting it as work
+    /// in progress held the run's wait loop open forever and the rest of the
+    /// selection was never enqueued.
+    func testICloudDeferredRowsAreNotCountedAsWorkTheRunCanWaitOn() async {
+        let script = WorkerScript([.fail(MediaExporter.Failure.iCloudDownloadRequired)],
+                                  fallback: .succeed(.uploaded(mediaKey: "ABC")))
+        let queue = makeQueue(script, maxConcurrent: 1)
+        queue.setICloudDownloadsAllowed(false)
+        queue.enqueue(sources(2))
+        await settle(queue) { queue.items.allSatisfy { $0.state.isFinished || $0.state == .waitingForICloud } }
+
+        XCTAssertEqual(queue.deferredForICloudCount, 1)
+        XCTAssertEqual(queue.activeCount, 1, "the deferred row is still unfinished")
+        XCTAssertFalse(queue.hasWorkableItems, "but nothing here can progress without a foreground download")
+    }
+
+    /// "Back Up Now" and "Re-check Backups" pass no limit, so the count they
+    /// report is the whole selection and nothing is left off-queue.
+    func testEnqueueWithoutALimitAcceptsEverySource() async {
+        let script = WorkerScript([])
+        let queue = makeQueue(script, maxConcurrent: 1)
+        queue.setNetworkAccess(allowed: false, pauseReason: "Waiting")
+        let accepted = queue.enqueue(sources(600), skippingExisting: true)
+        XCTAssertEqual(accepted.count, 600)
+        XCTAssertEqual(queue.items.count, 600)
+    }
+
     func testAutomaticEnqueueSkipsSourcesAlreadyTrackedOrRepeatedInOneBatch() async {
         let script = WorkerScript([])
         let queue = makeQueue(script, maxConcurrent: 1)

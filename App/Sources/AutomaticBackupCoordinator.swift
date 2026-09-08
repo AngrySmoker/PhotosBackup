@@ -11,12 +11,19 @@ final class AutomaticBackupCoordinator: ObservableObject {
     static let taskIdentifier = "com.g8row.photosbackup.background-backup"
     private static let logger = Logger(subsystem: "com.g8row.photosbackup", category: "automatic-backup")
 
-    /// How many sources one enqueue pass may append. These bound *memory*, not
-    /// how much a window uploads — the queue is durable, so anything a window
-    /// cannot finish simply waits for the next one. The old background value of
-    /// 25 meant a window that iOS might only grant once a day could never let
-    /// the queue saturate, and so could never advance the change token either.
-    private static let foregroundBatchLimit = 250
+    /// How many sources one background enqueue pass may append. This bounds
+    /// *memory*, not how much a window uploads — the queue is durable, so
+    /// anything a window cannot finish simply waits for the next one. The old
+    /// value of 25 meant a window that iOS might only grant once a day could
+    /// never let the queue saturate, and so could never advance the change
+    /// token either.
+    ///
+    /// The foreground has no equivalent cap. Paging it meant the queue only
+    /// ever showed a slice of the work, so the count the manual buttons
+    /// reported was a slice too, and any condition that ended the paging loop
+    /// early stranded the rest of the selection off-queue. In the foreground
+    /// the whole selection goes in at once and the queue's own concurrency
+    /// limit decides how much of it runs.
     private static let backgroundBatchLimit = 250
 
     private let photos: PhotosStack
@@ -194,21 +201,31 @@ final class AutomaticBackupCoordinator: ObservableObject {
         }
     }
 
-    /// Keep the in-memory queue bounded without stopping an initial backup after
-    /// its first page. Completed and failed source keys make each rescan cheap
-    /// and ensure the loop eventually reaches every selected asset.
-    private func performForegroundBackup(_ sources: [MediaSource]) async {
+    /// Hand the whole selection to the queue, then stay alive while it drains so
+    /// assets the library gains mid-run are picked up without another tap.
+    ///
+    /// `manual` runs are the user asking right now, so they are not gated on
+    /// `shouldSchedule`. That gate includes "Automatic Backup is turned off" —
+    /// which Stop Backup sets — so honouring it here meant a manual run enqueued
+    /// one page and then found the loop condition already false, leaving the
+    /// rest of the album unqueued until the user tapped again.
+    private func performForegroundBackup(_ sources: [MediaSource], manual: Bool = false) async {
         // Same reasoning as the background window: earlier transport failures
         // are invisible to the scan and nothing else releases them.
         queue.retryRetryableFailures()
-        while isForeground, !Task.isCancelled, account.status.isUsable, shouldSchedule, !isPausedForAnyReason {
-            let accepted = queue.enqueue(sources, skippingExisting: true, limit: Self.foregroundBatchLimit)
+        while isForeground, !Task.isCancelled, account.status.isUsable,
+              manual || shouldSchedule, !isPausedForAnyReason {
+            let accepted = queue.enqueue(sources, skippingExisting: true)
             if accepted.isEmpty { return }
-            while queue.activeCount > 0 {
+            // `hasWorkableItems`, not `activeCount`: rows parked on an iCloud
+            // download stay unfinished indefinitely, and waiting on them would
+            // hold this loop open long after the queue stopped moving.
+            while queue.hasWorkableItems {
                 // A pause the queue is honouring must end the loop too,
                 // otherwise this polls every 200 ms for as long as the user
                 // waits for Wi-Fi or leaves the backup paused.
-                if Task.isCancelled || !isForeground || !account.status.isUsable || !shouldSchedule
+                if Task.isCancelled || !isForeground || !account.status.isUsable
+                    || !(manual || shouldSchedule)
                     || queue.haltReason != nil || isPausedForAnyReason { return }
                 try? await Task.sleep(nanoseconds: 200_000_000)
             }
@@ -231,17 +248,22 @@ final class AutomaticBackupCoordinator: ObservableObject {
         case rechecking(count: Int)
     }
 
-    /// "Back Up Now". Runs the same bounded, paged loop the automatic scan uses
-    /// so a large library cannot be poured into the queue in one go.
+    /// "Back Up Now". Queues the entire selection, so the count reported back is
+    /// everything this run will attempt rather than the size of a first page.
     func backUpSelectedAlbumsNow() async -> ManualRunOutcome {
         guard !preferences.selectedAlbumIDs.isEmpty else { return .noAlbumsSelected }
         await albums.refresh()
         guard albums.canRead else { return .noLibraryAccess }
         let sources = await albums.sources(for: preferences.selectedAlbumIDs)
-        let accepted = queue.enqueue(sources, skippingExisting: true, limit: Self.foregroundBatchLimit)
-        guard !accepted.isEmpty else { return .nothingToDo }
-        startPagedRun(sources)
-        return .started(count: accepted.count)
+        // Released before the count is taken, not inside the run, so a retried
+        // failure is part of the number the user is shown. A failed row already
+        // tracks its source, so `enqueue` cannot count it a second time.
+        let released = queue.retryRetryableFailures()
+        let accepted = queue.enqueue(sources, skippingExisting: true)
+        let total = accepted.count + released
+        guard total > 0 else { return .nothingToDo }
+        startForegroundRun(sources)
+        return .started(count: total)
     }
 
     /// "Re-check Backups". Forgets remembered completions for the selection and
@@ -258,23 +280,23 @@ final class AutomaticBackupCoordinator: ObservableObject {
         // again. Releasing first is what makes this the "check everything is
         // actually backed up" action the button claims to be.
         let released = queue.retryRetryableFailures()
-        let result = queue.reverify(sources, limit: Self.foregroundBatchLimit)
+        let result = queue.reverify(sources)
         let total = result.enqueued + released
         guard total > 0 else { return .nothingToDo }
-        startPagedRun(sources)
+        startForegroundRun(sources)
         return .rechecking(count: total)
     }
 
-    /// Take over the foreground paging loop for a manually started run, so the
-    /// remaining pages follow without the user tapping again.
-    private func startPagedRun(_ sources: [MediaSource]) {
+    /// Take over the foreground loop for a manually started run, so the queue
+    /// keeps draining without the user tapping again.
+    private func startForegroundRun(_ sources: [MediaSource]) {
         cancelForegroundScan()
         ranForegroundBackup = true
         let runID = UUID()
         foregroundRunID = runID
         foregroundOperation = Task { @MainActor [weak self] in
             guard let self else { return }
-            await self.performForegroundBackup(sources)
+            await self.performForegroundBackup(sources, manual: true)
             if self.foregroundRunID == runID {
                 self.foregroundOperation = nil
                 self.foregroundRunID = nil

@@ -185,6 +185,13 @@ final class UploadQueue: ObservableObject {
     /// `activeCount`, so the UI has to be able to explain them.
     var deferredForICloudCount: Int { items.filter { $0.state == .waitingForICloud }.count }
     var isIdle: Bool { activeCount == 0 }
+    /// Whether any unfinished row can still make progress on its own. Rows
+    /// parked on an iCloud download are unfinished but inert until the export
+    /// can fetch their bytes, so a caller that waits on `activeCount` alone
+    /// would wait on them forever. `contains` so a large queue short-circuits.
+    var hasWorkableItems: Bool {
+        items.contains { !$0.state.isFinished && $0.state != .waitingForICloud }
+    }
     var pauseReason: String? {
         haltReason
             ?? (isUserPaused ? "You paused backup. Tap Resume to continue." : nil)

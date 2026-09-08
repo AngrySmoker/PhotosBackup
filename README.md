@@ -203,10 +203,12 @@ Android master token → Photos access token → private Photos API
   ignored.
 - Background album backup is opportunistic: iOS decides when each processing
   request runs and may delay it based on usage, battery, and system policy.
-- Automatic scans enqueue bounded batches of 250. The limit bounds memory, not
+- Background scans enqueue bounded batches of 250. The limit bounds memory, not
   how much a window uploads: the queue is durable, so whatever a window cannot
-  finish waits for the next one. Foreground scans keep paging until every
-  selected asset has been durably handled or the app leaves the foreground.
+  finish waits for the next one. Foreground scans and the manual Back Up Now and
+  Re-check Backups buttons queue the whole selection at once, so the count they
+  report is the full run and the queue's concurrency setting decides how much of
+  it moves at a time.
   iOS 16+ background scans use a persistent PhotoKit change token; iOS 15 and
   expired-token recovery use a correctness-first current-library scan. The token
   advances once a scan's sources have all been handed to the queue, so a
