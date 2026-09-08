@@ -735,6 +735,61 @@ final class UploadQueueTests: XCTestCase {
         XCTAssertEqual(reasons.sorted(by: { !$0 && $1 }), [false, true])
     }
 
+    /// Re-check has to defeat two different guards: the completion ledger, and
+    /// the finished row left behind by the original upload. Missing either one
+    /// makes the button silently do nothing.
+    func testReverifyForgetsCompletionsAndEnqueuesThemAgain() async {
+        let script = WorkerScript([], fallback: .succeed(.uploaded(mediaKey: "ABC")))
+        let queue = makeQueue(script, maxConcurrent: 1)
+        let source = MediaSource.asset(localIdentifier: "asset-1")
+        queue.enqueue([source], skippingExisting: true)
+        await settle(queue) { queue.items.first?.state == .done }
+        XCTAssertEqual(queue.completedSourceCount, 1)
+
+        // Without forgetting, a plain enqueue is correctly a no-op.
+        XCTAssertTrue(queue.enqueue([source], skippingExisting: true).isEmpty)
+
+        let result = queue.reverify([source])
+        XCTAssertEqual(result.forgotten, 1)
+        XCTAssertEqual(result.enqueued, 1)
+        await settle(queue) { queue.items.contains { $0.state == .done } }
+        XCTAssertEqual(script.calls, 2)
+    }
+
+    /// An item still in Google Photos comes back `alreadyBackedUp` from the hash
+    /// lookup rather than being uploaded again, and is re-recorded as complete.
+    func testReverifyRecordsAnAlreadyBackedUpItemWithoutReuploading() async {
+        let script = WorkerScript([.succeed(.uploaded(mediaKey: "ABC"))],
+                                  fallback: .succeed(.alreadyBackedUp(mediaKey: "ABC")))
+        let queue = makeQueue(script, maxConcurrent: 1)
+        let source = MediaSource.asset(localIdentifier: "asset-1")
+        queue.enqueue([source], skippingExisting: true)
+        await settle(queue) { queue.items.first?.state == .done }
+
+        queue.reverify([source])
+        await settle(queue) { queue.items.contains { $0.state == .alreadyBackedUp } }
+        XCTAssertEqual(queue.completedSourceCount, 1)
+    }
+
+    /// A failed row is absent from the ledger, so reverify cannot see it, and as
+    /// a tracked row it blocks its own source. Re-check releases it first.
+    func testReverifyDoesNotSeeAFailedRowUntilItIsReleased() async {
+        let transport = GPMCError(kind: .transport, message: "Could not reach Google")
+        let script = WorkerScript([.fail(transport)], fallback: .succeed(.uploaded(mediaKey: "ABC")))
+        let queue = makeQueue(script, maxConcurrent: 1, maxAttempts: 1)
+        let source = MediaSource.asset(localIdentifier: "asset-1")
+        queue.enqueue([source], skippingExisting: true)
+        await settle(queue) { queue.failedCount == 1 }
+
+        // Reverify alone cannot reach it: nothing to forget, nothing enqueued.
+        let result = queue.reverify([source])
+        XCTAssertEqual(result.forgotten, 0)
+        XCTAssertEqual(result.enqueued, 0)
+
+        XCTAssertEqual(queue.retryRetryableFailures(), 1)
+        await settle(queue) { queue.items.first?.state == .done }
+    }
+
     func testProgressFractionsAreMonotonicAcrossTheStates() {
         let ordered: [UploadItem.State] = [.hashing(fraction: 0), .hashing(fraction: 1), .checkingDuplicate,
                                            .uploading(fraction: 0), .uploading(fraction: 1), .finalizing, .done]

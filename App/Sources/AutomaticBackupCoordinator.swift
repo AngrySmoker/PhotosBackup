@@ -253,10 +253,16 @@ final class AutomaticBackupCoordinator: ObservableObject {
         guard albums.canRead else { return .noLibraryAccess }
         let sources = await albums.sources(for: preferences.selectedAlbumIDs)
         guard !sources.isEmpty else { return .nothingToDo }
+        // A failed row is not in the completion ledger, so `reverify` cannot see
+        // it — and as a tracked row it blocks its own source from being enqueued
+        // again. Releasing first is what makes this the "check everything is
+        // actually backed up" action the button claims to be.
+        let released = queue.retryRetryableFailures()
         let result = queue.reverify(sources, limit: Self.foregroundBatchLimit)
-        guard result.enqueued > 0 else { return .nothingToDo }
+        let total = result.enqueued + released
+        guard total > 0 else { return .nothingToDo }
         startPagedRun(sources)
-        return .rechecking(count: result.enqueued)
+        return .rechecking(count: total)
     }
 
     /// Take over the foreground paging loop for a manually started run, so the
