@@ -33,6 +33,11 @@ struct PhotosBackupApp: App {
         BackgroundFileUploadTransport.shared.setEventsDrainer { [weak automaticBackup] in
             await automaticBackup?.handleBackgroundURLSessionEvents()
         }
+        // Count completions at the queue, not from a view. SwiftUI does not
+        // update views for a backgrounded scene, and completed rows are dropped
+        // from the durable snapshot, so a view-driven counter loses every
+        // upload finished in a processing window that ends in termination.
+        stack.queue.onItemBackedUp = { [weak preferences] in preferences?.recordCompletedUpload() }
         // A successful exchange is what connects the account; the connector owns
         // the token, the stack owns everything downstream of it.
         sharedConnector.onExchange = { [weak stack] result in await stack?.connect(result) }

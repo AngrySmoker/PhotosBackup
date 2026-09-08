@@ -28,6 +28,10 @@ final class BackgroundFileUploadTransport: NSObject, FileUploadTransport, @unche
     private var starting: Set<UUID> = []
     private var discarded: Set<UUID> = []
     private var relaunchCompletions: [() -> Void] = []
+    /// Last time each live transfer reported bytes on the wire, so a wedged
+    /// task can be failed instead of sitting on "Uploading" forever.
+    private var lastProgressAt: [UUID: Date] = [:]
+    private var watchdog: Timer?
     private var eventsFinished = false
     private var eventsDrainer: (@Sendable () async -> Void)?
 
@@ -77,6 +81,8 @@ final class BackgroundFileUploadTransport: NSObject, FileUploadTransport, @unche
                 } else if let stored = loadResult(for: transferID) {
                     resolve(transferID, with: stored)
                 } else if shouldReconcile {
+                    noteProgress(for: transferID)
+                    startWatchdogIfNeeded()
                     reconcileOrStart(request, file: file, transferID: transferID)
                 }
             }
@@ -85,8 +91,61 @@ final class BackgroundFileUploadTransport: NSObject, FileUploadTransport, @unche
         }
     }
 
+    /// A transfer that has moved no bytes for this long is treated as wedged.
+    /// The session's seven-day request timeout plus `waitsForConnectivity`
+    /// means URLSession itself will never give up on it.
+    private static let stallTimeout: TimeInterval = 15 * 60
+
     func cancel(transferID: UUID) async {
         discardAndCancel(transferID: transferID)
+    }
+
+    private func noteProgress(for transferID: UUID) {
+        lock.lock()
+        lastProgressAt[transferID] = Date()
+        lock.unlock()
+    }
+
+    private func startWatchdogIfNeeded() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.watchdog == nil else { return }
+            let timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+                self?.failStalledTransfers()
+            }
+            timer.tolerance = 15
+            self.watchdog = timer
+        }
+    }
+
+    private func stopWatchdogIfIdle() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            let idle = self.lastProgressAt.isEmpty
+            self.lock.unlock()
+            guard idle else { return }
+            self.watchdog?.invalidate()
+            self.watchdog = nil
+        }
+    }
+
+    private func failStalledTransfers() {
+        let cutoff = Date().addingTimeInterval(-Self.stallTimeout)
+        lock.lock()
+        let stalled = lastProgressAt.filter { $0.value < cutoff }.map(\.key)
+        for id in stalled { lastProgressAt[id] = nil }
+        lock.unlock()
+        for id in stalled {
+            // Retryable on purpose: the queue backs off and tries again, and if
+            // the real cause is a dead network its own policy pause holds it.
+            resolve(id, with: StoredResult(
+                url: nil, statusCode: nil, headers: [:], body: Data(),
+                errorCode: URLError.timedOut.rawValue,
+                errorDescription: "the upload stopped making progress"
+            ))
+            cancelTask(transferID: id)
+        }
+        stopWatchdogIfIdle()
     }
 
     func forget(transferID: UUID) async {
@@ -99,7 +158,9 @@ final class BackgroundFileUploadTransport: NSObject, FileUploadTransport, @unche
         waiters[transferID] = nil
         progressHandlers[transferID] = nil
         starting.remove(transferID)
+        lastProgressAt[transferID] = nil
         lock.unlock()
+        stopWatchdogIfIdle()
     }
 
     /// Installed by the composition root. iOS's relaunch completion is delayed
@@ -193,7 +254,9 @@ final class BackgroundFileUploadTransport: NSObject, FileUploadTransport, @unche
         discarded.insert(transferID)
         let continuations = waiters.removeValue(forKey: transferID) ?? []
         progressHandlers[transferID] = nil
+        lastProgressAt[transferID] = nil
         lock.unlock()
+        stopWatchdogIfIdle()
         // Checked continuations are not resumed automatically when their Swift
         // task is cancelled. Always release callers before discarding the URL
         // session delegate completion, otherwise UploadQueue.running can retain
@@ -207,7 +270,9 @@ final class BackgroundFileUploadTransport: NSObject, FileUploadTransport, @unche
         let continuations = waiters.removeValue(forKey: transferID) ?? []
         progressHandlers[transferID] = nil
         starting.remove(transferID)
+        lastProgressAt[transferID] = nil
         lock.unlock()
+        stopWatchdogIfIdle()
         guard !continuations.isEmpty else { return }
 
         let outcome: Result<FileUploadResult, Error>
@@ -282,6 +347,7 @@ extension BackgroundFileUploadTransport: URLSessionDataDelegate, URLSessionTaskD
                     didSendBodyData bytesSent: Int64, totalBytesSent: Int64,
                     totalBytesExpectedToSend: Int64) {
         guard let value = task.taskDescription, let transferID = UUID(uuidString: value) else { return }
+        noteProgress(for: transferID)
         lock.lock()
         let reporter = progressHandlers[transferID]
         lock.unlock()

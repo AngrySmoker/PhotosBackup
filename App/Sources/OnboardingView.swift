@@ -45,11 +45,10 @@ struct OnboardingView: View {
                 onCancel: { showingConnect = false }
             )
         }
-        .preferredColorScheme(.light)
         .onAppear {
             guard !appeared else { return }
             appeared = true
-            albums.refresh()
+            albums.refreshInBackground()
         }
         .onChange(of: account.status) { status in
             guard step == 2, status.isUsable else { return }
@@ -429,6 +428,7 @@ struct OnboardingView: View {
 struct AlbumSelectionRow: View {
     let album: PhotoAlbum
     let isSelected: Bool
+    var backedUpCount: Int? = nil
     let action: () -> Void
 
     var body: some View {
@@ -437,7 +437,7 @@ struct AlbumSelectionRow: View {
                 FeatureIcon(symbol: album.symbol, size: 44)
                 VStack(alignment: .leading, spacing: 3) {
                     Text(album.title).font(.headline).foregroundStyle(.primary).lineLimit(1)
-                    Text("\(album.count.formatted()) items").font(.subheadline).foregroundStyle(.secondary)
+                    Text(detail).font(.subheadline).foregroundStyle(.secondary)
                 }
                 Spacer()
                 Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
@@ -447,5 +447,11 @@ struct AlbumSelectionRow: View {
             .background(BackupTheme.secondaryBackground, in: RoundedRectangle(cornerRadius: 15, style: .continuous))
         }
         .buttonStyle(.plain)
+    }
+
+    private var detail: String {
+        guard let backedUpCount else { return "\(album.count.formatted()) items" }
+        if backedUpCount >= album.count, album.count > 0 { return "All \(album.count.formatted()) backed up" }
+        return "\(backedUpCount.formatted()) of \(album.count.formatted()) backed up"
     }
 }

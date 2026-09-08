@@ -11,7 +11,7 @@ struct UploadsView: View {
         NavigationView {
             List {
                 manualBackupSection
-                if queue.activeCount > 0, let reason = queue.pauseReason { pausedSection(reason) }
+                if let reason = queue.pauseReason { pausedSection(reason) }
                 if let warning = queue.persistenceWarning { persistenceWarningSection(warning) }
                 if queue.items.isEmpty { emptySection }
                 else {
@@ -68,13 +68,16 @@ struct UploadsView: View {
             Text(reason).font(.footnote).foregroundStyle(.secondary)
             if queue.haltReason != nil {
                 Button("Resume Backup") { queue.resume() }.disabled(!account.status.isUsable)
+            } else if queue.isUserPaused {
+                Button("Resume Backup") { queue.resumeUserPausedUploads() }
+                    .disabled(!account.status.isUsable)
             }
         }
     }
 
     private var queueManagementSection: some View {
         Section("Queue Controls") {
-            if queue.activeCount > 0 {
+            if queue.activeCount > 0 || queue.isUserPaused {
                 if queue.isUserPaused {
                     Button {
                         queue.resumeUserPausedUploads()
@@ -90,10 +93,12 @@ struct UploadsView: View {
                     }
                 }
 
-                Button(role: .destructive) {
-                    showingStopBackupConfirmation = true
-                } label: {
-                    Label("Stop Backup", systemImage: "stop.circle")
+                if queue.activeCount > 0 {
+                    Button(role: .destructive) {
+                        showingStopBackupConfirmation = true
+                    } label: {
+                        Label("Stop Backup", systemImage: "stop.circle")
+                    }
                 }
             }
 
@@ -151,14 +156,18 @@ struct UploadsView: View {
                 Spacer()
                 if !queue.isIdle { Text("\(queue.activeCount) remaining") }
             }
+        } footer: {
+            if queue.deferredForICloudCount > 0 {
+                Text("\(queue.deferredForICloudCount) items need to download from iCloud first. Keep the app open to finish them.")
+            }
         }
     }
 
     private var stopBackupMessage: String {
         if preferences.automaticBackup {
-            return "Uploads in progress will be cancelled, the remaining queue will be stopped, and Automatic Backup will be turned off."
+            return "Uploads in progress will be cancelled, the queue will be cleared, and Automatic Backup will be turned off. Photos already backed up are not affected."
         }
-        return "Uploads in progress will be cancelled and the remaining queue will be stopped."
+        return "Uploads in progress will be cancelled and the queue will be cleared. Photos already backed up are not affected."
     }
 
     private func stopBackup() {

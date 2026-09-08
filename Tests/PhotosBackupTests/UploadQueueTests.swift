@@ -228,7 +228,7 @@ final class UploadQueueTests: XCTestCase {
         XCTAssertEqual(queue.items.first?.state, .uploading(fraction: 0.25))
         XCTAssertEqual(queue.items.first?.checkpoint, checkpoint)
         queue.cancelAll()
-        await settle(queue) { queue.items.first?.state == .cancelled }
+        await settle(queue) { queue.items.isEmpty }
     }
 
     func testURLSessionRelaunchOnlyPumpsCheckpointedTransfers() async {
@@ -582,10 +582,135 @@ final class UploadQueueTests: XCTestCase {
         await settle(queue) { queue.items.first?.state.isWorking == true }
         queue.clearFinished()
         XCTAssertEqual(queue.items.count, 1)
-        queue.cancelAll()
+        queue.cancel(queue.items[0].id)
         await settle(queue) { queue.items.first?.state == .cancelled }
         queue.clearFinished()
         XCTAssertTrue(queue.items.isEmpty)
+    }
+
+    /// Stop discards the queue. A single-row cancel is a durable "skip this"
+    /// marker, but Stop means start over, so a later rescan must be free to
+    /// pick these sources up again.
+    func testStopDiscardsCancelledRowsSoARescanCanPickThemUp() async {
+        let script = WorkerScript([.block], fallback: .succeed(.uploaded(mediaKey: "ABC")))
+        let queue = makeQueue(script, maxConcurrent: 1)
+        let source = MediaSource.asset(localIdentifier: "asset-1")
+        queue.enqueue([source], skippingExisting: true)
+        await settle(queue) { queue.items.first?.state.isWorking == true }
+
+        queue.cancelAll()
+        await settle(queue) { queue.items.isEmpty }
+        XCTAssertEqual(queue.enqueue([source], skippingExisting: true).count, 1)
+    }
+
+    /// The counterpart: cancelling one row is a decision, and an automatic
+    /// rescan must not quietly undo it on the next window.
+    func testCancelledRowBlocksReEnqueueUntilItIsCleared() async {
+        let script = WorkerScript([.block], fallback: .succeed(.uploaded(mediaKey: "ABC")))
+        let queue = makeQueue(script, maxConcurrent: 1)
+        let source = MediaSource.asset(localIdentifier: "asset-1")
+        queue.enqueue([source], skippingExisting: true)
+        await settle(queue) { queue.items.first?.state.isWorking == true }
+
+        queue.cancel(queue.items[0].id)
+        await settle(queue) { queue.items.first?.state == .cancelled }
+        XCTAssertTrue(queue.enqueue([source], skippingExisting: true).isEmpty)
+
+        queue.clearFinished()
+        XCTAssertEqual(queue.enqueue([source], skippingExisting: true).count, 1)
+    }
+
+    func testACancelledRowSurvivesRestoration() async {
+        let persistence = MemoryUploadQueuePersistence()
+        let first = UploadQueue(worker: WorkerScript([]).worker(), maxConcurrent: 1, persistence: persistence)
+        first.setNetworkAccess(allowed: false, pauseReason: "Waiting")
+        first.activateAccount("person@gmail.com")
+        first.enqueue([.asset(localIdentifier: "asset-1")], skippingExisting: true)
+        first.cancel(first.items[0].id)
+        XCTAssertEqual(first.items.first?.state, .cancelled)
+
+        let script = WorkerScript([])
+        let restored = UploadQueue(worker: script.worker(), maxConcurrent: 1, persistence: persistence)
+        restored.activateAccount("person@gmail.com")
+        try? await Task.sleep(nanoseconds: 20_000_000)
+
+        XCTAssertEqual(restored.items.first?.state, .cancelled)
+        XCTAssertEqual(script.calls, 0)
+    }
+
+    /// A pause has to outlive the queue draining. Clearing it when the last
+    /// item finished let the automatic scan enqueue a fresh batch and start
+    /// uploading again without the user resuming.
+    func testUserPauseSurvivesTheQueueDraining() async {
+        let script = WorkerScript([], fallback: .succeed(.uploaded(mediaKey: "ABC")))
+        let queue = makeQueue(script, maxConcurrent: 1)
+        queue.enqueue(sources(1))
+        queue.pauseAfterCurrentUploads()
+        await settle(queue) { queue.items.first?.state == .done }
+        try? await Task.sleep(nanoseconds: 20_000_000)
+
+        XCTAssertTrue(queue.isIdle)
+        XCTAssertTrue(queue.isUserPaused)
+
+        // And a paused queue still refuses to start newly enqueued work.
+        queue.enqueue(sources(1))
+        try? await Task.sleep(nanoseconds: 20_000_000)
+        XCTAssertEqual(script.calls, 1)
+
+        queue.resumeUserPausedUploads()
+        await settle(queue) { queue.items.allSatisfy { $0.state == .done } }
+        XCTAssertEqual(script.calls, 2)
+    }
+
+    /// The change-token commit depends on knowing whether the limit cut the
+    /// batch short: advancing past sources that were never examined loses them.
+    func testEnqueueReportsWhetherTheLimitTruncatedTheBatch() {
+        let queue = makeQueue(WorkerScript([], fallback: .block), maxConcurrent: 1)
+        let truncated = queue.enqueueReportingLimit(sources(5), skippingExisting: true, limit: 2)
+        XCTAssertEqual(truncated.accepted.count, 2)
+        XCTAssertTrue(truncated.reachedLimit)
+
+        let queue2 = makeQueue(WorkerScript([], fallback: .block), maxConcurrent: 1)
+        let complete = queue2.enqueueReportingLimit(sources(2), skippingExisting: true, limit: 10)
+        XCTAssertEqual(complete.accepted.count, 2)
+        XCTAssertFalse(complete.reachedLimit)
+    }
+
+    /// A completed item must be counted where it happens, not from a view: a
+    /// background window that ends in process termination never renders.
+    func testCompletionCallbackFiresOncePerBackedUpItem() async {
+        let script = WorkerScript([], fallback: .succeed(.uploaded(mediaKey: "ABC")))
+        let queue = makeQueue(script, maxConcurrent: 1)
+        var completions = 0
+        queue.onItemBackedUp = { completions += 1 }
+        queue.enqueue(sources(3))
+        await settle(queue) { queue.items.allSatisfy { $0.state == .done } }
+        XCTAssertEqual(completions, 3)
+    }
+
+    /// Losing an allowed transport has to stop a background PUT too: iOS keeps
+    /// the `allowsCellularAccess` the request was created with.
+    func testLosingTheAllowedTransportCancelsABackgroundTransferForRequeue() async {
+        let prepared = PreparedUpload(
+            uploadURL: URL(string: "https://example.com/upload")!, hash: Data(repeating: 1, count: 20),
+            filename: "photo.jpg", modified: Date(), byteCount: 10,
+            useQuota: false, saver: false, receipt: nil
+        )
+        let checkpoint = UploadCheckpoint(filePath: "/tmp/photo.jpg", filename: "photo.jpg",
+                                          modified: Date(), byteCount: 10, temporary: true,
+                                          prepared: prepared, continuesAfterProcessExit: true)
+        let worker: UploadWorker = { _, _, _, _, emit in
+            await emit(.checkpoint(checkpoint))
+            await emit(.state(.uploading(fraction: 0.25)))
+            while true { try await Task.sleep(nanoseconds: 5_000_000) }
+        }
+        let queue = UploadQueue(worker: worker, maxConcurrent: 1)
+        queue.enqueue(oneSource)
+        await settle(queue) { queue.items.first?.checkpoint == checkpoint }
+
+        queue.setNetworkAccess(allowed: false, pauseReason: "Waiting for Wi-Fi")
+        await settle(queue) { queue.items.first?.state == .queued }
+        XCTAssertEqual(queue.items.first?.checkpoint, checkpoint)
     }
 
     func testProgressFractionsAreMonotonicAcrossTheStates() {

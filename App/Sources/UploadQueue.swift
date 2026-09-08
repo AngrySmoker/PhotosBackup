@@ -54,7 +54,7 @@ struct UploadItem: Identifiable, Equatable, Sendable {
             switch self {
             case .queued: return "Waiting"
             case .waitingToRetry(let attempt): return "Retrying (attempt \(attempt + 1))"
-            case .waitingForICloud: return "Waiting for foreground to download from iCloud"
+            case .waitingForICloud: return "Will download from iCloud when you open the app"
             case .exporting: return "Preparing"
             case .hashing: return "Checking"
             case .checkingDuplicate: return "Looking for a copy"
@@ -132,6 +132,9 @@ final class UploadQueue: ObservableObject {
 
     /// Called once when Google refuses the credential, so the account state can follow.
     var onCredentialRejected: ((Error) -> Void)?
+    /// Called exactly once per item that reaches a backed-up state, including
+    /// during a background window where no view is observing the queue.
+    var onItemBackedUp: (() -> Void)?
 
     let maxConcurrent: Int
     let maxAttempts: Int
@@ -146,6 +149,10 @@ final class UploadQueue: ObservableObject {
     private var completedSourceKeys: Set<String> = []
     private var completionLedgerHealthy = true
     private var drainsBackgroundCompletionsOnly = false
+    /// Set while a `cancelAll` is settling, so the rows it cancels are dropped
+    /// instead of persisted as durable "skip this source" markers.
+    private var discardsCancelledRows = false
+    private var persistScheduled = false
 
     init(worker: @escaping UploadWorker,
          maxConcurrent: Int = 2,
@@ -167,10 +174,14 @@ final class UploadQueue: ObservableObject {
 
     var activeCount: Int { items.filter { !$0.state.isFinished }.count }
     var failedCount: Int { items.filter { if case .failed = $0.state { return true }; return false }.count }
+    /// Items held back because their bytes are only in iCloud. They are not
+    /// stalled — they resume when the app is foregrounded — but they do sit in
+    /// `activeCount`, so the UI has to be able to explain them.
+    var deferredForICloudCount: Int { items.filter { $0.state == .waitingForICloud }.count }
     var isIdle: Bool { activeCount == 0 }
     var pauseReason: String? {
         haltReason
-            ?? (isUserPaused ? "Paused by you; uploads already in progress will finish" : nil)
+            ?? (isUserPaused ? "You paused backup. Tap Resume to continue." : nil)
             ?? networkPauseReason
             ?? systemPauseReason
     }
@@ -183,40 +194,51 @@ final class UploadQueue: ObservableObject {
 
     // MARK: - Commands
 
+    /// What one `enqueue` call did. `reachedLimit` is the part callers with a
+    /// change token care about: when the limit cut the batch short, some
+    /// sources were never looked at, so the caller must not record the scan as
+    /// fully handled.
+    struct EnqueueOutcome {
+        let accepted: [UUID]
+        let reachedLimit: Bool
+    }
+
     @discardableResult
     func enqueue(_ sources: [MediaSource], skippingExisting: Bool = false, limit: Int? = nil) -> [UUID] {
+        enqueueReportingLimit(sources, skippingExisting: skippingExisting, limit: limit).accepted
+    }
+
+    @discardableResult
+    func enqueueReportingLimit(_ sources: [MediaSource],
+                               skippingExisting: Bool = false,
+                               limit: Int? = nil) -> EnqueueOutcome {
+        var reachedLimit = false
         var accepted: [UploadItem] = []
-        var trackedKeys = completedSourceKeys.union(items.compactMap { item -> String? in
-            switch item.state {
-            // A failed row is already the durable retry handle for its source.
-            // Automatic rescans must not append another identical failed row on
-            // every background window; the Activity UI can retry that row.
-            case .cancelled: return nil
-            default: return item.source.queueDeduplicationKey
-            }
-        })
+        // A failed row is already the durable retry handle for its source, and
+        // so is a cancelled one: automatic rescans must not append another
+        // identical row on every window, and a cancellation the user made
+        // deliberately must not silently undo itself on the next scan. Both are
+        // released by Retry or Clear Finished in the Activity UI.
+        var trackedKeys = completedSourceKeys.union(items.compactMap(\.source.queueDeduplicationKey))
         for source in sources {
-            if let limit, accepted.count >= max(0, limit) { break }
+            if let limit, accepted.count >= max(0, limit) {
+                reachedLimit = true
+                break
+            }
             if skippingExisting {
                 if let key = source.queueDeduplicationKey {
                     guard trackedKeys.insert(key).inserted else { continue }
                 } else {
-                    let isAlreadyTracked = items.contains { item in
-                        guard item.source == source else { return false }
-                        switch item.state {
-                        case .failed, .cancelled: return false
-                        default: return true
-                        }
-                    }
+                    let isAlreadyTracked = items.contains { $0.source == source }
                     if isAlreadyTracked || accepted.contains(where: { $0.source == source }) { continue }
                 }
             }
             accepted.append(UploadItem(source: source))
         }
         items.append(contentsOf: accepted)
-        persist()
+        persistNow()
         pump()
-        return accepted.map(\.id)
+        return EnqueueOutcome(accepted: accepted.map(\.id), reachedLimit: reachedLimit)
     }
 
     func cancel(_ id: UUID) {
@@ -229,27 +251,36 @@ final class UploadQueue: ObservableObject {
             userCancelled.remove(id)
             requeueCancelled.remove(id)
             cleanCheckpoint(for: index)
-            persist()
+            persistNow()
         }
     }
 
+    /// Stop everything and discard the queue. Unlike a single-row cancel, the
+    /// resulting rows are dropped rather than kept as durable "don't retry this"
+    /// markers — Stop means start over, so a later rescan must be free to pick
+    /// these sources up again.
     func cancelAll() {
         isUserPaused = false
+        discardsCancelledRows = true
         for item in items where !item.state.isFinished { cancel(item.id) }
-        persist()
+        items.removeAll { $0.state == .cancelled }
+        persistNow()
     }
 
-    /// Stop scheduling new work without throwing away queue state or staged files.
+    /// Stop scheduling new work without throwing away queue state or staged
+    /// files. The pause is durable: it survives the queue draining and a
+    /// relaunch, and only an explicit resume or stop clears it. Anything else
+    /// would let an automatic rescan quietly restart work the user paused.
     func pauseAfterCurrentUploads() {
-        guard activeCount > 0, !isUserPaused else { return }
+        guard !isUserPaused else { return }
         isUserPaused = true
-        persist()
+        persistNow()
     }
 
     func resumeUserPausedUploads() {
         guard isUserPaused else { return }
         isUserPaused = false
-        persist()
+        persistNow()
         pump()
     }
 
@@ -258,7 +289,7 @@ final class UploadQueue: ObservableObject {
               items[index].state != .done, items[index].state != .alreadyBackedUp else { return }
         items[index].attempts = 0
         items[index].state = .queued
-        persist()
+        persistNow()
         pump()
     }
 
@@ -268,12 +299,19 @@ final class UploadQueue: ObservableObject {
 
     func clearFinished() {
         items.removeAll { $0.state.isFinished }
-        persist()
+        persistNow()
     }
 
     /// Number of sources the queue considers already backed up. Used by the
     /// Settings verify action to explain what will be re-checked.
     var completedSourceCount: Int { completedSourceKeys.count }
+
+    /// A snapshot test for "is this library asset already backed up", safe to
+    /// hand to a background task computing per-album progress.
+    func backedUpAssetLookup() -> @Sendable (String) -> Bool {
+        let keys = completedSourceKeys
+        return { identifier in keys.contains("asset:\(identifier)") }
+    }
 
     /// Forget remembered completions so the next enqueue re-checks them against
     /// Google (hash lookup) and re-uploads anything deleted in the cloud.
@@ -299,7 +337,7 @@ final class UploadQueue: ObservableObject {
                 persistenceWarning = "Upload completion could not be saved: \(error.localizedDescription)"
             }
         }
-        persist()
+        persistNow()
         return keys.count
     }
 
@@ -308,9 +346,9 @@ final class UploadQueue: ObservableObject {
     /// genuinely missing bytes are uploaded again.
     /// Returns `(forgotten, enqueued)`.
     @discardableResult
-    func reverify(_ sources: [MediaSource]) -> (forgotten: Int, enqueued: Int) {
+    func reverify(_ sources: [MediaSource], limit: Int? = nil) -> (forgotten: Int, enqueued: Int) {
         let forgotten = forgetCompletedSources(for: sources)
-        let enqueued = enqueue(sources, skippingExisting: true).count
+        let enqueued = enqueue(sources, skippingExisting: true, limit: limit).count
         return (forgotten, enqueued)
     }
 
@@ -322,7 +360,7 @@ final class UploadQueue: ObservableObject {
         guard normalized != accountIdentifier else { return }
 
         if accountIdentifier != nil {
-            persist()
+            persistNow()
             for index in items.indices { cleanCheckpoint(for: index) }
             for task in running.values { task.cancel() }
         }
@@ -342,14 +380,14 @@ final class UploadQueue: ObservableObject {
                   snapshot.version == UploadQueueSnapshot.version,
                   snapshot.accountIdentifier == normalized else {
                 completedSourceKeys = Set(ledgerKeys)
-                persist()
+                persistNow()
                 return
             }
             if persistence.storesCompletionLedgerSeparately {
-                for key in snapshot.completedSourceKeys {
-                    do { try persistence.recordCompletedSourceKey(key, for: normalized) }
-                    catch { completionLedgerHealthy = false }
-                }
+                // One batched append. Per-key writes here meant one file-handle
+                // open and close for every photo the library had ever backed up.
+                do { try persistence.recordCompletedSourceKeys(snapshot.completedSourceKeys, for: normalized) }
+                catch { completionLedgerHealthy = false }
             }
             completedSourceKeys = Set(snapshot.completedSourceKeys)
             completedSourceKeys.formUnion(ledgerKeys)
@@ -361,7 +399,9 @@ final class UploadQueue: ObservableObject {
                 item.byteCount = stored.byteCount
                 item.attempts = stored.attempts
                 item.checkpoint = stored.checkpoint
-                if let reason = stored.failureReason {
+                if stored.cancelled == true {
+                    item.state = .cancelled
+                } else if let reason = stored.failureReason {
                     item.state = .failed(reason: reason, retryable: stored.failureRetryable)
                 } else {
                     item.state = .queued
@@ -369,11 +409,18 @@ final class UploadQueue: ObservableObject {
                 return item
             }
             if persistence.storesCompletionLedgerSeparately,
-               !snapshot.completedSourceKeys.isEmpty { persist() }
+               !snapshot.completedSourceKeys.isEmpty { persistNow() }
             pump()
         } catch {
             persistenceWarning = "The saved upload queue could not be restored: \(error.localizedDescription)"
         }
+    }
+
+    /// Write any coalesced snapshot immediately. Called when the app is about
+    /// to be suspended, where the next main-actor turn may never come.
+    func flushPendingWrites() {
+        guard persistScheduled else { return }
+        persistNow()
     }
 
     /// Clear the halt after the account has been reconnected; everything that
@@ -391,14 +438,21 @@ final class UploadQueue: ObservableObject {
         guard networkPauseReason != nextReason else { return }
         networkPauseReason = nextReason
         if allowed { pump() }
-        else { cancelRunningForRequeue() }
+        // A background transfer keeps the `allowsCellularAccess` it was created
+        // with, so iOS will happily finish it over cellular after the policy
+        // says otherwise. Losing an allowed transport therefore has to cancel
+        // those too — unlike a background-window expiry, which leaves them
+        // running on purpose. The staged file survives, so a retry only repeats
+        // the hash and the upload-URL request.
+        else { cancelRunningForRequeue(includingBackgroundTransfers: true) }
     }
 
     /// Called by the background-task expiration handler. Work remains queued
     /// for the next system execution window or foreground launch.
     func suspendForBackgroundExpiration() {
-        systemPauseReason = "Waiting for iOS to continue the backup"
+        systemPauseReason = "Paused until iOS gives the app more time"
         cancelRunningForRequeue()
+        flushPendingWrites()
     }
 
     func resumeSystemWork() {
@@ -523,7 +577,9 @@ final class UploadQueue: ObservableObject {
             items[index].state = state
         case .checkpoint(let checkpoint):
             items[index].checkpoint = checkpoint
-            persist()
+            // The durable hand-off to the background transfer: this must be on
+            // disk before the worker proceeds, not on the next turn.
+            persistNow()
         }
     }
 
@@ -539,10 +595,18 @@ final class UploadQueue: ObservableObject {
             items[index].checkpoint = nil
             recordCompletion(for: items[index])
             persist()
+            onItemBackedUp?()
         case .failure(let error):
             if userCancelled.remove(id) != nil {
-                requeueCancelled.remove(id); items[index].state = .cancelled
-                cleanCheckpoint(for: index); persist(); return
+                requeueCancelled.remove(id)
+                items[index].state = .cancelled
+                cleanCheckpoint(for: index)
+                if discardsCancelledRows {
+                    items.remove(at: index)
+                    if userCancelled.isEmpty { discardsCancelledRows = false }
+                }
+                persist()
+                return
             }
             // Policy, credential and background-expiration pauses all cancel
             // in-flight work for requeue. A later pump restarts it unchanged.
@@ -585,9 +649,10 @@ final class UploadQueue: ObservableObject {
         onCredentialRejected?(error)
     }
 
-    private func cancelRunningForRequeue() {
+    private func cancelRunningForRequeue(includingBackgroundTransfers: Bool = false) {
         for (id, task) in running {
-            if let index = items.firstIndex(where: { $0.id == id }),
+            if !includingBackgroundTransfers,
+               let index = items.firstIndex(where: { $0.id == id }),
                items[index].checkpoint?.isBackgroundTransfer == true {
                 continue
             }
@@ -609,15 +674,41 @@ final class UploadQueue: ObservableObject {
         }
     }
 
+    /// Coalesce the snapshot write. `persist()` is called from every queue
+    /// event — described, each checkpoint, each finish — and each call encodes
+    /// the whole items array. Batching to one write per main-actor turn keeps
+    /// the durability guarantee (nothing yields between the mutation and the
+    /// flush) while collapsing the five or six writes an item used to cost.
     private func persist() {
-        if activeCount == 0 { isUserPaused = false }
+        guard persistence != nil, accountIdentifier != nil else { return }
+        guard !persistScheduled else { return }
+        persistScheduled = true
+        Task { @MainActor [weak self] in
+            guard let self, self.persistScheduled else { return }
+            self.persistScheduled = false
+            self.persistNow()
+        }
+    }
+
+    /// Write immediately. Used where a later flush would be too late: the
+    /// checkpoint hand-off before a background PUT starts, and anything that
+    /// runs as the process is about to be suspended.
+    private func persistNow() {
+        persistScheduled = false
         guard let accountIdentifier, let persistence else { return }
         let storedItems = items.compactMap { item -> PersistedUploadItem? in
             guard let source = PersistedMediaSource(item.source)
                     ?? item.checkpoint.map({ .file($0.filePath) }) else { return nil }
             switch item.state {
-            case .alreadyBackedUp, .done, .cancelled:
+            case .alreadyBackedUp, .done:
                 return nil
+            case .cancelled:
+                // Kept so a deliberate cancellation is not silently undone by
+                // the next automatic scan. Cleared by Retry or Clear Finished.
+                return PersistedUploadItem(id: item.id, source: source, name: item.name,
+                                           byteCount: item.byteCount, attempts: item.attempts,
+                                           failureReason: nil, failureRetryable: false,
+                                           checkpoint: nil, cancelled: true)
             case .failed(let reason, let retryable):
                 return PersistedUploadItem(id: item.id, source: source, name: item.name,
                                            byteCount: item.byteCount, attempts: item.attempts,

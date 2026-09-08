@@ -22,18 +22,25 @@ final class PhotosStack {
 
     /// Restore the saved account and then sweep only staging files that no
     /// durable queue checkpoint still owns.
+    ///
+    /// The memoised task must cover *every* step, not just `account.restore()`.
+    /// A second caller that returned after only the restore would go on to
+    /// inspect a queue that had not been activated yet — on a background-session
+    /// relaunch that means `waitUntilBackgroundTransfersHandled()` sees an empty
+    /// queue, resolves immediately, and iOS's completion handler fires before a
+    /// completed PUT's receipt ever reaches the commit RPC.
     func start() async {
         if let startTask {
             await startTask.value
             return
         }
-        let task = Task { [account] in
+        let task = Task { @MainActor [account, queue, exporter] in
             await account.restore()
+            queue.activateAccount(account.status.email)
+            await exporter.purge(excluding: queue.retainedStagingURLs)
         }
         startTask = task
         await task.value
-        queue.activateAccount(account.status.email)
-        await exporter.purge(excluding: queue.retainedStagingURLs)
     }
 
     /// Hand a finished exchange to the account, then let the queue carry on.

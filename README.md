@@ -27,8 +27,10 @@ without a desktop companion or hosted service.
 - Retry transient failures, cancel work, and resume after reconnecting.
 - Restore pending album uploads after an app restart and remember completed
   library assets per Google account.
+- Show per-album backup progress, and re-upload assets edited after backup.
 - Upload in original quality or request Google's Storage Saver processing.
-- Enforce Wi-Fi-only or Wi-Fi-and-cellular policy both at queue and request level.
+- Enforce Wi-Fi-only or Wi-Fi-and-cellular policy at queue and request level,
+  cancelling in-flight background transfers when the allowed transport is lost.
 - Request recurring iOS background-processing windows for selected-album backup.
 - Keep file PUTs running in an iOS-owned background `URLSession`, then commit
   completed receipts when iOS relaunches the app.
@@ -46,7 +48,7 @@ The Xcode project, app target, and scheme are named `PhotosBackup`; the
 user-facing app is named **Photos Backup**.
 
 Latest release: **0.2.3** ([releases](https://github.com/g8row/PhotosBackup/releases)).
-85 tests run on iPhone 16 Pro simulator: 82 pass, with 2 opt-in live tests
+95 tests run on an iPhone simulator: 92 pass, with 2 opt-in live tests
 and 1 simulator Keychain test skipped.
 
 ### App identity (since 0.0.2)
@@ -200,11 +202,14 @@ Android master token → Photos access token → private Photos API
   ignored.
 - Background album backup is opportunistic: iOS decides when each processing
   request runs and may delay it based on usage, battery, and system policy.
-- Automatic scans enqueue bounded batches (250 items at a time while foregrounded,
-  25 per processing window). Foreground scans keep paging until every selected
-  asset has been durably handled or the app leaves the foreground.
+- Automatic scans enqueue bounded batches of 250. The limit bounds memory, not
+  how much a window uploads: the queue is durable, so whatever a window cannot
+  finish waits for the next one. Foreground scans keep paging until every
+  selected asset has been durably handled or the app leaves the foreground.
   iOS 16+ background scans use a persistent PhotoKit change token; iOS 15 and
-  expired-token recovery use a correctness-first current-library scan.
+  expired-token recovery use a correctness-first current-library scan. The token
+  advances once a scan's sources have all been handed to the queue, so a
+  saturated queue stops re-enumerating the library on every window.
 - Export, hashing, duplicate lookup, and upload initialization still need an
   execution window. Once initialized, the file PUT continues under iOS even if
   the processing window expires; the app persists the receipt before commit.

@@ -1,5 +1,88 @@
 import Foundation
 
+/// Serialises and rate-limits the phase callbacks `GPMCClient` fires
+/// synchronously from its hashing loop and its `URLSessionTaskDelegate`.
+///
+/// The previous `Task { await emit(...) }` per callback spawned one unstructured
+/// task per progress tick — thousands for a large video — and unstructured tasks
+/// carry no ordering guarantee, so a later fraction could be applied before an
+/// earlier one and the bar would visibly jump backwards. A single consumer keeps
+/// the order, and coalescing to the newest pending state keeps the main actor
+/// out of a hot loop it gains nothing from.
+final class UploadPhaseRelay: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pending: UploadItem.State?
+    private var lastSentAt = Date.distantPast
+    private var draining = false
+    private var stopped = false
+    private let emit: UploadEventSink
+    private let interval: TimeInterval
+
+    init(interval: TimeInterval = 0.1, emit: @escaping UploadEventSink) {
+        self.interval = interval
+        self.emit = emit
+    }
+
+    /// Safe to call from any thread, including a delegate queue.
+    func report(_ state: UploadItem.State) {
+        lock.lock()
+        guard !stopped else { lock.unlock(); return }
+        pending = state
+        let shouldStart = !draining
+        if shouldStart { draining = true }
+        lock.unlock()
+        guard shouldStart else { return }
+        Task { await self.drain() }
+    }
+
+    /// Flush whatever is pending, ignoring the rate limit. Used for the phase
+    /// changes that matter for the row's meaning rather than its percentage.
+    /// Drop anything still pending and refuse further reports. Called once the
+    /// worker has a terminal outcome, so a late progress tick cannot land on a
+    /// row that has already moved on.
+    func stop() {
+        lock.lock()
+        stopped = true
+        pending = nil
+        lock.unlock()
+    }
+
+    func flush() async {
+        let state: UploadItem.State?
+        lock.lock()
+        state = pending
+        pending = nil
+        lastSentAt = Date()
+        lock.unlock()
+        if let state { await emit(.state(state)) }
+    }
+
+    private func drain() async {
+        while true {
+            let wait: TimeInterval
+            let state: UploadItem.State?
+            lock.lock()
+            let elapsed = Date().timeIntervalSince(lastSentAt)
+            if elapsed >= interval, let next = pending {
+                state = next
+                pending = nil
+                lastSentAt = Date()
+                wait = 0
+            } else if pending != nil {
+                state = nil
+                wait = max(0, interval - elapsed)
+            } else {
+                draining = false
+                lock.unlock()
+                return
+            }
+            lock.unlock()
+            if let state { await emit(.state(state)) }
+            if wait > 0 { try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000)) }
+        }
+    }
+}
+
 /// The one real `UploadWorker`: export the item to a file, hand it to
 /// `GPMCClient`, and retain it across retry/relaunch boundaries until the
 /// transfer commits or reaches a terminal state.
@@ -16,6 +99,8 @@ struct PhotosUploader {
         let exporter = self.exporter
         let client = self.client
         return { id, source, restoredCheckpoint, options, emit in
+            let relay = UploadPhaseRelay(emit: emit)
+            defer { relay.stop() }
             guard let client = await client() else {
                 throw GPMCError(kind: .credentialRejected, message: "No Google account is connected. Connect one and try again.")
             }
@@ -53,8 +138,9 @@ struct PhotosUploader {
                     useQuota: options.useQuota,
                     saver: options.storageSaver
                 ) { phase in
-                    Task { await emit(.state(phase.itemState)) }
+                    relay.report(phase.itemState)
                 }
+                await relay.flush()
                 switch preparation {
                 case .alreadyBackedUp(let mediaKey):
                     await exporter.discard(checkpoint.exportedMedia)
@@ -74,8 +160,9 @@ struct PhotosUploader {
             let completed: PreparedUpload
             do {
                 completed = try await client.transfer(prepared, file: checkpoint.fileURL, transferID: id) { phase in
-                    Task { await emit(.state(phase.itemState)) }
+                    relay.report(phase.itemState)
                 }
+                await relay.flush()
             } catch {
                 await client.forgetTransfer(id)
                 // A failed upload URL may no longer be reusable. Keep the
@@ -88,8 +175,9 @@ struct PhotosUploader {
             await emit(.checkpoint(checkpoint))
 
             let outcome = try await client.commit(completed) { phase in
-                Task { await emit(.state(phase.itemState)) }
+                relay.report(phase.itemState)
             }
+            await relay.flush()
             await client.forgetTransfer(id)
             await exporter.discard(checkpoint.exportedMedia)
             await emit(.checkpoint(nil))

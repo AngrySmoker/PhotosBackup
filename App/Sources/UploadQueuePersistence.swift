@@ -47,10 +47,12 @@ struct PersistedUploadItem: Codable, Equatable, Sendable {
     let failureReason: String?
     let failureRetryable: Bool
     let checkpoint: UploadCheckpoint?
+    /// Optional so snapshots written by earlier releases remain decodable.
+    let cancelled: Bool?
 
     init(id: UUID, source: PersistedMediaSource, name: String, byteCount: Int64,
          attempts: Int, failureReason: String?, failureRetryable: Bool,
-         checkpoint: UploadCheckpoint? = nil) {
+         checkpoint: UploadCheckpoint? = nil, cancelled: Bool? = nil) {
         self.id = id
         self.source = source
         self.name = name
@@ -59,6 +61,7 @@ struct PersistedUploadItem: Codable, Equatable, Sendable {
         self.failureReason = failureReason
         self.failureRetryable = failureRetryable
         self.checkpoint = checkpoint
+        self.cancelled = cancelled
     }
 }
 
@@ -88,6 +91,7 @@ protocol UploadQueuePersisting {
     var storesCompletionLedgerSeparately: Bool { get }
     func loadCompletedSourceKeys(for accountIdentifier: String) throws -> [String]
     func recordCompletedSourceKey(_ key: String, for accountIdentifier: String) throws
+    func recordCompletedSourceKeys(_ keys: [String], for accountIdentifier: String) throws
     func removeCompletedSourceKeys(_ keys: Set<String>, for accountIdentifier: String) throws
 }
 
@@ -98,6 +102,9 @@ extension UploadQueuePersisting {
         return snapshot.completedSourceKeys
     }
     func recordCompletedSourceKey(_ key: String, for accountIdentifier: String) throws {}
+    func recordCompletedSourceKeys(_ keys: [String], for accountIdentifier: String) throws {
+        for key in keys { try recordCompletedSourceKey(key, for: accountIdentifier) }
+    }
     func removeCompletedSourceKeys(_ keys: Set<String>, for accountIdentifier: String) throws {}
 }
 
@@ -148,16 +155,41 @@ struct FileUploadQueuePersistence: UploadQueuePersisting {
         guard FileManager.default.fileExists(atPath: ledgerURL.path) else { return keys }
         let account = Data(accountIdentifier.utf8).base64EncodedString()
         let contents = try String(contentsOf: ledgerURL, encoding: .utf8)
+        var lineCount = 0
+        var seen = Set<String>()
+        var ownKeys: [String] = []
+        var otherAccountLines: [String] = []
         for line in contents.split(whereSeparator: \.isNewline) {
+            lineCount += 1
             let parts = line.split(separator: "\t", maxSplits: 1)
             guard parts.count == 2, parts[0] == Substring(account),
-                  let data = Data(base64Encoded: String(parts[1])) else { continue }
-            keys.append(String(decoding: data, as: UTF8.self))
+                  let data = Data(base64Encoded: String(parts[1])) else {
+                otherAccountLines.append(String(line))
+                continue
+            }
+            let key = String(decoding: data, as: UTF8.self)
+            if seen.insert(key).inserted { ownKeys.append(key) }
+        }
+        keys.append(contentsOf: ownKeys)
+        // The ledger only ever appends, so a source that is re-verified or
+        // re-uploaded leaves a line each time. Rewrite it once the duplicates
+        // outweigh the real entries, otherwise every launch pays to parse them.
+        let distinct = ownKeys.count + otherAccountLines.count
+        if lineCount > 512, lineCount > distinct * 2 {
+            try? rewriteLedger(ownKeys: ownKeys, account: account, otherLines: otherAccountLines)
         }
         return keys
     }
 
     func recordCompletedSourceKey(_ key: String, for accountIdentifier: String) throws {
+        try recordCompletedSourceKeys([key], for: accountIdentifier)
+    }
+
+    /// Append in one pass. The snapshot-to-ledger migration hands over every
+    /// remembered key at once, and opening a file handle per key made the first
+    /// launch after upgrading a large library take minutes.
+    func recordCompletedSourceKeys(_ keys: [String], for accountIdentifier: String) throws {
+        guard !keys.isEmpty else { return }
         let directory = ledgerURL.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         if !FileManager.default.fileExists(atPath: ledgerURL.path) {
@@ -165,12 +197,27 @@ struct FileUploadQueuePersistence: UploadQueuePersisting {
                 throw CocoaError(.fileWriteUnknown)
             }
         }
-        let line = Data((Data(accountIdentifier.utf8).base64EncodedString() + "\t"
-            + Data(key.utf8).base64EncodedString() + "\n").utf8)
+        let account = Data(accountIdentifier.utf8).base64EncodedString()
+        let payload = keys
+            .map { account + "\t" + Data($0.utf8).base64EncodedString() + "\n" }
+            .joined()
         let handle = try FileHandle(forWritingTo: ledgerURL)
         defer { try? handle.close() }
         try handle.seekToEnd()
-        try handle.write(contentsOf: line)
+        try handle.write(contentsOf: Data(payload.utf8))
+        try? FileManager.default.setAttributes(
+            [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+            ofItemAtPath: ledgerURL.path
+        )
+    }
+
+    private func rewriteLedger(ownKeys: [String], account: String, otherLines: [String]) throws {
+        try FileManager.default.createDirectory(at: ledgerURL.deletingLastPathComponent(),
+                                                withIntermediateDirectories: true)
+        let own = ownKeys.map { account + "\t" + Data($0.utf8).base64EncodedString() }
+        let lines = otherLines + own
+        let output = lines.isEmpty ? "" : lines.joined(separator: "\n") + "\n"
+        try output.write(to: ledgerURL, atomically: true, encoding: .utf8)
         try? FileManager.default.setAttributes(
             [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
             ofItemAtPath: ledgerURL.path

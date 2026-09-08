@@ -165,8 +165,16 @@ actor MediaExporter {
             }
             throw Failure.unreadable(error.localizedDescription)
         }
-        return try describe(destination, filename: resource.originalFilename,
-                            modified: asset.creationDate ?? asset.modificationDate, temporary: true)
+        do {
+            return try describe(destination, filename: resource.originalFilename,
+                                modified: asset.creationDate ?? asset.modificationDate, temporary: true)
+        } catch {
+            // `describe` rejects an empty file. The write itself succeeded, so
+            // the earlier cleanup did not run and the directory would linger
+            // until the next launch's purge.
+            try? FileManager.default.removeItem(at: destination.deletingLastPathComponent())
+            throw error
+        }
     }
 
     private func describe(_ url: URL, filename: String, modified: Date?, temporary: Bool) throws -> ExportedMedia {

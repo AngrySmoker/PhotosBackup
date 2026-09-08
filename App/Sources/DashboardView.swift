@@ -6,11 +6,14 @@ struct DashboardView: View {
     @EnvironmentObject private var queue: UploadQueue
     @EnvironmentObject private var preferences: BackupPreferences
     @EnvironmentObject private var albums: PhotoAlbumStore
+    @EnvironmentObject private var automaticBackup: AutomaticBackupCoordinator
 
     let onConnect: () -> Void
     let onAccount: () -> Void
     @State private var showPicker = false
     @State private var showingStopBackupConfirmation = false
+    @State private var manualRunMessage: String?
+    @State private var isStartingManualRun = false
 
     private var selectedAlbums: [PhotoAlbum] {
         albums.albums.filter { preferences.selectedAlbumIDs.contains($0.id) }
@@ -57,7 +60,13 @@ struct DashboardView: View {
             } message: {
                 Text(stopBackupMessage)
             }
-            .onAppear { albums.refresh() }
+            .onAppear {
+                albums.refreshInBackground()
+                refreshBackedUpCounts()
+            }
+            .onChange(of: preferences.selectedAlbumIDs) { _ in refreshBackedUpCounts() }
+            .onChange(of: albums.albums) { _ in refreshBackedUpCounts() }
+            .onChange(of: preferences.backedUpCount) { _ in refreshBackedUpCounts() }
         }
         .navigationViewStyle(.stack)
     }
@@ -79,7 +88,7 @@ struct DashboardView: View {
         case .connected:
             if let warning = account.persistenceWarning {
                 banner(color: .orange, symbol: "key.slash", title: "Not saved to Keychain", message: warning, showsChevron: false)
-            } else if queue.activeCount > 0, let reason = queue.pauseReason {
+            } else if let reason = queue.pauseReason {
                 banner(color: .orange, symbol: "pause.circle.fill", title: "Backup paused", message: reason, showsChevron: false)
             }
         case .rejected(_, let reason):
@@ -121,7 +130,7 @@ struct DashboardView: View {
                 metric(value: queue.activeCount.formatted(), label: "In queue")
             }
 
-            if !queue.isIdle {
+            if !queue.isIdle || queue.isUserPaused {
                 HStack(spacing: 10) {
                     if queue.isUserPaused {
                         Button {
@@ -147,15 +156,17 @@ struct DashboardView: View {
                         .accessibilityHint("Lets uploads in progress finish, then holds the remaining queue")
                     }
 
-                    Button(role: .destructive) {
-                        showingStopBackupConfirmation = true
-                    } label: {
-                        Label("Stop", systemImage: "stop.circle")
-                            .font(.subheadline.weight(.semibold))
-                            .frame(maxWidth: .infinity)
+                    if !queue.isIdle {
+                        Button(role: .destructive) {
+                            showingStopBackupConfirmation = true
+                        } label: {
+                            Label("Stop", systemImage: "stop.circle")
+                                .font(.subheadline.weight(.semibold))
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.bordered)
+                        .tint(.red)
                     }
-                    .buttonStyle(.bordered)
-                    .tint(.red)
                 }
             }
         }
@@ -174,11 +185,32 @@ struct DashboardView: View {
     }
 
     private var albumBackupAction: some View {
-        let enabled = account.status.isUsable && !selectedAlbums.isEmpty && queue.isIdle
+        let enabled = account.status.isUsable && !selectedAlbums.isEmpty
+            && !isStartingManualRun && !queue.isUserPaused
         return Button(action: backUpSelectedAlbums) {
-            quickActionLabel(symbol: "arrow.up.circle.fill", title: "Back Up Now", detail: selectedAlbums.isEmpty ? "Choose albums first" : "\(selectedItemCount.formatted()) items", isEnabled: enabled)
+            quickActionLabel(symbol: "arrow.up.circle.fill",
+                             title: isStartingManualRun ? "Checking…" : "Back Up Now",
+                             detail: backUpActionDetail,
+                             isEnabled: enabled)
         }
         .disabled(!enabled)
+    }
+
+    private var backUpActionDetail: String {
+        if selectedAlbums.isEmpty { return "Choose albums first" }
+        if queue.isUserPaused { return "Backup is paused" }
+        let backedUp = selectedBackedUpCount
+        guard selectedItemCount > 0 else { return "\(selectedItemCount.formatted()) items" }
+        return "\(backedUp.formatted()) of \(selectedItemCount.formatted()) backed up"
+    }
+
+    /// Backed-up total for the selection, using the same "All Photos contains
+    /// everything" rule as `selectedItemCount` so the two agree.
+    private var selectedBackedUpCount: Int {
+        if let all = selectedAlbums.first(where: { $0.isAllPhotos }) {
+            return albums.backedUpCounts[all.id] ?? 0
+        }
+        return selectedAlbums.reduce(0) { $0 + (albums.backedUpCounts[$1.id] ?? 0) }
     }
 
     private var photoPickerAction: some View {
@@ -198,6 +230,12 @@ struct DashboardView: View {
                     StatusPill(text: "Automatic", symbol: "arrow.triangle.2.circlepath", color: .green)
                 }
             }
+            if let manualRunMessage {
+                Text(manualRunMessage)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             if selectedAlbums.isEmpty {
                 Text("No albums selected yet. Choose albums from the Albums tab.")
                     .font(.subheadline).foregroundStyle(.secondary)
@@ -208,10 +246,13 @@ struct DashboardView: View {
                         FeatureIcon(symbol: album.symbol, size: 42)
                         VStack(alignment: .leading, spacing: 2) {
                             Text(album.title).font(.subheadline.weight(.semibold))
-                            Text("\(album.count.formatted()) items").font(.caption).foregroundStyle(.secondary)
+                            Text(progressLabel(for: album)).font(.caption).foregroundStyle(.secondary)
                         }
                         Spacer()
-                        Image(systemName: "checkmark.circle.fill").foregroundStyle(BackupTheme.blue)
+                        Image(systemName: albums.backedUpCounts[album.id] == album.count
+                              ? "checkmark.circle.fill" : "circle.dashed")
+                            .foregroundStyle(albums.backedUpCounts[album.id] == album.count
+                                             ? Color.green : BackupTheme.blue)
                     }
                 }
                 if selectedAlbums.count > 4 {
@@ -292,7 +333,7 @@ struct DashboardView: View {
 
     private var heroTitle: String {
         if !account.status.isUsable { return "Connect to back up" }
-        if queue.activeCount > 0, queue.pauseReason != nil { return "Backup paused" }
+        if queue.pauseReason != nil { return "Backup paused" }
         if !queue.isIdle { return "Backing up…" }
         if queue.failedCount > 0 { return "Backup needs attention" }
         if preferences.backedUpCount == 0 { return "Ready to back up" }
@@ -301,6 +342,7 @@ struct DashboardView: View {
 
     private var heroSubtitle: String {
         if !account.status.isUsable { return "Connect an account to get started" }
+        if let reason = queue.pauseReason { return reason }
         if !queue.isIdle { return "\(queue.activeCount) items remaining" }
         if queue.failedCount > 0 { return "\(queue.failedCount) items failed — open Activity to retry" }
         if selectedAlbums.isEmpty { return "Choose albums to protect" }
@@ -308,33 +350,61 @@ struct DashboardView: View {
     }
 
     private var heroProgress: Double {
-        if !account.status.isUsable || (queue.activeCount > 0 && queue.pauseReason != nil) { return 0.18 }
+        if !account.status.isUsable || queue.pauseReason != nil { return 0.18 }
         return queue.isIdle ? 1 : max(queue.overallFraction, 0.04)
     }
 
     private var heroTint: Color {
-        if !account.status.isUsable || (queue.activeCount > 0 && queue.pauseReason != nil) { return .orange }
+        if !account.status.isUsable || queue.pauseReason != nil { return .orange }
         if queue.failedCount > 0 { return .red }
         return queue.isIdle ? .green : BackupTheme.blue
     }
 
     private var heroSymbol: String {
         if !account.status.isUsable { return "link" }
-        if queue.activeCount > 0, queue.pauseReason != nil { return "pause.fill" }
+        if queue.pauseReason != nil { return "pause.fill" }
         if queue.failedCount > 0 { return "exclamationmark" }
         return queue.isIdle ? "checkmark" : "arrow.up"
     }
 
+    private func progressLabel(for album: PhotoAlbum) -> String {
+        guard let backedUp = albums.backedUpCounts[album.id] else {
+            return "\(album.count.formatted()) items"
+        }
+        return "\(backedUp.formatted()) of \(album.count.formatted()) backed up"
+    }
+
+    private func refreshBackedUpCounts() {
+        albums.refreshBackedUpCounts(for: preferences.selectedAlbumIDs,
+                                     isBackedUp: queue.backedUpAssetLookup())
+    }
+
     private func backUpSelectedAlbums() {
-        let sources = albums.sources(for: preferences.selectedAlbumIDs)
-        queue.enqueue(sources, skippingExisting: true)
+        guard !isStartingManualRun else { return }
+        isStartingManualRun = true
+        manualRunMessage = nil
+        Task {
+            let outcome = await automaticBackup.backUpSelectedAlbumsNow()
+            isStartingManualRun = false
+            manualRunMessage = Self.message(for: outcome)
+        }
+    }
+
+    static func message(for outcome: AutomaticBackupCoordinator.ManualRunOutcome) -> String {
+        switch outcome {
+        case .noLibraryAccess: return "Allow photo access in Settings to back up your albums."
+        case .noAlbumsSelected: return "Choose albums in the Albums tab first."
+        case .nothingToDo: return "Everything in your selected albums is already backed up."
+        case .started(let count): return "Backing up \(count.formatted()) items. Watch progress in Activity."
+        case .rechecking(let count): return "Re-checking \(count.formatted()) items against Google Photos."
+        }
     }
 
     private var stopBackupMessage: String {
         if preferences.automaticBackup {
-            return "Uploads in progress will be cancelled, the remaining queue will be stopped, and Automatic Backup will be turned off."
+            return "Uploads in progress will be cancelled, the queue will be cleared, and Automatic Backup will be turned off. Photos already backed up are not affected."
         }
-        return "Uploads in progress will be cancelled and the remaining queue will be stopped."
+        return "Uploads in progress will be cancelled and the queue will be cleared. Photos already backed up are not affected."
     }
 
     private func stopBackup() {

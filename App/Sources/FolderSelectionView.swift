@@ -5,8 +5,14 @@ import UIKit
 struct FolderSelectionView: View {
     @EnvironmentObject private var albums: PhotoAlbumStore
     @EnvironmentObject private var preferences: BackupPreferences
+    @EnvironmentObject private var queue: UploadQueue
     @Environment(\.openURL) private var openURL
     @State private var searchText = ""
+
+    private func refreshBackedUpCounts() {
+        albums.refreshBackedUpCounts(for: preferences.selectedAlbumIDs,
+                                     isBackedUp: queue.backedUpAssetLookup())
+    }
 
     private var filteredAlbums: [PhotoAlbum] {
         guard !searchText.isEmpty else { return albums.albums }
@@ -37,7 +43,13 @@ struct FolderSelectionView: View {
                         .font(.subheadline).foregroundStyle(.secondary)
                 }
             }
-            .onAppear { albums.refresh() }
+            .onAppear {
+                albums.refreshInBackground()
+                refreshBackedUpCounts()
+            }
+            .onChange(of: preferences.selectedAlbumIDs) { _ in refreshBackedUpCounts() }
+            .onChange(of: albums.albums) { _ in refreshBackedUpCounts() }
+            .onChange(of: queue.items) { _ in refreshBackedUpCounts() }
         }
         .navigationViewStyle(.stack)
     }
@@ -45,6 +57,7 @@ struct FolderSelectionView: View {
     private var albumList: some View {
         ScrollView {
             LazyVStack(spacing: 10) {
+                if albums.isLimited { limitedAccessBanner }
                 HStack(spacing: 10) {
                     Image(systemName: preferences.automaticBackup ? "arrow.triangle.2.circlepath.circle.fill" : "pause.circle.fill")
                         .foregroundStyle(preferences.automaticBackup ? .green : .orange)
@@ -57,13 +70,39 @@ struct FolderSelectionView: View {
                 .padding(.bottom, 4)
 
                 ForEach(filteredAlbums) { album in
-                    AlbumSelectionRow(album: album, isSelected: preferences.selectedAlbumIDs.contains(album.id)) {
+                    AlbumSelectionRow(album: album,
+                                      isSelected: preferences.selectedAlbumIDs.contains(album.id),
+                                      backedUpCount: albums.backedUpCounts[album.id]) {
                         preferences.toggle(albumID: album.id)
                     }
                 }
             }
             .padding(16)
         }
+    }
+
+    /// Under limited access every PhotoKit fetch is scoped to the assets the
+    /// user hand-picked, so "All Photos" can read as a few dozen items with no
+    /// explanation. Say so, and offer the way to change it.
+    private var limitedAccessBanner: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 10) {
+                Image(systemName: "photo.badge.checkmark").foregroundStyle(.orange)
+                Text("Limited photo access").font(.subheadline.weight(.semibold))
+                Spacer()
+            }
+            Text("Only the photos you picked are visible to Photos Backup, so these counts do not cover your whole library.")
+                .font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Button("Change in Settings") {
+                if let url = URL(string: UIApplication.openSettingsURLString) { openURL(url) }
+            }
+            .font(.footnote.weight(.semibold))
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 14))
+        .padding(.bottom, 4)
     }
 
     private var permissionState: some View {

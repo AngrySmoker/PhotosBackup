@@ -2,7 +2,6 @@ import SwiftUI
 
 struct ContentView: View {
     @EnvironmentObject private var log: ProbeLog
-    @EnvironmentObject private var queue: UploadQueue
     @EnvironmentObject private var preferences: BackupPreferences
 
     var body: some View {
@@ -15,11 +14,9 @@ struct ContentView: View {
                     .transition(.opacity)
             }
         }
-        .preferredColorScheme(.light)
         .tint(BackupTheme.blue)
         .animation(.easeInOut(duration: 0.3), value: preferences.completedOnboarding)
         .onAppear { markBuildStep() }
-        .onChange(of: queue.items) { preferences.observeCompletedUploads($0) }
     }
 
     private func markBuildStep() {
@@ -54,7 +51,10 @@ private struct MainAppView: View {
                 .tabItem { Label("Settings", systemImage: "gearshape.fill") }
                 .tag(3)
         }
-        .sheet(isPresented: $showConnectionTutorial) {
+        // Full screen, like onboarding's connect step. As a sheet, an
+        // accidental downward swipe discards a single-use oauth_token and the
+        // whole Google sign-in has to be repeated.
+        .fullScreenCover(isPresented: $showConnectionTutorial) {
             ConnectionTutorialView()
         }
     }

@@ -11,6 +11,14 @@ final class AutomaticBackupCoordinator: ObservableObject {
     static let taskIdentifier = "com.g8row.photosbackup.background-backup"
     private static let logger = Logger(subsystem: "com.g8row.photosbackup", category: "automatic-backup")
 
+    /// How many sources one enqueue pass may append. These bound *memory*, not
+    /// how much a window uploads — the queue is durable, so anything a window
+    /// cannot finish simply waits for the next one. The old background value of
+    /// 25 meant a window that iOS might only grant once a day could never let
+    /// the queue saturate, and so could never advance the change token either.
+    private static let foregroundBatchLimit = 250
+    private static let backgroundBatchLimit = 250
+
     private let photos: PhotosStack
     private let account: PhotosAccount
     private let queue: UploadQueue
@@ -54,7 +62,13 @@ final class AutomaticBackupCoordinator: ObservableObject {
                 task.setTaskCompleted(success: false)
                 return
             }
-            Task { @MainActor [weak self] in self?.begin(task) }
+            // iOS expects an expiration handler promptly, and the hop to the
+            // main actor below can be delayed by whatever it is already doing.
+            // Install a handler that works before `begin` runs, then let
+            // `begin` replace it with one that can also cancel the operation.
+            let window = BackgroundWindow()
+            task.expirationHandler = { window.expire() }
+            Task { @MainActor [weak self] in self?.begin(task, window: window) }
         }
     }
 
@@ -94,6 +108,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
 
     func applicationDidEnterBackground() {
         cancelForegroundScan()
+        queue.flushPendingWrites()
         isForeground = false
         queue.setICloudDownloadsAllowed(false)
         shouldRunAfterActivation = true
@@ -148,10 +163,94 @@ final class AutomaticBackupCoordinator: ObservableObject {
               account.status.isUsable,
               preferences.connection.decision(for: network.status).allowsUploads else { return }
 
-        albums.refresh()
-        guard albums.canRead else { return }
         ranForegroundBackup = true
-        let sources = albums.sources(for: preferences.selectedAlbumIDs)
+        let runID = UUID()
+        foregroundRunID = runID
+        foregroundOperation = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.albums.refresh()
+            if self.albums.canRead, !Task.isCancelled {
+                let sources = await self.albums.sources(for: self.preferences.selectedAlbumIDs)
+                if !Task.isCancelled { await self.performForegroundBackup(sources) }
+            } else {
+                // Access was refused or not decided yet. Release the once-per
+                // foreground latch so granting it later still starts a scan.
+                self.ranForegroundBackup = false
+            }
+            if self.foregroundRunID == runID {
+                self.foregroundOperation = nil
+                self.foregroundRunID = nil
+            }
+        }
+    }
+
+    /// Keep the in-memory queue bounded without stopping an initial backup after
+    /// its first page. Completed and failed source keys make each rescan cheap
+    /// and ensure the loop eventually reaches every selected asset.
+    private func performForegroundBackup(_ sources: [MediaSource]) async {
+        while isForeground, !Task.isCancelled, account.status.isUsable, shouldSchedule, !isPausedForAnyReason {
+            let accepted = queue.enqueue(sources, skippingExisting: true, limit: Self.foregroundBatchLimit)
+            if accepted.isEmpty { return }
+            while queue.activeCount > 0 {
+                // A pause the queue is honouring must end the loop too,
+                // otherwise this polls every 200 ms for as long as the user
+                // waits for Wi-Fi or leaves the backup paused.
+                if Task.isCancelled || !isForeground || !account.status.isUsable || !shouldSchedule
+                    || queue.haltReason != nil || isPausedForAnyReason { return }
+                try? await Task.sleep(nanoseconds: 200_000_000)
+            }
+        }
+    }
+
+    /// Any condition that stops the queue starting new work. Polling past one
+    /// of these makes no progress and only keeps the main actor awake.
+    private var isPausedForAnyReason: Bool {
+        queue.isUserPaused || queue.networkPauseReason != nil || queue.systemPauseReason != nil
+    }
+
+    /// The result of a manual "Back Up Now" or "Re-check Backups", so the UI can
+    /// say what happened instead of leaving a button that appears to do nothing.
+    enum ManualRunOutcome: Equatable {
+        case noLibraryAccess
+        case noAlbumsSelected
+        case nothingToDo
+        case started(count: Int)
+        case rechecking(count: Int)
+    }
+
+    /// "Back Up Now". Runs the same bounded, paged loop the automatic scan uses
+    /// so a large library cannot be poured into the queue in one go.
+    func backUpSelectedAlbumsNow() async -> ManualRunOutcome {
+        guard !preferences.selectedAlbumIDs.isEmpty else { return .noAlbumsSelected }
+        await albums.refresh()
+        guard albums.canRead else { return .noLibraryAccess }
+        let sources = await albums.sources(for: preferences.selectedAlbumIDs)
+        let accepted = queue.enqueue(sources, skippingExisting: true, limit: Self.foregroundBatchLimit)
+        guard !accepted.isEmpty else { return .nothingToDo }
+        startPagedRun(sources)
+        return .started(count: accepted.count)
+    }
+
+    /// "Re-check Backups". Forgets remembered completions for the selection and
+    /// re-enqueues it; the worker's hash lookup settles anything still in the
+    /// cloud without re-uploading it.
+    func reverifySelectedAlbums() async -> ManualRunOutcome {
+        guard !preferences.selectedAlbumIDs.isEmpty else { return .noAlbumsSelected }
+        await albums.refresh()
+        guard albums.canRead else { return .noLibraryAccess }
+        let sources = await albums.sources(for: preferences.selectedAlbumIDs)
+        guard !sources.isEmpty else { return .nothingToDo }
+        let result = queue.reverify(sources, limit: Self.foregroundBatchLimit)
+        guard result.enqueued > 0 else { return .nothingToDo }
+        startPagedRun(sources)
+        return .rechecking(count: result.enqueued)
+    }
+
+    /// Take over the foreground paging loop for a manually started run, so the
+    /// remaining pages follow without the user tapping again.
+    private func startPagedRun(_ sources: [MediaSource]) {
+        cancelForegroundScan()
+        ranForegroundBackup = true
         let runID = UUID()
         foregroundRunID = runID
         foregroundOperation = Task { @MainActor [weak self] in
@@ -164,28 +263,13 @@ final class AutomaticBackupCoordinator: ObservableObject {
         }
     }
 
-    /// Keep the in-memory queue bounded without stopping an initial backup after
-    /// its first page. Completed and failed source keys make each rescan cheap
-    /// and ensure the loop eventually reaches every selected asset.
-    private func performForegroundBackup(_ sources: [MediaSource]) async {
-        while isForeground, !Task.isCancelled, account.status.isUsable, shouldSchedule {
-            let accepted = queue.enqueue(sources, skippingExisting: true, limit: 250)
-            if accepted.isEmpty { return }
-            while queue.activeCount > 0 {
-                if Task.isCancelled || !isForeground || !account.status.isUsable || !shouldSchedule
-                    || queue.haltReason != nil { return }
-                try? await Task.sleep(nanoseconds: 200_000_000)
-            }
-        }
-    }
-
     private func cancelForegroundScan() {
         foregroundOperation?.cancel()
         foregroundOperation = nil
         foregroundRunID = nil
     }
 
-    private func begin(_ task: BGProcessingTask) {
+    private func begin(_ task: BGProcessingTask, window: BackgroundWindow) {
         Self.logger.info("Beginning an iOS background-processing window")
         isForeground = false
         updateSchedule()
@@ -205,11 +289,14 @@ final class AutomaticBackupCoordinator: ObservableObject {
             self.backgroundOperation = nil
         }
         backgroundOperation = operation
-        task.expirationHandler = { [weak self] in
+        let expire: @Sendable () -> Void = { [weak self] in
             Self.logger.notice("iOS expired the background-processing window; requeuing unfinished uploads")
             operation.cancel()
             Task { @MainActor [weak self] in self?.queue.suspendForBackgroundExpiration() }
         }
+        task.expirationHandler = expire
+        // iOS may already have expired the window while this hop was queued.
+        window.adopt(expire)
     }
 
     private func performBackgroundBackup() async -> Bool {
@@ -224,16 +311,25 @@ final class AutomaticBackupCoordinator: ObservableObject {
               account.status.isUsable,
               preferences.connection.decision(for: network.status).allowsUploads else { return false }
 
-        albums.refresh()
+        await albums.refresh()
         guard albums.canRead else { return false }
         let failuresBefore = queue.failedCount
         let scan = libraryChanges.scan(albums: albums,
                                        selectedAlbumIDs: preferences.selectedAlbumIDs,
                                        accountIdentifier: account.status.email)
-        let accepted = queue.enqueue(scan.sources, skippingExisting: true, limit: 25)
-        // Do not advance past a large import until repeated bounded runs have
-        // durably handed every changed asset to the queue.
-        if accepted.isEmpty, queue.persistenceWarning == nil { libraryChanges.commit(scan) }
+        // An edited asset already has a completion recorded against its
+        // identifier, so the dedup below would drop it. Release those first;
+        // the worker's hash lookup still short-circuits anything whose bytes
+        // did not actually change.
+        if !scan.editedSources.isEmpty {
+            queue.forgetCompletedSources(for: scan.editedSources)
+        }
+        let outcome = queue.enqueueReportingLimit(scan.sources, skippingExisting: true,
+                                                  limit: Self.backgroundBatchLimit)
+        // Advance the change token once every source in this scan has been
+        // durably handed to the queue — accepted now, or already tracked. Only
+        // a batch the limit cut short leaves sources unexamined.
+        if !outcome.reachedLimit, queue.persistenceWarning == nil { libraryChanges.commit(scan) }
         let settled = await queue.waitUntilSettled()
         if !settled {
             // Expiration or a policy pause cancels the wait, but the work
@@ -285,4 +381,29 @@ final class AutomaticBackupCoordinator: ObservableObject {
         }
     }
 #endif
+}
+
+/// Bridges the gap between a `BGProcessingTask` arriving on a system queue and
+/// the coordinator taking it over on the main actor. An expiration that lands
+/// inside that gap is remembered and replayed to the real handler.
+final class BackgroundWindow: @unchecked Sendable {
+    private let lock = NSLock()
+    private var expired = false
+    private var handler: (@Sendable () -> Void)?
+
+    func expire() {
+        lock.lock()
+        expired = true
+        let handler = self.handler
+        lock.unlock()
+        handler?()
+    }
+
+    func adopt(_ handler: @escaping @Sendable () -> Void) {
+        lock.lock()
+        self.handler = handler
+        let alreadyExpired = expired
+        lock.unlock()
+        if alreadyExpired { handler() }
+    }
 }

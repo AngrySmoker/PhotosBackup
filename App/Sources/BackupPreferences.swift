@@ -43,7 +43,6 @@ final class BackupPreferences: ObservableObject {
     @Published private(set) var backedUpCount: Int
 
     private let defaults: UserDefaults
-    private var countedQueueItems: Set<UUID> = []
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -61,12 +60,15 @@ final class BackupPreferences: ObservableObject {
         else { selectedAlbumIDs.insert(albumID) }
     }
 
-    func observeCompletedUploads(_ items: [UploadItem]) {
-        let completed = items.filter { $0.state == .done || $0.state == .alreadyBackedUp }
-        let newIDs = Set(completed.map(\.id)).subtracting(countedQueueItems)
-        guard !newIDs.isEmpty else { return }
-        countedQueueItems.formUnion(newIDs)
-        backedUpCount += newIDs.count
+    /// Called by `UploadQueue` the moment an item reaches a backed-up state.
+    ///
+    /// This deliberately does not observe the queue's published items from a
+    /// view: SwiftUI does not update views for a backgrounded scene, and
+    /// completed rows are dropped from the durable snapshot, so anything
+    /// uploaded during a processing window that ends in process termination
+    /// would never be counted at all.
+    func recordCompletedUpload() {
+        backedUpCount += 1
         defaults.set(backedUpCount, forKey: Key.backedUpCount)
     }
 
@@ -101,19 +103,51 @@ final class PhotoAlbumStore: ObservableObject {
     @Published private(set) var albums: [PhotoAlbum] = []
     @Published private(set) var authorization = PHPhotoLibrary.authorizationStatus(for: .readWrite)
     @Published private(set) var isLoading = false
+    /// Backed-up item counts per album id, filled in lazily off the main actor.
+    @Published private(set) var backedUpCounts: [String: Int] = [:]
+
+    private var refreshTask: Task<Void, Never>?
+    private var countsTask: Task<Void, Never>?
 
     var canRead: Bool { authorization == .authorized || authorization == .limited }
+    /// True when the user granted access to a hand-picked subset. Every fetch is
+    /// then scoped to that subset, so counts are not library-wide.
+    var isLimited: Bool { authorization == .limited }
 
     func requestAccess() async {
         authorization = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
-        if canRead { refresh() }
+        if canRead { await refresh() }
     }
 
-    func refresh() {
+    /// Enumerating collections and counting their assets is slow enough on a
+    /// large library to drop frames, so it runs off the main actor and only the
+    /// finished list is published. Concurrent callers share one pass.
+    func refresh() async {
+        if let refreshTask {
+            await refreshTask.value
+            return
+        }
         authorization = PHPhotoLibrary.authorizationStatus(for: .readWrite)
-        guard canRead else { albums = []; return }
+        guard canRead else { albums = []; backedUpCounts = [:]; return }
         isLoading = true
+        let task = Task { @MainActor [weak self] in
+            let loaded = await Task.detached(priority: .userInitiated) { Self.loadAlbums() }.value
+            guard let self else { return }
+            self.albums = loaded
+            self.isLoading = false
+        }
+        refreshTask = task
+        await task.value
+        refreshTask = nil
+    }
 
+    /// Fire-and-forget variant for `onAppear`, which cannot await.
+    func refreshInBackground() {
+        guard refreshTask == nil else { return }
+        Task { await refresh() }
+    }
+
+    private nonisolated static func loadAlbums() -> [PhotoAlbum] {
         var result: [PhotoAlbum] = []
         var seen = Set<String>()
         func append(_ collection: PHAssetCollection) {
@@ -124,7 +158,7 @@ final class PhotoAlbumStore: ObservableObject {
                 id: collection.localIdentifier,
                 title: collection.localizedTitle ?? "Untitled Album",
                 count: fetch.count,
-                symbol: Self.symbol(for: collection),
+                symbol: symbol(for: collection),
                 collection: collection
             ))
         }
@@ -141,7 +175,7 @@ final class PhotoAlbumStore: ObservableObject {
         }
 
         // A synthetic album for the entire library, always pinned to the top.
-        let allCount = PHAsset.fetchAssets(with: Self.allPhotosOptions()).count
+        let allCount = PHAsset.fetchAssets(with: allPhotosOptions()).count
         if allCount > 0 {
             ordered.insert(PhotoAlbum(
                 id: PhotoAlbum.allPhotosID,
@@ -151,14 +185,45 @@ final class PhotoAlbumStore: ObservableObject {
                 collection: nil
             ), at: 0)
         }
-
-        albums = ordered
-        isLoading = false
+        return ordered
     }
 
-    func sources(for albumIDs: Set<String>) -> [MediaSource] {
+    /// Asset identifiers per album, enumerated off the main actor.
+    func assetIdentifiers(for albumIDs: Set<String>) async -> [String: [String]] {
+        let targets = albums.filter { albumIDs.contains($0.id) }
+            .map { ($0.id, $0.collection) }
+        guard !targets.isEmpty else { return [:] }
+        return await Task.detached(priority: .userInitiated) {
+            var result: [String: [String]] = [:]
+            for (id, collection) in targets {
+                let assets = collection.map { PHAsset.fetchAssets(in: $0, options: nil) }
+                    ?? PHAsset.fetchAssets(with: Self.allPhotosOptions())
+                var identifiers: [String] = []
+                identifiers.reserveCapacity(assets.count)
+                assets.enumerateObjects { asset, _, _ in identifiers.append(asset.localIdentifier) }
+                result[id] = identifiers
+            }
+            return result
+        }.value
+    }
+
+    func sources(for albumIDs: Set<String>) async -> [MediaSource] {
         // Albums overlap (and "All Photos" contains all of them), so dedup by
         // asset identifier — otherwise one asset becomes several queue sources.
+        let byAlbum = await assetIdentifiers(for: albumIDs)
+        var seen = Set<String>()
+        var sources: [MediaSource] = []
+        for album in albums where albumIDs.contains(album.id) {
+            for identifier in byAlbum[album.id] ?? [] where seen.insert(identifier).inserted {
+                sources.append(.asset(localIdentifier: identifier))
+            }
+        }
+        return sources
+    }
+
+    /// Synchronous variant, retained for the background-window scan where the
+    /// work already runs outside a frame deadline.
+    func sourcesSynchronously(for albumIDs: Set<String>) -> [MediaSource] {
         var seen = Set<String>()
         var sources: [MediaSource] = []
         for album in albums where albumIDs.contains(album.id) {
@@ -176,15 +241,38 @@ final class PhotoAlbumStore: ObservableObject {
         return sources
     }
 
+    /// Recompute "N of M backed up" for the selected albums. `isBackedUp` is
+    /// resolved against the queue's durable completion ledger.
+    func refreshBackedUpCounts(for albumIDs: Set<String>,
+                               isBackedUp: @escaping @Sendable (String) -> Bool) {
+        countsTask?.cancel()
+        guard canRead, !albumIDs.isEmpty else { backedUpCounts = [:]; return }
+        countsTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let byAlbum = await self.assetIdentifiers(for: albumIDs)
+            guard !Task.isCancelled else { return }
+            let counts = await Task.detached(priority: .utility) {
+                byAlbum.mapValues { identifiers in
+                    identifiers.reduce(into: 0) { total, id in
+                        if isBackedUp(id) { total += 1 }
+                    }
+                }
+            }.value
+            guard !Task.isCancelled else { return }
+            self.backedUpCounts = counts
+        }
+    }
+
     /// Restrict a PhotoKit persistent-change batch to the selected albums.
     /// The changed identifier set is normally tiny, while the full-scan method
     /// above remains the iOS 15 and expired-token fallback.
     func sources(for albumIDs: Set<String>, matching identifiers: Set<String>) -> [MediaSource] {
         guard !identifiers.isEmpty else { return [] }
         if albumIDs.contains(PhotoAlbum.allPhotosID) {
-            let assets = PHAsset.fetchAssets(withLocalIdentifiers: Array(identifiers), options: Self.allPhotosOptions())
+            let assets = PHAsset.fetchAssets(withLocalIdentifiers: Array(identifiers), options: nil)
             var result: [MediaSource] = []
             assets.enumerateObjects { asset, _, _ in
+                guard asset.mediaType == .image || asset.mediaType == .video else { return }
                 result.append(.asset(localIdentifier: asset.localIdentifier))
             }
             return result
@@ -204,7 +292,7 @@ final class PhotoAlbumStore: ObservableObject {
 
     /// Images and videos across the whole library, newest first, for the
     /// synthetic "All Photos" album.
-    static func allPhotosOptions() -> PHFetchOptions {
+    nonisolated static func allPhotosOptions() -> PHFetchOptions {
         let options = PHFetchOptions()
         options.predicate = NSPredicate(
             format: "mediaType == %d OR mediaType == %d",
@@ -214,7 +302,7 @@ final class PhotoAlbumStore: ObservableObject {
         return options
     }
 
-    static func symbol(for collection: PHAssetCollection) -> String {
+    nonisolated static func symbol(for collection: PHAssetCollection) -> String {
         switch collection.assetCollectionSubtype {
         case .smartAlbumUserLibrary: return "camera.fill"
         case .smartAlbumScreenshots: return "iphone"

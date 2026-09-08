@@ -6,6 +6,7 @@ struct SettingsView: View {
     @EnvironmentObject private var queue: UploadQueue
     @EnvironmentObject private var preferences: BackupPreferences
     @EnvironmentObject private var albums: PhotoAlbumStore
+    @EnvironmentObject private var automaticBackup: AutomaticBackupCoordinator
 
     let showTutorial: () -> Void
     @State private var confirmDisconnect = false
@@ -20,7 +21,6 @@ struct SettingsView: View {
                 accountSection
                 backupSection
                 verifySection
-                safariSection
                 supportSection
                 aboutSection
             }
@@ -133,23 +133,13 @@ struct SettingsView: View {
         }
     }
 
-    private var safariSection: some View {
-        Section {
-            Button("Connect Account") { showTutorial() }
-        } header: {
-            Text("Connection")
-        } footer: {
-            Text("Sign in to Google in a secure in-app window to connect your Google Photos account.")
-        }
-    }
-
     private var verifySection: some View {
         Section {
             Button {
                 runVerification()
             } label: {
                 HStack {
-                    Text(isVerifying ? "Verifying…" : "Verify Backup")
+                    Text(isVerifying ? "Re-checking…" : "Re-check Backups")
                     Spacer()
                     if isVerifying { ProgressView() }
                 }
@@ -162,9 +152,9 @@ struct SettingsView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
         } header: {
-            Text("Verify")
+            Text("Re-check")
         } footer: {
-            Text("Re-checks selected albums against Google Photos. Items still in the cloud finish quickly; anything deleted there is queued for upload again.")
+            Text("Compares your selected albums against Google Photos again. Items still in the cloud finish quickly; anything deleted there is queued for upload again.")
         }
     }
 
@@ -176,25 +166,11 @@ struct SettingsView: View {
         guard canVerify else { return }
         isVerifying = true
         verifyMessage = nil
-        albums.refresh()
-        guard albums.canRead else {
-            verifyMessage = "Allow photo library access to verify your backup."
+        Task {
+            let outcome = await automaticBackup.reverifySelectedAlbums()
             isVerifying = false
-            return
+            verifyMessage = DashboardView.message(for: outcome)
         }
-        let sources = albums.sources(for: preferences.selectedAlbumIDs)
-        guard !sources.isEmpty else {
-            verifyMessage = "No items in the selected albums to verify."
-            isVerifying = false
-            return
-        }
-        let result = queue.reverify(sources)
-        if result.enqueued == 0, result.forgotten == 0 {
-            verifyMessage = "Everything is already queued or up to date."
-        } else {
-            verifyMessage = "Re-checking \(result.enqueued) items against Google Photos. Watch progress in Activity."
-        }
-        isVerifying = false
     }
 
     private var supportSection: some View {
