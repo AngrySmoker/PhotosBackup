@@ -1,13 +1,12 @@
-import PhotosUI
 import SwiftUI
 
 struct UploadsView: View {
     @EnvironmentObject private var account: PhotosAccount
     @EnvironmentObject private var queue: UploadQueue
-    @State private var selection: [PhotosPickerItem] = []
+    @State private var showPicker = false
 
     var body: some View {
-        NavigationStack {
+        NavigationView {
             List {
                 manualBackupSection
                 if queue.activeCount > 0, let reason = queue.pauseReason { pausedSection(reason) }
@@ -18,26 +17,27 @@ struct UploadsView: View {
             .listStyle(.insetGrouped)
             .navigationTitle("Activity")
             .toolbar {
-                if queue.items.contains(where: { $0.state.isFinished }) {
-                    ToolbarItem(placement: .navigationBarTrailing) {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    if queue.items.contains(where: { $0.state.isFinished }) {
                         Button("Clear") { queue.clearFinished() }
                     }
                 }
             }
-            .onChange(of: selection) { items in
-                guard !items.isEmpty else { return }
-                selection = []
-                Task {
-                    await MediaLibrary.requestReadAccess()
-                    queue.enqueue(MediaLibrary.sources(for: items), skippingExisting: true)
-                }
+            .sheet(isPresented: $showPicker) {
+                PhotoPicker { sources in enqueue(sources) }.ignoresSafeArea()
             }
         }
+        .navigationViewStyle(.stack)
+    }
+
+    private func enqueue(_ sources: [MediaSource]) {
+        guard !sources.isEmpty else { return }
+        queue.enqueue(sources, skippingExisting: true)
     }
 
     private var manualBackupSection: some View {
         Section {
-            PhotosPicker(selection: $selection, maxSelectionCount: 50, matching: .any(of: [.images, .videos]), photoLibrary: .shared()) {
+            Button { showPicker = true } label: {
                 HStack(spacing: 12) {
                     FeatureIcon(symbol: "photo.badge.plus", size: 42)
                     VStack(alignment: .leading, spacing: 3) {
@@ -47,6 +47,7 @@ struct UploadsView: View {
                 }
                 .padding(.vertical, 4)
             }
+            .buttonStyle(.plain)
             .disabled(!account.status.isUsable)
         } footer: {
             if !account.status.isUsable { Text("Connect a Google Photos account before starting a backup.") }

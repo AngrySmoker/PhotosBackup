@@ -12,7 +12,7 @@ struct SettingsView: View {
     private let gpmcURL = URL(string: "https://github.com/xob0t/gpmc")!
 
     var body: some View {
-        NavigationStack {
+        NavigationView {
             Form {
                 accountSection
                 backupSection
@@ -28,6 +28,7 @@ struct SettingsView: View {
                 Text("New backups will stop until you connect again. Photos already backed up are not affected.")
             }
         }
+        .navigationViewStyle(.stack)
     }
 
     private var accountSection: some View {
@@ -149,10 +150,10 @@ struct SettingsView: View {
 
     private var aboutSection: some View {
         Section("About") {
-            LabeledContent("App", value: "Photos Backup")
-            LabeledContent("Version", value: appVersion)
-            LabeledContent("iOS", value: UIDevice.current.systemVersion)
-            LabeledContent("Core technology") {
+            LabeledRow("App", value: "Photos Backup")
+            LabeledRow("Version", value: appVersion)
+            LabeledRow("iOS", value: UIDevice.current.systemVersion)
+            LabeledRow("Core technology") {
                 Link("GPMC by xob0t", destination: gpmcURL)
             }
         }

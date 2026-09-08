@@ -1,4 +1,3 @@
-import PhotosUI
 import SwiftUI
 
 struct DashboardView: View {
@@ -10,7 +9,7 @@ struct DashboardView: View {
 
     let onConnect: () -> Void
     let onAccount: () -> Void
-    @State private var selection: [PhotosPickerItem] = []
+    @State private var showPicker = false
 
     private var selectedAlbums: [PhotoAlbum] {
         albums.albums.filter { preferences.selectedAlbumIDs.contains($0.id) }
@@ -19,7 +18,7 @@ struct DashboardView: View {
     private var selectedItemCount: Int { selectedAlbums.reduce(0) { $0 + $1.count } }
 
     var body: some View {
-        NavigationStack {
+        NavigationView {
             ScrollView {
                 LazyVStack(spacing: 16) {
                     accountBanner
@@ -38,16 +37,17 @@ struct DashboardView: View {
                     accountToolbarItem
                 }
             }
-            .onChange(of: selection) { items in
-                guard !items.isEmpty else { return }
-                selection = []
-                Task {
-                    await MediaLibrary.requestReadAccess()
-                    queue.enqueue(MediaLibrary.sources(for: items), skippingExisting: true)
-                }
+            .sheet(isPresented: $showPicker) {
+                PhotoPicker { sources in enqueue(sources) }.ignoresSafeArea()
             }
             .onAppear { albums.refresh() }
         }
+        .navigationViewStyle(.stack)
+    }
+
+    private func enqueue(_ sources: [MediaSource]) {
+        guard !sources.isEmpty else { return }
+        queue.enqueue(sources, skippingExisting: true)
     }
 
     @ViewBuilder private var accountBanner: some View {
@@ -128,7 +128,7 @@ struct DashboardView: View {
 
     private var photoPickerAction: some View {
         let enabled = account.status.isUsable
-        return PhotosPicker(selection: $selection, maxSelectionCount: 50, matching: .any(of: [.images, .videos]), photoLibrary: .shared()) {
+        return Button { showPicker = true } label: {
             quickActionLabel(symbol: "photo.badge.plus", title: "Pick Photos", detail: "Manual backup", isEnabled: enabled)
         }
         .disabled(!enabled)

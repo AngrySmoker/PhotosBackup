@@ -12,9 +12,19 @@ enum MediaSource: Equatable, Sendable {
     case asset(localIdentifier: String)
     /// A picker selection we could not resolve to an asset (no library
     /// permission, or a cloud-only item chosen through the limited picker).
-    case picked(PhotosPickerItem)
+    /// Carries the item provider so the file is copied lazily at export time.
+    case picked(PickedItem)
     /// An existing file. Used by tests and by anything that already staged one.
     case file(URL)
+}
+
+/// A picked item with no resolvable asset id. Wraps the provider so the file
+/// can be copied lazily at export time. Reference identity is enough for the
+/// queue's dedup, and picked items are never persisted.
+final class PickedItem: @unchecked Sendable, Equatable {
+    let provider: NSItemProvider
+    init(_ provider: NSItemProvider) { self.provider = provider }
+    static func == (lhs: PickedItem, rhs: PickedItem) -> Bool { lhs === rhs }
 }
 
 struct ExportedMedia: Equatable, Sendable {
@@ -24,17 +34,6 @@ struct ExportedMedia: Equatable, Sendable {
     let byteCount: Int64
     /// False for `.file` sources, which the exporter does not own and must not delete.
     let temporary: Bool
-}
-
-/// Copies a picked item to disk without pulling it through memory.
-/// `FileRepresentation` hands us a URL that is only valid inside the closure,
-/// so the copy happens there and the caller gets a URL it owns.
-private struct ImportedFile: Transferable {
-    let url: URL
-    static var transferRepresentation: some TransferRepresentation {
-        FileRepresentation(importedContentType: .image) { ImportedFile(url: try MediaExporter.adopt($0.file)) }
-        FileRepresentation(importedContentType: .movie) { ImportedFile(url: try MediaExporter.adopt($0.file)) }
-    }
 }
 
 /// Turns a `MediaSource` into a file `GPMCClient.upload` can read, and cleans
@@ -71,6 +70,27 @@ actor MediaExporter {
         return destination
     }
 
+    /// Copy a picked item provider's file into staging. `loadFileRepresentation`
+    /// hands back a URL valid only inside its closure, so the copy happens there.
+    static func copyToStaging(from provider: NSItemProvider) async throws -> URL {
+        let movie = UTType.movie.identifier
+        let image = UTType.image.identifier
+        let typeID: String
+        if provider.hasItemConformingToTypeIdentifier(movie) { typeID = movie }
+        else if provider.hasItemConformingToTypeIdentifier(image) { typeID = image }
+        else { throw Failure.noResource }
+        return try await withCheckedThrowingContinuation { continuation in
+            provider.loadFileRepresentation(forTypeIdentifier: typeID) { url, error in
+                if let url {
+                    do { continuation.resume(returning: try adopt(url)) }
+                    catch { continuation.resume(throwing: error) }
+                } else {
+                    continuation.resume(throwing: error ?? Failure.noResource)
+                }
+            }
+        }
+    }
+
     static func stage(named name: String) throws -> URL {
         let directory = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -89,14 +109,9 @@ actor MediaExporter {
             return try describe(url, filename: url.lastPathComponent, modified: nil, temporary: false)
         case .asset(let identifier):
             return try await exportAsset(identifier)
-        case .picked(let item):
-            // A picker item that carries a library identifier still has its
-            // original filename and capture date; take that path when we can.
-            if let identifier = item.itemIdentifier, let media = try? await exportAsset(identifier) { return media }
-            guard let imported = try await item.loadTransferable(type: ImportedFile.self) else {
-                throw Failure.noResource
-            }
-            return try describe(imported.url, filename: imported.url.lastPathComponent, modified: nil, temporary: true)
+        case .picked(let picked):
+            let url = try await Self.copyToStaging(from: picked.provider)
+            return try describe(url, filename: url.lastPathComponent, modified: nil, temporary: true)
         }
     }
 
@@ -157,12 +172,12 @@ enum MediaLibrary {
     }
 
     /// Prefer asset identifiers so filenames and capture dates survive; fall
-    /// back to the picker item itself when the library is off limits.
-    static func sources(for items: [PhotosPickerItem]) -> [MediaSource] {
+    /// back to the item provider for a lazy copy when the library is off limits.
+    static func sources(forPickerResults results: [PHPickerResult]) -> [MediaSource] {
         let readable = isReadable
-        return items.map { item in
-            if readable, let identifier = item.itemIdentifier { return .asset(localIdentifier: identifier) }
-            return .picked(item)
+        return results.map { result in
+            if readable, let identifier = result.assetIdentifier { return .asset(localIdentifier: identifier) }
+            return .picked(PickedItem(result.itemProvider))
         }
     }
 }

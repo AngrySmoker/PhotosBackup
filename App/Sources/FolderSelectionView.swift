@@ -14,7 +14,7 @@ struct FolderSelectionView: View {
     }
 
     var body: some View {
-        NavigationStack {
+        NavigationView {
             Group {
                 if albums.authorization == .notDetermined {
                     permissionState
@@ -39,6 +39,7 @@ struct FolderSelectionView: View {
             }
             .onAppear { albums.refresh() }
         }
+        .navigationViewStyle(.stack)
     }
 
     private var albumList: some View {

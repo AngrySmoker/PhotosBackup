@@ -11,7 +11,7 @@ struct DiagnosticsView: View {
     var body: some View {
         List {
             Section("Environment") {
-                LabeledContent("iOS", value: UIDevice.current.systemVersion)
+                LabeledRow("iOS", value: UIDevice.current.systemVersion)
             }
 
             Section("Connection Flow") {
@@ -45,8 +45,8 @@ struct DiagnosticsView: View {
 
             Section {
                 DisclosureGroup("Advanced: Paste oauth_token", isExpanded: $showAdvanced) {
-                    TextField("oauth_token value", text: $manualToken, axis: .vertical)
-                        .textInputAutocapitalization(.never).autocorrectionDisabled().font(.footnote.monospaced()).lineLimit(1...4)
+                    TextField("oauth_token value", text: $manualToken)
+                        .textInputAutocapitalization(.never).autocorrectionDisabled().font(.footnote.monospaced()).lineLimit(4)
                     Button("Run Exchange") {
                         let token = manualToken.trimmingCharacters(in: .whitespacesAndNewlines)
                         guard !token.isEmpty else { return }

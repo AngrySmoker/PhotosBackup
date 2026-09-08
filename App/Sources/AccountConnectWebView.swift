@@ -18,7 +18,7 @@ struct AccountConnectView: View {
     @State private var didCapture = false
 
     var body: some View {
-        NavigationStack {
+        NavigationView {
             ZStack {
                 EmbeddedSetupWebView(loading: $loading) { token in
                     guard !didCapture else { return }
@@ -42,6 +42,7 @@ struct AccountConnectView: View {
                 }
             }
         }
+        .navigationViewStyle(.stack)
     }
 }
 

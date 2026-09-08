@@ -192,7 +192,7 @@ struct OnboardingView: View {
                 .padding(.bottom, 8)
                 .frame(minHeight: geometry.size.height)
             }
-            .scrollIndicators(.hidden)
+            .hiddenScrollIndicators()
         }
         .onAppear { verifyConnection() }
     }
@@ -277,7 +277,7 @@ struct OnboardingView: View {
                 .padding(24)
                 .frame(minHeight: geometry.size.height)
             }
-            .scrollIndicators(.hidden)
+            .hiddenScrollIndicators()
         }
     }
 
@@ -340,7 +340,7 @@ struct OnboardingView: View {
                 .padding(.bottom, 8)
                 .frame(minHeight: geometry.size.height)
             }
-            .scrollIndicators(.hidden)
+            .hiddenScrollIndicators()
         }
     }
 

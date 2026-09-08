@@ -66,7 +66,7 @@ struct AppMark: View {
     var body: some View {
         ZStack {
             RoundedRectangle(cornerRadius: size * 0.24, style: .continuous)
-                .fill(BackupTheme.blue.gradient)
+                .fill(LinearGradient(colors: [BackupTheme.blue, BackupTheme.blue.opacity(0.82)], startPoint: .topLeading, endPoint: .bottomTrailing))
             Image(systemName: "photo.stack.fill")
                 .font(.system(size: size * 0.43, weight: .semibold))
                 .foregroundStyle(.white)
