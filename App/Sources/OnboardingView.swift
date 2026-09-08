@@ -4,7 +4,6 @@ import UIKit
 
 struct OnboardingView: View {
     @EnvironmentObject private var account: PhotosAccount
-    @EnvironmentObject private var handoff: HandoffStore
     @EnvironmentObject private var log: ProbeLog
     @EnvironmentObject private var probe: AccountConnector
     @EnvironmentObject private var preferences: BackupPreferences
@@ -178,7 +177,7 @@ struct OnboardingView: View {
                     Spacer(minLength: 28)
                     if !connectionVerified {
                         Button(probe.running ? "Verifying…" : (connectionFailed ? "Try Again" : "Check Again")) {
-                            if connectionFailed { showingConnect = true } else { checkForHandoff() }
+                            if connectionFailed { showingConnect = true } else { verifyConnection() }
                         }
                         .buttonStyle(PrimaryButtonStyle()).disabled(probe.running)
                         if !probe.running {
@@ -195,7 +194,7 @@ struct OnboardingView: View {
             }
             .scrollIndicators(.hidden)
         }
-        .onAppear { checkForHandoff() }
+        .onAppear { verifyConnection() }
     }
 
     private var chooseFolders: some View {
@@ -412,10 +411,8 @@ struct OnboardingView: View {
         probe.log.steps.first(where: { $0.id == id })?.state
     }
 
-    private func checkForHandoff() {
-        if let pending = handoff.drainAppGroup() {
-            Task { await probe.handle(pending) { handoff.consume() } }
-        } else if account.status.isUsable {
+    private func verifyConnection() {
+        if account.status.isUsable {
             Task { await account.verify() }
         }
     }

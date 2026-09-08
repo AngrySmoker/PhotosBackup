@@ -1,8 +1,8 @@
 import Foundation
 
-/// Drives the credential half of the checklist: everything from a captured
-/// oauth_token onward. The Safari-side steps (enable, permission, cookie read,
-/// handoff) are marked by the app as evidence arrives.
+/// Drives the credential half of the flow: everything from a captured
+/// oauth_token onward. `AccountConnectView` reads the token in-app and passes
+/// it to `ingestWebToken`; this type exchanges it and wires up the account.
 @MainActor
 final class AccountConnector: ObservableObject {
     let log: ProbeLog
@@ -17,22 +17,6 @@ final class AccountConnector: ObservableObject {
 
     init(log: ProbeLog) {
         self.log = log
-    }
-
-    /// Record that a handoff arrived, then run the exchange.
-    func handle(_ handoff: Handoff, then consume: @escaping () -> Void) async {
-        log.set(ProbeLog.nativeHandoff, .passed,
-                "channel: \(handoff.channel), captured \(Self.rel(handoff.capturedAt))")
-        log.set(ProbeLog.appIngest, .passed,
-                "token length \(handoff.oauthToken.count); source cleared after read")
-        // If we got here the extension necessarily read the cookie and was
-        // permitted to; reflect that unless already explicitly failed.
-        markInferred(ProbeLog.cookieRead, "inferred from a successful handoff")
-        markInferred(ProbeLog.hostPermission, "inferred: cookies.get returned a value")
-        markInferred(ProbeLog.extensionEnabled, "inferred: extension delivered a native message")
-
-        await runExchange(oauthToken: handoff.oauthToken)
-        consume()
     }
 
     /// Capture path for the in-app WKWebView connector: the app reads the
@@ -105,12 +89,6 @@ final class AccountConnector: ObservableObject {
         } catch {
             log.set(ProbeLog.readAccess, .failed, (error as? LocalizedError)?.errorDescription
                     ?? error.localizedDescription)
-        }
-    }
-
-    private func markInferred(_ id: String, _ note: String) {
-        if log.steps.first(where: { $0.id == id })?.state != .failed {
-            log.set(id, .passed, note)
         }
     }
 

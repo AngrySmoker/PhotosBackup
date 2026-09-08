@@ -35,7 +35,6 @@ Generated `PhotosBackup.xcodeproj` is disposable — regenerate, don't hand-edit
 | `UploadQueuePersistence` | UploadQueuePersistence.swift | Durable per-account snapshot (version-checked, never reused across accounts) |
 | `AutomaticBackupCoordinator` | AutomaticBackupCoordinator.swift | BGProcessingTask scheduling; batches: 25/background window, 250/foreground |
 | `NetworkPolicy` / monitor | NetworkPolicy.swift | Wi-Fi-only vs Wi-Fi+cellular, enforced at queue + request level |
-| `HandoffStore` | HandoffStore.swift | **Vestigial** (extension retired): old App Group / `photosbackup://` handoff, pending removal |
 | `CredentialStore` | CredentialStore.swift | Single Keychain item, `AfterFirstUnlockThisDeviceOnly` |
 | `MediaExport` / `PhotosUploader` | MediaExport.swift / PhotosUploader.swift | PHAsset export → hash → duplicate-check → upload → finalize; Live Photos = still only |
 

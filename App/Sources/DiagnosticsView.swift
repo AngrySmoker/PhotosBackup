@@ -3,7 +3,6 @@ import SwiftUI
 /// The original feasibility-probe interface, preserved for engineering and support.
 struct DiagnosticsView: View {
     @EnvironmentObject private var log: ProbeLog
-    @EnvironmentObject private var handoff: HandoffStore
     @EnvironmentObject private var probe: AccountConnector
     @State private var manualToken = ""
     @State private var showAdvanced = false
@@ -13,21 +12,11 @@ struct DiagnosticsView: View {
         List {
             Section("Environment") {
                 LabeledContent("iOS", value: UIDevice.current.systemVersion)
-                LabeledContent("App Group handoff") {
-                    Text(handoff.appGroupAvailable ? "Available" : "Inert (unsigned)")
-                        .foregroundStyle(handoff.appGroupAvailable ? .green : .orange)
-                }
-                if let error = handoff.lastError { Text(error).font(.footnote).foregroundStyle(.red) }
             }
 
             Section("Connection Flow") {
                 Button { showingConnect = true } label: {
                     Label("Connect Google Account", systemImage: "person.badge.key")
-                }
-                if let pending = handoff.pending {
-                    LabeledContent("Pending token") {
-                        Text("\(String(pending.oauthToken.prefix(6)))…\(String(pending.oauthToken.suffix(4)))").monospaced()
-                    }
                 }
                 if probe.running { HStack { ProgressView(); Text("Running exchange…").foregroundStyle(.secondary) } }
             }

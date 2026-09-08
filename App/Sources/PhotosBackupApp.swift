@@ -3,7 +3,6 @@ import SwiftUI
 @main
 struct PhotosBackupApp: App {
     @StateObject private var log: ProbeLog
-    @StateObject private var handoff = HandoffStore()
     @StateObject private var connector: AccountConnector
     @StateObject private var account: PhotosAccount
     @StateObject private var queue: UploadQueue
@@ -48,29 +47,16 @@ struct PhotosBackupApp: App {
         WindowGroup {
             ContentView()
                 .environmentObject(log)
-                .environmentObject(handoff)
                 .environmentObject(connector)
                 .environmentObject(account)
                 .environmentObject(queue)
                 .environmentObject(preferences)
                 .environmentObject(albums)
                 .task { await automaticBackup.start() }
-                .onOpenURL { url in
-                    if handoff.isReturnURL(url) {
-                        if let h = handoff.drainAppGroup() {
-                            Task { await connector.handle(h) { handoff.consume() } }
-                        }
-                    } else if let h = handoff.ingest(url: url) {
-                        Task { await connector.handle(h) { handoff.consume() } }
-                    }
-                }
                 .onChange(of: scenePhase) { phase in
                     switch phase {
                     case .active:
                         automaticBackup.applicationDidBecomeActive()
-                        if let h = handoff.drainAppGroup() {
-                            Task { await connector.handle(h) { handoff.consume() } }
-                        }
                     case .background:
                         automaticBackup.applicationDidEnterBackground()
                     default:

@@ -5,9 +5,9 @@
 </p>
 
 An experimental, fully on-device iPhone app for backing up selected photos,
-videos, and albums to Google Photos. It combines a SwiftUI app with a bundled
-Safari web extension so account setup can be completed on the phone without a
-desktop companion or hosted service.
+videos, and albums to Google Photos. It is a single SwiftUI app that completes
+Google account setup in an in-app web view, so everything happens on the phone
+without a desktop companion or hosted service.
 
 > [!WARNING]
 > This project uses Google's private, undocumented Photos endpoints and an
@@ -17,8 +17,8 @@ desktop companion or hosted service.
 
 ## What it can do
 
-- Connect a Google account through Safari's EmbeddedSetup flow.
-- Capture the single-use `oauth_token` with a bundled Safari web extension.
+- Connect a Google account through Google's EmbeddedSetup flow, in an in-app web view.
+- Capture the single-use `oauth_token` in-process from the web view's cookie store.
 - Exchange the token for a Google Photos credential entirely on the device.
 - Select albums from the local Photos library.
 - Queue individual photos, videos, or all items in selected albums.
@@ -34,10 +34,10 @@ desktop companion or hosted service.
 
 ## Current status
 
-The complete authentication path has been proven on an iOS simulator: Safari
-receives the `oauth_token`, the extension captures it, the app exchanges it for
-an unbound master token and Photos credential, and an authenticated
-`photosdata-pa` request succeeds.
+The complete authentication path has been proven on an iOS 17 device and
+simulator: the in-app web view receives the `oauth_token`, the app reads it from
+the web view's own cookie store, exchanges it for an unbound master token and
+Photos credential, and an authenticated `photosdata-pa` request succeeds.
 
 The Xcode project, app target, and scheme are named `PhotosBackup`; the
 user-facing app is named **Photos Backup**.
@@ -50,9 +50,6 @@ Latest release: **0.0.2** ([releases](https://github.com/g8row/PhotosBackup/rele
 | Piece | Value |
 | --- | --- |
 | App bundle ID | `com.g8row.photosbackup` |
-| Extension bundle ID | `com.g8row.photosbackup.extension` |
-| App Group | `group.com.g8row.photosbackup` |
-| URL-scheme handoff | `photosbackup://` |
 | Background task | `com.g8row.photosbackup.background-backup` |
 
 > [!IMPORTANT]
@@ -138,39 +135,28 @@ Prebuilt unsigned IPAs are attached to each
 - AirDrop `PhotosBackup.ipa` to the iPhone and save it in Files.
 - Turn on LocalDevVPN.
 - In SideStore, tap +, choose `PhotosBackup.ipa`, and install it.
-- If asked whether to retain app extensions, keep Photos Backup Connect.
 - After updating across the 0.0.2 bundle-ID change, reconnect the Google
   account once.
-- If needed, re-enable the extension under Settings → Apps → Safari →
-  Extensions → Photos Backup Connect and allow `accounts.google.com`.
 
 ## Connect a Google account
 
 1. Install and launch Photos Backup.
-2. In Settings, enable the **Photos Backup Connect** Safari extension and allow
-   it to access `accounts.google.com`.
-3. Continue through onboarding and open Google EmbeddedSetup in Safari.
-4. Sign in and accept Google's consent prompt. The page may remain on a spinner
-   afterward; that is expected.
-5. Open the extension's toolbar menu and choose **Connect account** once.
-6. Return to Photos Backup, grant the desired Photos access, and select albums.
+2. In onboarding (or Settings → Connect Account), tap **Connect Google Account**.
+3. Sign in and accept Google's consent prompt in the in-app window. The page may
+   remain on a spinner afterward; that is expected — the app captures the token
+   and closes the window on its own.
+4. Grant the desired Photos access and select albums.
 
-The captured `oauth_token` is single-use. Triggering the handoff twice can spend
-the token before the second exchange and require another sign-in.
+The captured `oauth_token` is single-use and is read once from the web view's
+cookie store, then the web session is discarded.
 
 ## Authentication and credential handling
 
 The normal flow is:
 
 ```text
-Safari EmbeddedSetup
-        │
-        ▼
-Photos Backup Connect extension
-        │  oauth_token
-        ▼
-App Group handoff, or photosbackup:// fallback
-        │
+In-app EmbeddedSetup web view
+        │  oauth_token (read from WKHTTPCookieStore)
         ▼
 Android master token → Photos access token → private Photos API
 ```
@@ -180,11 +166,11 @@ Android master token → Photos access token → private Photos API
   `AfterFirstUnlockThisDeviceOnly` when Keychain access is available.
 - Exported Photos-library items are staged temporarily and removed after the
   queue finishes with them.
+- The `oauth_token` is read in-process from the app's own non-persistent web
+  view cookie store; it never leaves the app via an extension, App Group, or
+  custom URL scheme.
 - Bound/encrypted Google tokens are rejected because token binding is not
   implemented.
-- The URL-scheme fallback carries a live single-use token. Custom URL schemes
-  are not exclusive on iOS, so this is weaker than an App Group handoff and
-  should not be used for broad distribution without a fresh security review.
 
 ## Known limitations
 
@@ -200,8 +186,8 @@ Android master token → Photos access token → private Photos API
   requeued for the next run. A background `URLSession` could further improve
   large-file transfers by letting iOS own the byte transfer between app runs.
 - Unsigned simulator builds cannot persist the credential in the Keychain.
-  Free personal-team builds cannot provision App Groups and normally expire
-  after seven days.
+  Free personal-team builds normally expire after seven days and must be
+  refreshed.
 - Google accounts that receive a bound/encrypted master token are unsupported.
 - This is not an App Store-ready release.
 
@@ -248,8 +234,7 @@ App/Sources/AutomaticBackupCoordinator.swift  BGProcessingTask scheduling
 App/Sources/NetworkPolicy.swift               Wi-Fi-only / cellular enforcement
 App/Sources/UploadQueuePersistence.swift      Durable account-scoped queue
 App/Resources/                Info.plist and app icon assets
-Extension/Sources/            Native Safari extension handler
-Extension/WebResources/       WebExtension manifest, scripts, popup, and icons
+App/Sources/AccountConnectWebView.swift       In-app EmbeddedSetup web view
 GPMC/Core/                    Photos protocol client and protobuf helpers
 Tests/PhotosBackupTests/      Offline unit tests and gated live tests
 Scripts/make-ipa.sh           Unsigned IPA packaging

@@ -131,7 +131,8 @@ round-tripped fine, confirming the filter is specifically on HttpOnly.
   with them the URL-scheme token-exposure risk (Distribution risk #2 above).
 - New: `AccountConnectView` (`App/Sources/AccountConnectWebView.swift`). The
   connect step in onboarding, the Settings sheet, and Diagnostics all present it.
-- Now **vestigial**, pending removal: `Extension/` (target dropped from
-  `project.yml`), `HandoffStore`, the `photosbackup` URL type in `Info.plist`,
-  and the App Group entitlement. Left in place this pass to keep the change
-  self-contained; none is on the live path.
+- **Removed** (follow-up commit): `Extension/`, `HandoffStore`, the
+  `AccountConnector.handle(_:)` handoff path, the `photosbackup` URL type in
+  `Info.plist`, and the App Group entitlement (`CODE_SIGN_ENTITLEMENTS` dropped
+  from `project.yml`). The app no longer declares any App Group or custom URL
+  scheme.
