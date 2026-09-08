@@ -7,21 +7,23 @@ manual credential import.
 The probe is a small app + Safari web extension that runs the checklist from
 the handoff plan's Step 2 and reports each step pass/fail on screen.
 
-**Current bottom line (2026-09-08, after attempt 3):** the route is confirmed
-end to end through the credential exchange. The step-3 blocker was **not**
-permissions and **not** code signing — iOS Safari exposes more than one cookie
-store, and a `cookies.get()` / `getAll()` that omits `storeId` searches only the
-default store, which is not the one the browsing tabs use. With that fixed,
-steps 1-8 all pass on an **unsigned simulator build**: EmbeddedSetup issues an
-`oauth_token` to mobile Safari, the extension reads it, the app ingests it, and
-it exchanges cleanly into an Android master token and a Photos access token.
-**No `TokenEncrypted=1`** — token binding does not have to be ported.
+**Current bottom line (2026-09-08, after attempt 5): the route works.** All nine
+checklist steps pass on an **unsigned simulator build**. Google's EmbeddedSetup
+page issues an `oauth_token` to mobile Safari, the bundled extension reads it,
+hands it to the app, and the app exchanges it into an Android master token, then
+a Photos access token, then makes a successful authenticated call to
+`photosdata-pa`. ADR-001's open question is answered yes, and **no
+`TokenEncrypted=1`** appeared, so token binding does not need porting.
 
-Step 9 (the read-only Photos call) returned HTTP 400 on its first live run. That
-was a bug in this port, now fixed: the `x-goog-ext-*-bin` headers were being
-sent on every photosdata-pa RPC, but upstream sends them only on commit and
-album calls — never on the hash lookup. It needs one more fresh token to confirm
-green.
+Two blockers found along the way were both ours, not Google's: the extension was
+querying the wrong cookie store, and every protobuf RPC was posting an empty
+body. Neither had anything to do with code signing.
+
+**What still needs a real Apple Developer team** (a free personal one should do):
+the App Group handoff channel and the Keychain. On an unsigned build the
+credential cannot be persisted at all, so a connected account is session-only.
+That is now reported as a warning rather than a rejection — the credential is
+good, it just cannot be written down.
 
 ## Build & run
 
@@ -74,7 +76,7 @@ TEST_RUNNER_GPMC_LIVE=1 TEST_RUNNER_GPMC_OAUTH_TOKEN=oauth_XXXX xcodebuild ... t
 | 6 | App ingests the token, single use | **PASS** | Live: `token length 80; source cleared after read`. |
 | 7 | Exchange `oauth_token` → master token | **PASS** | Live, on a fresh token: master token issued for `alexguroov@gmail.com`, androidId `636428d840be3e65`. |
 | 8 | Exchange master token → Photos access token | **PASS** | Access token issued, expires in 16 hr. **No `TokenEncrypted=1`** — this account's credential is unbound, so token binding does not need porting for it. |
-| 9 | Read-only Photos request succeeds | **FIXED, AWAITING RETEST** | Two live runs returned HTTP 400. Real cause: `request()` stopped assigning `httpBody`, so every protobuf RPC posted an empty body. Fixed, with a regression test that reads the outgoing body. Needs one fresh token to confirm green. |
+| 9 | Read-only Photos request succeeds | **PASS** | Green once the empty-body bug was fixed. `GPMCClient.validateReadAccess()` — dummy hash lookup accepted by photosdata-pa. |
 
 ## Test log
 
@@ -228,24 +230,41 @@ Two diagnostics added so the next wire-format bug is not another guessing round:
   `oauth_token` is single-use, so iterating no longer costs an interactive
   sign-in each time.
 
-## Manual test script (next run — confirm step 9)
+### 2026-09-08 — attempt 5 (all nine green)
 
-Steps 1-8 are settled. Only step 9 is open.
+With the body restored, **step 9 passes**: `dummy hash lookup accepted by
+photosdata-pa`. The full checklist is green on an unsigned build.
 
-Because the app now keeps the exchange result in memory, this no longer needs a
-sign-in **if the app has not been relaunched since the last exchange**: just tap
-**Re-run read-only check**.
+Follow-up found in the same run: the Uploads page showed the account in orange
+with "The Keychain refused the credential". Two separate problems behind it,
+both fixed:
 
-Otherwise, one fresh token:
+1. **A failed write was being reported as a rejected credential.** They are not
+   the same thing — an unsigned build has no keychain-access-group, and that
+   says nothing about whether Google will honour the token (step 9 had just
+   proved it will). `CredentialStore.save` now throws `Unpersisted`, which
+   carries the credential, and `PhotosAccount` adopts it and raises a
+   `persistenceWarning` instead of refusing. The account is usable for the
+   session. A bound token is still a hard refusal.
+2. **A failed *read* at launch reported a rejected account before one existed.**
+   With nothing connected, an unreadable store just means nothing to restore, so
+   `restore()` now lands on `.disconnected` with the same warning.
+
+## Manual test script (re-running the whole flow)
 
 1. Rebuild + reinstall (commands above), launch `GPMCAuthProbe`.
 2. **Open Google EmbeddedSetup in Safari** → sign in → **I agree**. The page
    then hangs on a spinner; expected.
 3. **GPMC Connect** popup → **Connect account**, **once**. Accept the
-   `gpmcprobe://` dialog once; **cancel** any second one.
-4. Step 9 should be green. If it is not, the failure text now carries Google's
-   own explanation — capture that line verbatim before changing anything, and
-   use **Re-run read-only check** to iterate without burning another sign-in.
+   `gpmcprobe://` dialog once; **cancel** any second one — `oauth_token` is
+   single-use, and a second ingest re-runs the exchange on a spent token.
+4. All nine steps should go green. **Re-run read-only check** repeats step 9
+   against the in-memory credential without another sign-in.
+5. On an unsigned build the Uploads page will show "Not saved to the Keychain".
+   That is expected and does not block uploading during the session.
+
+Failures now quote Google's own response body, so capture that line verbatim
+before changing anything.
 
 ## If the route is confirmed dead
 

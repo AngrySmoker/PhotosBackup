@@ -50,6 +50,19 @@ struct UploadsView: View {
                 Text(reason).font(.footnote).foregroundStyle(.secondary)
                 Button("Disconnect", role: .destructive) { Task { await account.disconnect() } }
             }
+            if let warning = account.persistenceWarning {
+                // Same underlying cause, two different situations: an account
+                // already connected this session, or no account at all.
+                let connected = account.status.isUsable
+                Label(connected ? "Not saved to the Keychain" : "Keychain unavailable",
+                      systemImage: "exclamationmark.triangle")
+                    .foregroundStyle(.orange)
+                Text(warning + (connected
+                        ? " The account works for this session but will be gone after a relaunch."
+                        : " Credentials cannot be stored on this build, so a connected account will not survive a relaunch.")
+                     + " A signed build with a real team fixes it.")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
             if let halt = queue.haltReason {
                 Text(halt).font(.footnote).foregroundStyle(.red)
                 Button("Resume the queue") { queue.resume() }

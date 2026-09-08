@@ -40,22 +40,23 @@ request? The `GPMCAuthProbe` target exists to answer exactly this. If the
 answer is no, the fallback is a one-time manual `oauth_token` / `auth_data`
 import under advanced setup (already sketched in `GPMCClient.AuthData`).
 
-**Status 2026-09-08 (attempt 2):** the open question is **answered: yes.**
-Google's EmbeddedSetup page issues an `oauth_token` cookie to mobile Safari (80
-chars, `accounts.google.com`, `httpOnly`, session), the extension reads it, and
-the app ingests it — all on an **unsigned simulator build**. The consent screen
-renders on a mobile UA; no desktop-UA override is needed.
+**Status 2026-09-08 (attempt 5): answered yes; the decision stands.** All nine
+checklist steps pass on an **unsigned simulator build** — EmbeddedSetup issues an
+`oauth_token` to mobile Safari, the extension reads it (`httpOnly`, so only the
+`cookies` API could), the app ingests it single-use, and it exchanges into a
+master token, a Photos access token, and a successful `photosdata-pa` call. The
+consent screen renders on a mobile UA; no desktop-UA override is needed. **No
+`TokenEncrypted=1`**, so token binding does not need porting.
 
 Attempt 1's conclusion that "a real Apple Developer team is probably needed even
-to evaluate this route" was **wrong**, and is retracted. The zero-cookies
-symptom was cookie-store partitioning, not entitlement: iOS Safari exposes
-several cookie stores and a query omitting `storeId` searches the wrong one. A
-team is still needed for the App Group handoff and to ship, but not to evaluate.
+to evaluate this route" was **wrong**, and is retracted. Both blockers were bugs
+in this port: the extension queried only the default cookie store (iOS Safari
+partitions them), and a refactor had dropped the request body so every protobuf
+RPC posted zero bytes. Neither was an entitlement problem.
 
-Remaining unknown: the `oauth_token` → master token exchange (checklist step 7)
-has not had a clean run — the token was consumed twice in one session, so the
-only live attempt saw a spent token. See `feasibility-probe.md` → Test log,
-attempt 2.
+A team is still required to **ship**: the App Group handoff and the Keychain both
+need one. Without it the credential cannot be persisted, so a connected account
+is session-only — surfaced as a warning, not a rejection.
 
 ## Consequences
 

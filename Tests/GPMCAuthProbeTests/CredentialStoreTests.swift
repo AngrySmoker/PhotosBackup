@@ -3,6 +3,41 @@ import XCTest
 
 final class CredentialStoreTests: XCTestCase {
 
+    /// An unsigned build has no keychain-access-group, so the Keychain refuses
+    /// every write. That is an environment limit, not a bad credential -- the
+    /// account has to stay usable for the session instead of reading as
+    /// rejected. Observed live on 2026-09-08 as a yellow Uploads page.
+    func testAWriteFailureStillYieldsAUsableCredential() async throws {
+        struct RefusingStore: SecretStore {
+            func read() throws -> Data? { nil }
+            func write(_ data: Data) throws { throw CredentialStore.Failure.keychain(errSecMissingEntitlement) }
+            func delete() throws {}
+        }
+        let store = CredentialStore(secrets: RefusingStore())
+        do {
+            _ = try await store.save(result())
+            XCTFail("expected the write to fail")
+        } catch let unpersisted as CredentialStore.Unpersisted {
+            XCTAssertEqual(unpersisted.credential.email, "person@gmail.com")
+            XCTAssertFalse(unpersisted.credential.authData.isEmpty)
+            XCTAssertFalse(unpersisted.reason.isEmpty)
+        }
+    }
+
+    /// A bound token is the opposite case: refused outright, never persisted.
+    func testABoundTokenIsRefusedRatherThanReportedAsUnpersisted() async {
+        let store = CredentialStore(secrets: MemorySecretStore())
+        do {
+            _ = try await store.save(result(encrypted: true))
+            XCTFail("expected a bound token to be refused")
+        } catch let failure as CredentialStore.Failure {
+            XCTAssertEqual(failure, .bound)
+        } catch {
+            XCTFail("wrong error: \(error)")
+        }
+    }
+
+
     private func result(encrypted: Bool = false, email: String = "person@gmail.com") -> TokenExchange.Result {
         let authData = TokenExchange.googlePhotosCredentialBody(
             androidId: "0123456789abcdef", email: email, masterToken: "aas_et/master")

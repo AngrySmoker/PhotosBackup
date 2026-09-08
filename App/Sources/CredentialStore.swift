@@ -94,6 +94,13 @@ actor CredentialStore {
         }
     }
 
+    /// A credential that is good but could not be written down. Carries the
+    /// credential so the caller can still connect with it for this session.
+    struct Unpersisted: Error {
+        let credential: StoredCredential
+        let reason: String
+    }
+
     private let secrets: SecretStore
     private var cached: StoredCredential?
 
@@ -122,7 +129,17 @@ actor CredentialStore {
         let credential = StoredCredential(androidId: result.androidId, email: result.email,
                                           masterToken: result.masterToken, authData: result.authData,
                                           connectedAt: Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded(.down)))
-        try secrets.write(try JSONEncoder.gpmc.encode(credential))
+        do {
+            try secrets.write(try JSONEncoder.gpmc.encode(credential))
+        } catch {
+            // The Keychain being unavailable says nothing about whether Google
+            // will honour the token, so hand the credential back rather than
+            // throwing it away. It is usable now; it just will not survive a
+            // relaunch. (Unsigned builds have no keychain-access-group.)
+            cached = credential
+            throw Unpersisted(credential: credential,
+                              reason: (error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+        }
         cached = credential
         return credential
     }

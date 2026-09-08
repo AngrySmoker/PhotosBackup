@@ -27,6 +27,9 @@ final class PhotosAccount: ObservableObject {
 
     @Published private(set) var status: Status = .loading
     @Published private(set) var verifying = false
+    /// Set when the credential works but could not be stored. Not a rejection:
+    /// the account is usable until the app is relaunched.
+    @Published private(set) var persistenceWarning: String?
 
     private let store: CredentialStore
     private var credential: StoredCredential?
@@ -41,8 +44,11 @@ final class PhotosAccount: ObservableObject {
             guard let credential = try await store.load() else { status = .disconnected; return }
             adopt(credential)
         } catch {
+            // Nothing has been connected yet, so an unreadable store is not a
+            // rejected account — it just means there is nothing to restore.
             credential = nil; client = nil
-            status = .rejected(email: "", reason: Self.describe(error))
+            persistenceWarning = Self.describe(error)
+            status = .disconnected
         }
     }
 
@@ -50,6 +56,10 @@ final class PhotosAccount: ObservableObject {
     func connect(_ result: TokenExchange.Result) async {
         do {
             adopt(try await store.save(result))
+            persistenceWarning = nil
+        } catch let unpersisted as CredentialStore.Unpersisted {
+            adopt(unpersisted.credential)
+            persistenceWarning = unpersisted.reason
         } catch {
             status = .rejected(email: result.email, reason: Self.describe(error))
         }
@@ -58,6 +68,7 @@ final class PhotosAccount: ObservableObject {
     func disconnect() async {
         await store.clear()
         credential = nil; client = nil
+        persistenceWarning = nil
         status = .disconnected
     }
 
