@@ -142,7 +142,7 @@ actor GPMCClient {
         try await authenticate()
         let dummyHash = Data(repeating: 0, count: 20)
         let check = Proto.bytes(1, Proto.bytes(1, Proto.bytes(1, dummyHash)) + Proto.bytes(2, Data()))
-        _ = try await rpc("5084965799730810217", body: check)
+        _ = try await rpc(Self.hashCheckMethod, body: check)
     }
     private func request(_ url: URL, method: String = "POST", body: Data? = nil, file: URL? = nil, headers: [String: String] = [:], delegate: URLSessionTaskDelegate? = nil, allowReauth: Bool = true) async throws -> (Data, HTTPURLResponse) {
         if expiry <= Date().addingTimeInterval(30) { try await authenticate() }
@@ -163,8 +163,20 @@ actor GPMCClient {
         }
         return try checked(result.0, result.1)
     }
-    private func rpc(_ method: String, body: Data) async throws -> Data {
-        try await request(URL(string: "https://photosdata-pa.googleapis.com/6439526531001121323/" + method)!, body: body, headers: ["x-goog-ext-173412678-bin": "CgcIAhClARgC", "x-goog-ext-174067345-bin": "CgIIAg=="]).0
+    // photosdata-pa method ids (gotohp @ 0637c745, backend/api.go).
+    private static let hashCheckMethod = "5084965799730810217"
+    private static let commitMethod = "16538846908252377752"
+    /// Only some photosdata-pa calls carry these. `doCommitRequest`,
+    /// `CreateAlbum` and `AddMediaToAlbum` set them upstream;
+    /// `FindRemoteMediaByHash` deliberately does not, and sending them on the
+    /// hash lookup gets the request rejected with HTTP 400.
+    private static let extHeaders = [
+        "x-goog-ext-173412678-bin": "CgcIAhClARgC",
+        "x-goog-ext-174067345-bin": "CgIIAg==",
+    ]
+    private func rpc(_ method: String, body: Data, ext: Bool = false) async throws -> Data {
+        try await request(URL(string: "https://photosdata-pa.googleapis.com/6439526531001121323/" + method)!,
+                          body: body, headers: ext ? Self.extHeaders : [:]).0
     }
 
     /// SHA-1 the file, ask whether Google already holds it, and otherwise
@@ -184,7 +196,7 @@ actor GPMCClient {
         let hash = Data(hasher.finalize())
         phase(.checkingDuplicate)
         let check = Proto.bytes(1, Proto.bytes(1, Proto.bytes(1, hash)) + Proto.bytes(2, Data()))
-        let existing = try await rpc("5084965799730810217", body: check)
+        let existing = try await rpc(Self.hashCheckMethod, body: check)
         if let key = try Proto.string(at: [1, 2, 2, 1], in: existing) { return .alreadyBackedUp(mediaKey: key) }
         phase(.preparing)
         let endpoint = URL(string: "https://photos.googleapis.com/data/upload/uploadmedia/interactive")!
@@ -203,7 +215,7 @@ actor GPMCClient {
         let stamp = UInt64(max(0, date.timeIntervalSince1970))
         let metadata = Proto.bytes(1, receipt) + Proto.string(2, filename) + Proto.bytes(3, hash) + Proto.bytes(4, Proto.int(1, stamp) + Proto.int(2, 46_000_000)) + Proto.int(7, saver ? 1 : 3) + Proto.int(10, 1)
         let device = Proto.string(3, useQuota ? "Pixel 8" : (saver ? "Pixel 2" : "Pixel XL")) + Proto.string(4, "Google") + Proto.int(5, 28)
-        let committed = try await rpc("16538846908252377752", body: Proto.bytes(1, metadata) + Proto.bytes(2, device) + Proto.bytes(3, Data([1, 3])))
+        let committed = try await rpc(Self.commitMethod, body: Proto.bytes(1, metadata) + Proto.bytes(2, device) + Proto.bytes(3, Data([1, 3])), ext: true)
         guard let key = try Proto.string(at: [1, 3, 1], in: committed) else { throw GPMCError(message: "Google rejected the upload during finalization.") }
         return .uploaded(mediaKey: key)
     }

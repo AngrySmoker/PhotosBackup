@@ -7,21 +7,21 @@ manual credential import.
 The probe is a small app + Safari web extension that runs the checklist from
 the handoff plan's Step 2 and reports each step pass/fail on screen.
 
-**Current bottom line (2026-09-08, after attempt 2):** the route works as far as
-we can currently test it. The step-3 blocker was **not** permissions and **not**
-code signing — iOS Safari exposes more than one cookie store, and a
-`cookies.get()` / `getAll()` that omits `storeId` searches only the default
-store, which is not the one the browsing tabs use. Sweeping every store from
-`cookies.getAllCookieStores()` fixed it. With that fix, **Google's EmbeddedSetup
-page does issue an `oauth_token` cookie to mobile Safari** (80 chars, domain
-`accounts.google.com`, `httpOnly`, session) and the extension reads it, hands it
-to the app, and the app ingests it single-use. Steps 1-6 pass on an **unsigned
-simulator build**.
+**Current bottom line (2026-09-08, after attempt 3):** the route is confirmed
+end to end through the credential exchange. The step-3 blocker was **not**
+permissions and **not** code signing — iOS Safari exposes more than one cookie
+store, and a `cookies.get()` / `getAll()` that omits `storeId` searches only the
+default store, which is not the one the browsing tabs use. With that fixed,
+steps 1-8 all pass on an **unsigned simulator build**: EmbeddedSetup issues an
+`oauth_token` to mobile Safari, the extension reads it, the app ingests it, and
+it exchanges cleanly into an Android master token and a Photos access token.
+**No `TokenEncrypted=1`** — token binding does not have to be ported.
 
-Step 7 (the exchange) is **not yet cleanly measured**: the token was consumed
-twice by two operators driving the simulator at once, so the run that reached
-Google saw an already-spent token and returned `BadAuthentication`. This says
-nothing about the exchange itself — it needs one clean run on a fresh token.
+Step 9 (the read-only Photos call) returned HTTP 400 on its first live run. That
+was a bug in this port, now fixed: the `x-goog-ext-*-bin` headers were being
+sent on every photosdata-pa RPC, but upstream sends them only on commit and
+album calls — never on the hash lookup. It needs one more fresh token to confirm
+green.
 
 ## Build & run
 
@@ -72,9 +72,9 @@ TEST_RUNNER_GPMC_LIVE=1 TEST_RUNNER_GPMC_OAUTH_TOKEN=oauth_XXXX xcodebuild ... t
 | 4 | Extension reads the `oauth_token` cookie | **PASS** | `Found oauth_token` — length 80, domain `accounts.google.com`, `httpOnly: true`, `session: true`. `httpOnly` matters: no content script could have read it, only the `cookies` API. Screenshot `07-oauth-token-found-live.png`. |
 | 5 | Cookie handed to native code | **PASS** (via URL channel) | Delivered over the `gpmcprobe://` fallback (`channel: url, captured 12 sec ago`). The App Group path remains inert on an unsigned build, as designed. |
 | 6 | App ingests the token, single use | **PASS** | Live: `token length 80; source cleared after read`. |
-| 7 | Exchange `oauth_token` → master token | **INCONCLUSIVE** | Request/body match gotohp (`TokenExchangeTests`, 7/7). Live run returned `BadAuthentication` on an **already-spent** token (consumed twice — see Test log attempt 2), so the happy path is still unmeasured. Needs one clean run on a fresh token. |
-| 8 | Exchange master token → Photos access token | **NOT RUN** | Needs a real master token. `TokenEncrypted=1` is detected and rejected (not mishandled). |
-| 9 | Read-only Photos request succeeds | **NOT RUN** | `GPMCClient.validateReadAccess()` — dummy hash lookup, mirrors gotohp's `FindRemoteMediaByHash`. |
+| 7 | Exchange `oauth_token` → master token | **PASS** | Live, on a fresh token: master token issued for `alexguroov@gmail.com`, androidId `636428d840be3e65`. |
+| 8 | Exchange master token → Photos access token | **PASS** | Access token issued, expires in 16 hr. **No `TokenEncrypted=1`** — this account's credential is unbound, so token binding does not need porting for it. |
+| 9 | Read-only Photos request succeeds | **FIXED, AWAITING RETEST** | First live run returned HTTP 400 — the port sent the `x-goog-ext-*-bin` headers on the hash lookup, which upstream sends only on commit/album calls. Fixed and covered by a regression test; needs one more fresh token to confirm green. |
 
 ## Test log
 
@@ -162,33 +162,52 @@ probably needed even to evaluate this route" is **refuted**. Cookie access,
 capture, handoff and ingest all work unsigned. A team is still required for the
 App Group handoff channel (shipping), but not for evaluation.
 
-## Manual test script (next run — one clean shot at step 7)
+### 2026-09-08 — attempt 3 (fresh token, single clean run)
 
-Steps 1-6 are settled. The only thing left to measure is the exchange, and it
-must be done on a **fresh** `oauth_token` with **exactly one** Connect account
-tap. Do not run two operators against the simulator at once.
+- Steps 1-6 green again, unchanged.
+- **Step 7 PASS.** Master token issued; `account: alexguroov@gmail.com ·
+  androidId: 636428d840be3e65`.
+- **Step 8 PASS.** `access token issued, expires in 16 hr`. Critically, **no
+  `TokenEncrypted=1`** — the credential is unbound, so `tokenbinding.go` does
+  not need porting for this account.
+- **Step 9 FAIL — HTTP 400**, and the cause was ours, not Google's.
 
-1. Launch `GPMCAuthProbe`. Confirm the extension is enabled and has All Websites
-   access (a reinstall wipes the grant).
+**Root cause of the 400.** `GPMCClient.rpc()` attached
+`x-goog-ext-173412678-bin` and `x-goog-ext-174067345-bin` to *every*
+photosdata-pa call. Upstream does not: in gotohp @ 0637c745 `backend/api.go`,
+those headers are set by `doCommitRequest`, `CreateAlbum` and `AddMediaToAlbum`,
+but **not** by `FindRemoteMediaByHash`. Sending them on the hash lookup gets it
+rejected with 400. A 400 (rather than 401/403) was the tell: the credential was
+fine — step 8 had just succeeded — so the request itself was malformed.
+
+This was **not** a probe-only bug. `validateReadAccess()` and the duplicate
+check inside `upload()` build the identical message and went through the same
+`rpc()` helper, so every upload's dedupe step would have failed the same way.
+
+**Fix:** the extension headers are now opt-in per RPC (`rpc(_:body:ext:)`),
+set only on the commit call. Covered by
+`GPMCClientTests.testHashLookupOmitsTheExtensionHeadersThatCommitSends`, which
+was confirmed to fail against the old behaviour before being kept.
+
+**Still to confirm:** step 9 green on a fresh token.
+
+## Manual test script (next run — confirm step 9)
+
+Steps 1-8 are settled. Only step 9 is open, and the fix for it is untested
+against the live endpoint.
+
+1. Rebuild + reinstall (commands above), launch `GPMCAuthProbe`.
 2. Tap **Open Google EmbeddedSetup in Safari**. EmbeddedSetup always starts a
    full add-account sign-in — an existing Safari session is not reused, so the
    account password is required here.
-3. Sign in and tap **I agree**. The page then hangs on a spinner; that is
-   expected and means the cookie has been written.
-4. Open the **GPMC Connect** popup → **Check for token** → expect
-   `Found oauth_token`.
-5. Tap **Connect account** **once**. Accept the `gpmcprobe://` dialog once.
-   If a second dialog appears, **cancel it** — accepting it re-ingests a spent
-   token and will paint step 7 red for no reason.
-6. Return to the app. Steps 7-9 run automatically. Screenshot the checklist.
-7. Report: the step 7 result, and if green, whether step 8 reported
-   `TokenEncrypted=1` — that decides whether token binding must be ported
-   before shipping.
-
-If step 7 fails again on a demonstrably fresh single-use token, the likely
-suspects are the `droidguard_results: "dummy123"` placeholder in
-`TokenExchange.oauthExchangeBody` and the `Email` placeholder, both inherited
-from gotohp.
+3. Sign in and tap **I agree**. The page then hangs on a spinner; expected.
+4. **GPMC Connect** popup → **Connect account**, **once**. Accept the
+   `gpmcprobe://` dialog once; **cancel** any second one — accepting it
+   re-ingests a spent token and paints step 7 red for no reason.
+5. Return to the app. Step 9 should now be green. If it is still 400, capture
+   the response body before changing anything: the remaining suspects are the
+   `Accept-Encoding: gzip` header (upstream sets it explicitly; URLSession
+   manages its own) and the all-zero dummy hash.
 
 ## If the route is confirmed dead
 

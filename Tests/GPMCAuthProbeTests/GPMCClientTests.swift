@@ -42,6 +42,27 @@ final class GPMCClientTests: XCTestCase {
 
     // MARK: - Error kinds
 
+    /// The photosdata-pa RPCs are not uniform. gotohp @ 0637c745 sets the two
+    /// x-goog-ext headers on commit / CreateAlbum / AddMediaToAlbum but not on
+    /// FindRemoteMediaByHash, and Google answers the hash lookup with HTTP 400
+    /// when they are present. Observed live on 2026-09-08 as a red step 9.
+    func testHashLookupOmitsTheExtensionHeadersThatCommitSends() async throws {
+        StubProtocol.handler = { request in
+            if request.url?.host == "android.googleapis.com" {
+                return .text("Auth=ya29.token\nExpiry=\(Self.farFuture)\n")
+            }
+            return .ok(Data())
+        }
+        let client = try GPMCClient(authData: Self.credential, session: StubProtocol.session())
+        _ = try? await client.validateReadAccess()
+
+        let lookup = StubProtocol.seen.first { $0.url?.absoluteString.hasSuffix("5084965799730810217") == true }
+        let request = try XCTUnwrap(lookup, "the hash lookup was never sent")
+        XCTAssertNil(request.value(forHTTPHeaderField: "x-goog-ext-173412678-bin"))
+        XCTAssertNil(request.value(forHTTPHeaderField: "x-goog-ext-174067345-bin"))
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/x-protobuf")
+    }
+
     func testRetryClassification() {
         XCTAssertTrue(GPMCError(kind: .transport, message: "x").isRetryable)
         XCTAssertTrue(GPMCError(kind: .server(503), message: "x").isRetryable)
