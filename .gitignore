@@ -24,3 +24,6 @@ acc.txt
 
 # Agent worktrees
 .claude/worktrees/
+
+# Per-worktree derived data (agents build in parallel).
+.dd/
