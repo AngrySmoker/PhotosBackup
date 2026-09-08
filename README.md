@@ -45,7 +45,7 @@ Photos credential, and an authenticated `photosdata-pa` request succeeds.
 The Xcode project, app target, and scheme are named `PhotosBackup`; the
 user-facing app is named **Photos Backup**.
 
-Latest release: **0.2.2** ([releases](https://github.com/g8row/PhotosBackup/releases)).
+Latest release: **0.2.3** ([releases](https://github.com/g8row/PhotosBackup/releases)).
 85 tests run on iPhone 16 Pro simulator: 82 pass, with 2 opt-in live tests
 and 1 simulator Keychain test skipped.
 
