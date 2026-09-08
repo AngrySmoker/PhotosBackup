@@ -37,6 +37,10 @@ final class AutomaticBackupCoordinator: ObservableObject {
 #if DEBUG
     @Published private(set) var debugSimulationStatus = "Ready"
     static let lldbSimulationCommand = "e -l objc -- (void)[[BGTaskScheduler sharedScheduler] _simulateLaunchForTaskWithIdentifier:@\"\(taskIdentifier)\"]"
+    /// The run's OSLog output goes to the system log, not to this screen. On a
+    /// simulator this streams it; on a device use Console.app and filter by the
+    /// same subsystem.
+    static let logStreamCommand = "xcrun simctl spawn booted log stream --level debug --predicate 'subsystem == \"com.g8row.photosbackup\"'"
 #endif
 
     init(photos: PhotosStack,
@@ -148,12 +152,18 @@ final class AutomaticBackupCoordinator: ObservableObject {
         }
     }
 
-    private var shouldSchedule: Bool {
-        preferences.completedOnboarding
-            && preferences.automaticBackup
-            && !preferences.selectedAlbumIDs.isEmpty
-            && account.status.isUsable
+    /// Why automatic backup cannot run, in the user's terms, or nil when it can.
+    /// One source of truth so a refused run can say which condition stopped it
+    /// instead of reporting a bare failure.
+    var scheduleBlocker: String? {
+        if !preferences.completedOnboarding { return "Onboarding is not finished" }
+        if !preferences.automaticBackup { return "Automatic Backup is turned off" }
+        if preferences.selectedAlbumIDs.isEmpty { return "No albums are selected" }
+        if !account.status.isUsable { return "No Google account is connected" }
+        return nil
     }
+
+    private var shouldSchedule: Bool { scheduleBlocker == nil }
 
     private func runForegroundBackupIfNeeded() {
         guard isForeground,
@@ -282,10 +292,10 @@ final class AutomaticBackupCoordinator: ObservableObject {
                 task?.setTaskCompleted(success: false)
                 return
             }
-            let success = await self.performBackgroundBackup()
+            let report = await self.performBackgroundBackup()
             task?.expirationHandler = nil
-            task?.setTaskCompleted(success: success)
-            Self.logger.info("Background-processing window finished; success=\(success)")
+            task?.setTaskCompleted(success: report.success)
+            Self.logger.info("Background-processing window finished; success=\(report.success)")
             self.backgroundOperation = nil
         }
         backgroundOperation = operation
@@ -299,20 +309,36 @@ final class AutomaticBackupCoordinator: ObservableObject {
         window.adopt(expire)
     }
 
-    private func performBackgroundBackup() async -> Bool {
+    /// The outcome of one window, with the reason attached. `success` is what
+    /// iOS is told; `summary` is what a human reads in Diagnostics and the log.
+    struct BackgroundRunReport {
+        let success: Bool
+        let summary: String
+    }
+
+    private func performBackgroundBackup() async -> BackgroundRunReport {
         await photos.start()
         _ = await network.waitForInitialStatus()
         applyNetworkPolicy()
 
         // A user pause is durable and must not be bypassed by a scheduled run.
-        guard !queue.isUserPaused else { return true }
+        guard !queue.isUserPaused else {
+            return finish(.init(success: true, summary: "Paused by you — no work started"))
+        }
 
-        guard shouldSchedule,
-              account.status.isUsable,
-              preferences.connection.decision(for: network.status).allowsUploads else { return false }
+        if let blocker = scheduleBlocker {
+            return finish(.init(success: false, summary: blocker))
+        }
+        let decision = preferences.connection.decision(for: network.status)
+        guard decision.allowsUploads else {
+            return finish(.init(success: false,
+                                summary: decision.pauseReason ?? "The connection policy does not allow uploads"))
+        }
 
         await albums.refresh()
-        guard albums.canRead else { return false }
+        guard albums.canRead else {
+            return finish(.init(success: false, summary: "No photo library access"))
+        }
         let failuresBefore = queue.failedCount
         let scan = libraryChanges.scan(albums: albums,
                                        selectedAlbumIDs: preferences.selectedAlbumIDs,
@@ -330,16 +356,40 @@ final class AutomaticBackupCoordinator: ObservableObject {
         // durably handed to the queue — accepted now, or already tracked. Only
         // a batch the limit cut short leaves sources unexamined.
         if !outcome.reachedLimit, queue.persistenceWarning == nil { libraryChanges.commit(scan) }
+
+        let backedUpBefore = queue.completedSourceCount
         let settled = await queue.waitUntilSettled()
+        let uploaded = max(0, queue.completedSourceCount - backedUpBefore)
+        let failed = queue.failedCount - failuresBefore
+        var parts = ["enqueued \(outcome.accepted.count)", "backed up \(uploaded)"]
+        if failed > 0 { parts.append("\(failed) failed") }
+        if queue.deferredForICloudCount > 0 {
+            parts.append("\(queue.deferredForICloudCount) waiting on iCloud")
+        }
+        if outcome.reachedLimit { parts.append("more to scan next window") }
+
+        if let halt = queue.haltReason {
+            return finish(.init(success: false, summary: "Stopped: \(halt)"))
+        }
         if !settled {
             // Expiration or a policy pause cancels the wait, but the work
             // remains durably queued for the next window. Report success
             // unless the credential halted or new failures appeared,
             // otherwise iOS backs off a window that did everything it could.
-            if queue.haltReason == nil && queue.failedCount == failuresBefore { return true }
-            return false
+            let reason = queue.pauseReason ?? "ran out of time"
+            parts.append("deferred — \(reason)")
+            return finish(.init(success: failed == 0, summary: parts.joined(separator: " · ")))
         }
-        return queue.failedCount == failuresBefore
+        return finish(.init(success: failed == 0, summary: parts.joined(separator: " · ")))
+    }
+
+    private func finish(_ report: BackgroundRunReport) -> BackgroundRunReport {
+        if report.success {
+            Self.logger.info("Automatic backup run: \(report.summary, privacy: .public)")
+        } else {
+            Self.logger.notice("Automatic backup run did not complete: \(report.summary, privacy: .public)")
+        }
+        return report
     }
 
     /// Called from the background URL-session delegate before iOS receives its
@@ -374,8 +424,8 @@ final class AutomaticBackupCoordinator: ObservableObject {
         queue.setICloudDownloadsAllowed(false)
         backgroundOperation = Task { @MainActor [weak self] in
             guard let self else { return }
-            let success = await self.performBackgroundBackup()
-            self.debugSimulationStatus = success ? "Finished successfully" : "Finished with deferred or failed work"
+            let report = await self.performBackgroundBackup()
+            self.debugSimulationStatus = report.summary
             if self.isForeground { self.queue.setICloudDownloadsAllowed(true) }
             self.backgroundOperation = nil
         }

@@ -19,6 +19,18 @@ struct DiagnosticsView: View {
 
 #if DEBUG
             Section {
+                // Say up front why a run would refuse, rather than making the
+                // user press the button to find out.
+                if let blocker = automaticBackup.scheduleBlocker {
+                    Label(blocker, systemImage: "exclamationmark.triangle.fill")
+                        .font(.footnote)
+                        .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    Label("Ready to run", systemImage: "checkmark.circle.fill")
+                        .font(.footnote)
+                        .foregroundStyle(.green)
+                }
                 Button {
                     automaticBackup.simulateRun()
                 } label: {
@@ -27,8 +39,12 @@ struct DiagnosticsView: View {
                 Text(automaticBackup.debugSimulationStatus)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
                 Button("Copy LLDB Launch Command") {
                     UIPasteboard.general.string = AutomaticBackupCoordinator.lldbSimulationCommand
+                }
+                Button("Copy Log Stream Command") {
+                    UIPasteboard.general.string = AutomaticBackupCoordinator.logStreamCommand
                 }
             } header: {
                 Text("Background Debugging")
