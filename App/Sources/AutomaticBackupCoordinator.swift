@@ -198,6 +198,9 @@ final class AutomaticBackupCoordinator: ObservableObject {
     /// its first page. Completed and failed source keys make each rescan cheap
     /// and ensure the loop eventually reaches every selected asset.
     private func performForegroundBackup(_ sources: [MediaSource]) async {
+        // Same reasoning as the background window: earlier transport failures
+        // are invisible to the scan and nothing else releases them.
+        queue.retryRetryableFailures()
         while isForeground, !Task.isCancelled, account.status.isUsable, shouldSchedule, !isPausedForAnyReason {
             let accepted = queue.enqueue(sources, skippingExisting: true, limit: Self.foregroundBatchLimit)
             if accepted.isEmpty { return }
@@ -339,6 +342,10 @@ final class AutomaticBackupCoordinator: ObservableObject {
         guard albums.canRead else {
             return finish(.init(success: false, summary: "No photo library access"))
         }
+        // Release earlier transport/5xx failures before scanning. They are
+        // invisible to the scan (the dedup treats a failed row as a durable
+        // handle), so without this a network blip parks those items forever.
+        let released = queue.retryRetryableFailures()
         let failuresBefore = queue.failedCount
         let scan = libraryChanges.scan(albums: albums,
                                        selectedAlbumIDs: preferences.selectedAlbumIDs,
@@ -360,13 +367,28 @@ final class AutomaticBackupCoordinator: ObservableObject {
         let backedUpBefore = queue.completedSourceCount
         let settled = await queue.waitUntilSettled()
         let uploaded = max(0, queue.completedSourceCount - backedUpBefore)
-        let failed = queue.failedCount - failuresBefore
-        var parts = ["enqueued \(outcome.accepted.count)", "backed up \(uploaded)"]
-        if failed > 0 { parts.append("\(failed) failed") }
+        let newFailures = queue.failedCount - failuresBefore
+        var parts: [String] = []
+        if released > 0 { parts.append("retried \(released) earlier failure\(released == 1 ? "" : "s")") }
+        parts.append("enqueued \(outcome.accepted.count)")
+        parts.append("backed up \(uploaded)")
+        // Report the standing failure count, not just this run's delta: a queue
+        // that is entirely stuck reads as "nothing happened" otherwise.
+        if queue.failedCount > 0 {
+            parts.append(newFailures > 0
+                ? "\(queue.failedCount) failed (\(newFailures) new)"
+                : "\(queue.failedCount) still failing")
+        }
         if queue.deferredForICloudCount > 0 {
             parts.append("\(queue.deferredForICloudCount) waiting on iCloud")
         }
         if outcome.reachedLimit { parts.append("more to scan next window") }
+        // Say why zero, rather than leaving the reader to guess.
+        if outcome.accepted.isEmpty, uploaded == 0, queue.failedCount == 0 {
+            parts.append(scan.sources.isEmpty
+                ? "no library changes since the last scan"
+                : "everything in the selection is already backed up")
+        }
 
         if let halt = queue.haltReason {
             return finish(.init(success: false, summary: "Stopped: \(halt)"))
@@ -378,9 +400,9 @@ final class AutomaticBackupCoordinator: ObservableObject {
             // otherwise iOS backs off a window that did everything it could.
             let reason = queue.pauseReason ?? "ran out of time"
             parts.append("deferred — \(reason)")
-            return finish(.init(success: failed == 0, summary: parts.joined(separator: " · ")))
+            return finish(.init(success: newFailures == 0, summary: parts.joined(separator: " · ")))
         }
-        return finish(.init(success: failed == 0, summary: parts.joined(separator: " · ")))
+        return finish(.init(success: newFailures == 0, summary: parts.joined(separator: " · ")))
     }
 
     private func finish(_ report: BackgroundRunReport) -> BackgroundRunReport {

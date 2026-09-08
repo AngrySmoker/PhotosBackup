@@ -15,6 +15,22 @@ struct GPMCError: LocalizedError, Equatable {
     let message: String
     init(kind: Kind = .malformed, message: String) { self.kind = kind; self.message = message }
     var errorDescription: String? { message }
+
+    /// `localizedDescription` collapses to "unknown error" for several URL
+    /// error codes, which makes a failed row impossible to act on. Keep the
+    /// readable text where there is one, and fall back to domain and code.
+    static func describeTransport(_ error: Error) -> String {
+        let nsError = error as NSError
+        let described = nsError.localizedDescription
+        let useless = described.isEmpty
+            || described.localizedCaseInsensitiveContains("unknown error")
+        guard useless else { return described }
+        if let urlError = error as? URLError {
+            return "\(urlError.code) (URLError \(urlError.errorCode))"
+        }
+        return "\(nsError.domain) \(nsError.code)"
+    }
+
     /// True when trying again may succeed without the user doing anything.
     var isRetryable: Bool {
         switch kind {
@@ -139,7 +155,7 @@ final class ForegroundFileUploadTransport: FileUploadTransport, @unchecked Senda
         } catch let error as GPMCError {
             throw error
         } catch {
-            throw GPMCError(kind: .transport, message: "Could not reach Google: \(error.localizedDescription)")
+            throw GPMCError(kind: .transport, message: "Could not reach Google: \(GPMCError.describeTransport(error))")
         }
     }
 
@@ -197,6 +213,7 @@ actor GPMCClient {
         }
     }
     var accountEmail: String { auth.values["Email"] ?? "" }
+
     private func checked(_ data: Data, _ response: URLResponse) throws -> (Data, HTTPURLResponse) {
         guard let http = response as? HTTPURLResponse else { throw GPMCError(message: "Invalid server response.") }
         if http.statusCode == 401 || http.statusCode == 403 {
@@ -238,7 +255,7 @@ actor GPMCClient {
         } catch is CancellationError {
             throw CancellationError()
         } catch {
-            throw GPMCError(kind: .transport, message: "Could not reach Google: \(error.localizedDescription)")
+            throw GPMCError(kind: .transport, message: "Could not reach Google: \(GPMCError.describeTransport(error))")
         }
     }
     func authenticate() async throws {

@@ -713,6 +713,28 @@ final class UploadQueueTests: XCTestCase {
         XCTAssertEqual(queue.items.first?.checkpoint, checkpoint)
     }
 
+    /// A transport failure parks an item in `.failed`, where the enqueue dedup
+    /// treats it as a durable handle. Nothing automatic used to release it, so
+    /// one network blip stopped those photos being backed up permanently.
+    func testRetryableFailuresAreReleasedButPermanentOnesAreNot() async {
+        let transport = GPMCError(kind: .transport, message: "Could not reach Google")
+        let permanent = GPMCError(kind: .malformed, message: "That item has no file to upload.")
+        let script = WorkerScript([.fail(transport), .fail(permanent)], fallback: .fail(transport))
+        let queue = makeQueue(script, maxConcurrent: 1, maxAttempts: 1)
+        queue.enqueue(sources(2))
+        await settle(queue) { queue.failedCount == 2 }
+
+        let released = queue.retryRetryableFailures()
+        XCTAssertEqual(released, 1)
+
+        await settle(queue) { queue.failedCount == 2 }
+        let reasons = queue.items.compactMap { item -> Bool? in
+            if case .failed(_, let retryable) = item.state { return retryable }
+            return nil
+        }
+        XCTAssertEqual(reasons.sorted(by: { !$0 && $1 }), [false, true])
+    }
+
     func testProgressFractionsAreMonotonicAcrossTheStates() {
         let ordered: [UploadItem.State] = [.hashing(fraction: 0), .hashing(fraction: 1), .checkingDuplicate,
                                            .uploading(fraction: 0), .uploading(fraction: 1), .finalizing, .done]

@@ -297,6 +297,26 @@ final class UploadQueue: ObservableObject {
         for item in items { if case .failed = item.state { retry(item.id) } }
     }
 
+    /// Requeue failures a later attempt could plausibly fix, and report how
+    /// many were released.
+    ///
+    /// The per-item retry with backoff only covers one worker run; once an item
+    /// exhausts `maxAttempts` it lands in `.failed`, where the dedup treats it
+    /// as a durable handle and no automatic scan ever touches it again. Without
+    /// this, a transient network blip parks those photos until someone notices
+    /// and taps Retry — which is not what a backup is for. Errors marked
+    /// non-retryable (a missing asset, a refused credential) are left alone.
+    @discardableResult
+    func retryRetryableFailures() -> Int {
+        let retryable = items.filter { item in
+            if case .failed(_, let retryable) = item.state { return retryable }
+            return false
+        }
+        guard !retryable.isEmpty else { return 0 }
+        for item in retryable { retry(item.id) }
+        return retryable.count
+    }
+
     func clearFinished() {
         items.removeAll { $0.state.isFinished }
         persistNow()

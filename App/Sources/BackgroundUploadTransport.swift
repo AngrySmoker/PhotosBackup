@@ -265,6 +265,23 @@ final class BackgroundFileUploadTransport: NSObject, FileUploadTransport, @unche
         cancelTask(transferID: transferID)
     }
 
+    /// Turn a URL-loading failure into something a failed row can be acted on.
+    /// `localizedDescription` is "unknown error" for `NSURLErrorUnknown`, which
+    /// is exactly the code the Simulator returns for every background-session
+    /// upload — background sessions are not supported there, so a row that says
+    /// only "unknown error" sends you hunting for a bug that is not in the app.
+    static func describeFailure(_ detail: String, code: Int?) -> String {
+        let vague = detail.isEmpty || detail.localizedCaseInsensitiveContains("unknown error")
+        guard vague else { return "Could not reach Google: \(detail)" }
+#if targetEnvironment(simulator)
+        if code == NSURLErrorUnknown {
+            return "The Simulator cannot run background uploads. Try this on a device."
+        }
+#endif
+        guard let code else { return "Could not reach Google: the upload failed." }
+        return "Could not reach Google: URLError \(code)."
+    }
+
     private func resolve(_ transferID: UUID, with stored: StoredResult) {
         lock.lock()
         let continuations = waiters.removeValue(forKey: transferID) ?? []
@@ -279,7 +296,8 @@ final class BackgroundFileUploadTransport: NSObject, FileUploadTransport, @unche
         if stored.errorCode == NSURLErrorCancelled {
             outcome = .failure(CancellationError())
         } else if let detail = stored.errorDescription {
-            outcome = .failure(GPMCError(kind: .transport, message: "Could not reach Google: \(detail)"))
+            outcome = .failure(GPMCError(kind: .transport,
+                                         message: Self.describeFailure(detail, code: stored.errorCode)))
         } else if let url = stored.url, let status = stored.statusCode,
                   let response = HTTPURLResponse(url: url, statusCode: status,
                                                  httpVersion: "HTTP/1.1", headerFields: stored.headers) {
