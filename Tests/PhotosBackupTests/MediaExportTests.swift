@@ -84,4 +84,17 @@ final class MediaExportTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: staged.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: staged.deletingLastPathComponent().path))
     }
+
+    func testPurgePreservesFilesRetainedByDurableQueueCheckpoints() async throws {
+        let source = try scratch(Data(repeating: 4, count: 32), named: "kept.jpg")
+        let kept = try MediaExporter.adopt(source)
+        let orphan = try MediaExporter.adopt(source)
+        let exporter = MediaExporter()
+
+        await exporter.purge(excluding: [kept])
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: kept.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: orphan.path))
+        await exporter.purge()
+    }
 }

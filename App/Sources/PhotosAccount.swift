@@ -38,13 +38,16 @@ final class PhotosAccount: ObservableObject {
 
     private let store: CredentialStore
     private let requestNetworkPolicy: UploadRequestNetworkPolicy
+    private let fileUploadTransport: any FileUploadTransport
     private var credential: StoredCredential?
     private var client: GPMCClient?
 
     init(store: CredentialStore = CredentialStore(),
-         requestNetworkPolicy: UploadRequestNetworkPolicy = UploadRequestNetworkPolicy()) {
+         requestNetworkPolicy: UploadRequestNetworkPolicy = UploadRequestNetworkPolicy(),
+         fileUploadTransport: any FileUploadTransport = BackgroundFileUploadTransport.shared) {
         self.store = store
         self.requestNetworkPolicy = requestNetworkPolicy
+        self.fileUploadTransport = fileUploadTransport
     }
 
     func setCellularUploadsAllowed(_ allowed: Bool) {
@@ -121,7 +124,9 @@ final class PhotosAccount: ObservableObject {
     private func adopt(_ credential: StoredCredential) {
         self.credential = credential
         do {
-            client = try GPMCClient(authData: credential.authData, networkPolicy: requestNetworkPolicy)
+            client = try GPMCClient(authData: credential.authData,
+                                    networkPolicy: requestNetworkPolicy,
+                                    fileUploadTransport: fileUploadTransport)
             status = .connected(email: credential.email, since: credential.connectedAt)
         } catch {
             client = nil

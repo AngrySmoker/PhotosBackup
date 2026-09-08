@@ -30,6 +30,9 @@ without a desktop companion or hosted service.
 - Upload in original quality or request Google's Storage Saver processing.
 - Enforce Wi-Fi-only or Wi-Fi-and-cellular policy both at queue and request level.
 - Request recurring iOS background-processing windows for selected-album backup.
+- Keep file PUTs running in an iOS-owned background `URLSession`, then commit
+  completed receipts when iOS relaunches the app.
+- Track PhotoKit persistent changes on iOS 16+ so backdated imports are found.
 - Store usable long-lived credentials in the iOS Keychain when signing permits.
 
 ## Current status
@@ -43,7 +46,8 @@ The Xcode project, app target, and scheme are named `PhotosBackup`; the
 user-facing app is named **Photos Backup**.
 
 Latest release: **0.2.0** ([releases](https://github.com/g8row/PhotosBackup/releases)).
-75 offline unit tests pass (2 live tests skipped) on iPhone 16 Pro simulator.
+85 tests run on iPhone 16 Pro simulator: 82 pass, with 2 opt-in live tests
+and 1 simulator Keychain test skipped.
 
 ### App identity (since 0.0.2)
 
@@ -51,6 +55,7 @@ Latest release: **0.2.0** ([releases](https://github.com/g8row/PhotosBackup/rele
 | --- | --- |
 | App bundle ID | `com.g8row.photosbackup` |
 | Background task | `com.g8row.photosbackup.background-backup` |
+| Background upload session | `com.g8row.photosbackup.background-upload` |
 
 > [!IMPORTANT]
 > The bundle ID and Keychain service changed in 0.0.2. After updating from an
@@ -95,6 +100,22 @@ xcodebuild \
 
 For a signed device build, set `DEVELOPMENT_TEAM` in `project.yml`, regenerate
 the project, and let Xcode manage signing.
+
+### Test background execution
+
+Debug builds expose **Settings → Diagnostics → Simulate Background Run**. This
+runs the same scan/enqueue/wait path immediately and is the fastest normal test
+loop.
+
+To exercise the actual `BGProcessingTask` launch handler on a connected device,
+run the app from Xcode, background it, pause the debugger, and enter this in the
+LLDB console:
+
+```text
+e -l objc -- (void)[[BGTaskScheduler sharedScheduler] _simulateLaunchForTaskWithIdentifier:@"com.g8row.photosbackup.background-backup"]
+```
+
+The Diagnostics screen also has a button that copies this command.
 
 ### Build an unsigned IPA
 
@@ -164,8 +185,8 @@ Android master token → Photos access token → private Photos API
 - The exchange runs locally; there is no companion backend.
 - Credentials are stored as a single Keychain item using
   `AfterFirstUnlockThisDeviceOnly` when Keychain access is available.
-- Exported Photos-library items are staged temporarily and removed after the
-  queue finishes with them.
+- Exported Photos-library items are staged in protected Application Support,
+  retained while a background transfer owns them, and removed afterward.
 - The `oauth_token` is read in-process from the app's own non-persistent web
   view cookie store; it never leaves the app via an extension, App Group, or
   custom URL scheme.
@@ -179,12 +200,16 @@ Android master token → Photos access token → private Photos API
   ignored.
 - Background album backup is opportunistic: iOS decides when each processing
   request runs and may delay it based on usage, battery, and system policy.
-- Automatic work is split into bounded batches (25 items per background window,
-  250 per foreground activation) and unfinished durable items resume later.
-- Uploads must finish inside the granted background-processing window. If iOS
-  expires it, in-flight items and iCloud resource downloads are cancelled and
-  requeued for the next run. A background `URLSession` could further improve
-  large-file transfers by letting iOS own the byte transfer between app runs.
+- Automatic scans enqueue bounded batches (250 items at a time while foregrounded,
+  25 per processing window). Foreground scans keep paging until every selected
+  asset has been durably handled or the app leaves the foreground.
+  iOS 16+ background scans use a persistent PhotoKit change token; iOS 15 and
+  expired-token recovery use a correctness-first current-library scan.
+- Export, hashing, duplicate lookup, and upload initialization still need an
+  execution window. Once initialized, the file PUT continues under iOS even if
+  the processing window expires; the app persists the receipt before commit.
+- Cloud-only PhotoKit resources are deferred during short background processing
+  windows and resume with network access when the app is foregrounded.
 - Unsigned simulator builds cannot persist the credential in the Keychain.
   Free personal-team builds normally expire after seven days and must be
   refreshed.
@@ -231,6 +256,8 @@ Never commit tokens or captured account credentials.
 ```text
 App/Sources/                  SwiftUI app, onboarding, account, and upload queue
 App/Sources/AutomaticBackupCoordinator.swift  BGProcessingTask scheduling
+App/Sources/BackgroundUploadTransport.swift   Relaunch-safe file PUT transport
+App/Sources/PhotoLibraryChangeTracker.swift   Persistent PhotoKit scan token
 App/Sources/NetworkPolicy.swift               Wi-Fi-only / cellular enforcement
 App/Sources/UploadQueuePersistence.swift      Durable account-scoped queue
 App/Resources/                Info.plist and app icon assets

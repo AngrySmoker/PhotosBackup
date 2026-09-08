@@ -10,6 +10,7 @@ struct DashboardView: View {
     let onConnect: () -> Void
     let onAccount: () -> Void
     @State private var showPicker = false
+    @State private var showingStopBackupConfirmation = false
 
     private var selectedAlbums: [PhotoAlbum] {
         albums.albums.filter { preferences.selectedAlbumIDs.contains($0.id) }
@@ -39,6 +40,16 @@ struct DashboardView: View {
             }
             .sheet(isPresented: $showPicker) {
                 PhotoPicker { sources in enqueue(sources) }.ignoresSafeArea()
+            }
+            .confirmationDialog(
+                "Stop all backups?",
+                isPresented: $showingStopBackupConfirmation,
+                titleVisibility: .visible
+            ) {
+                Button("Stop Backup", role: .destructive) { stopBackup() }
+                Button("Keep Backing Up", role: .cancel) {}
+            } message: {
+                Text(stopBackupMessage)
             }
             .onAppear { albums.refresh() }
         }
@@ -102,6 +113,44 @@ struct DashboardView: View {
                 metric(value: selectedAlbums.count.formatted(), label: "Albums")
                 Divider().frame(height: 38)
                 metric(value: queue.activeCount.formatted(), label: "In queue")
+            }
+
+            if !queue.isIdle {
+                HStack(spacing: 10) {
+                    if queue.isUserPaused {
+                        Button {
+                            queue.resumeUserPausedUploads()
+                        } label: {
+                            Label("Resume", systemImage: "play.circle")
+                                .font(.subheadline.weight(.semibold))
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.bordered)
+                        .tint(BackupTheme.blue)
+                        .disabled(!account.status.isUsable)
+                    } else if queue.pauseReason == nil {
+                        Button {
+                            queue.pauseAfterCurrentUploads()
+                        } label: {
+                            Label("Pause", systemImage: "pause.circle")
+                                .font(.subheadline.weight(.semibold))
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.bordered)
+                        .tint(BackupTheme.blue)
+                        .accessibilityHint("Lets uploads in progress finish, then holds the remaining queue")
+                    }
+
+                    Button(role: .destructive) {
+                        showingStopBackupConfirmation = true
+                    } label: {
+                        Label("Stop", systemImage: "stop.circle")
+                            .font(.subheadline.weight(.semibold))
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(.red)
+                }
             }
         }
         .padding(20)
@@ -239,6 +288,7 @@ struct DashboardView: View {
         if !account.status.isUsable { return "Connect to back up" }
         if queue.activeCount > 0, queue.pauseReason != nil { return "Backup paused" }
         if !queue.isIdle { return "Backing up…" }
+        if queue.failedCount > 0 { return "Backup needs attention" }
         if preferences.backedUpCount == 0 { return "Ready to back up" }
         return "Backup complete"
     }
@@ -246,6 +296,7 @@ struct DashboardView: View {
     private var heroSubtitle: String {
         if !account.status.isUsable { return "Connect an account to get started" }
         if !queue.isIdle { return "\(queue.activeCount) items remaining" }
+        if queue.failedCount > 0 { return "\(queue.failedCount) items failed — open Activity to retry" }
         if selectedAlbums.isEmpty { return "Choose albums to protect" }
         return "Your selected albums are up to date"
     }
@@ -257,12 +308,14 @@ struct DashboardView: View {
 
     private var heroTint: Color {
         if !account.status.isUsable || (queue.activeCount > 0 && queue.pauseReason != nil) { return .orange }
+        if queue.failedCount > 0 { return .red }
         return queue.isIdle ? .green : BackupTheme.blue
     }
 
     private var heroSymbol: String {
         if !account.status.isUsable { return "link" }
         if queue.activeCount > 0, queue.pauseReason != nil { return "pause.fill" }
+        if queue.failedCount > 0 { return "exclamationmark" }
         return queue.isIdle ? "checkmark" : "arrow.up"
     }
 
@@ -271,12 +324,24 @@ struct DashboardView: View {
         queue.enqueue(sources, skippingExisting: true)
     }
 
+    private var stopBackupMessage: String {
+        if preferences.automaticBackup {
+            return "Uploads in progress will be cancelled, the remaining queue will be stopped, and Automatic Backup will be turned off."
+        }
+        return "Uploads in progress will be cancelled and the remaining queue will be stopped."
+    }
+
+    private func stopBackup() {
+        preferences.automaticBackup = false
+        queue.cancelAll()
+    }
+
     private func symbol(_ state: UploadItem.State) -> String {
         switch state {
         case .done, .alreadyBackedUp: return "checkmark"
         case .failed: return "exclamationmark"
         case .cancelled: return "xmark"
-        case .queued, .waitingToRetry: return "clock"
+        case .queued, .waitingToRetry, .waitingForICloud: return "clock"
         default: return "arrow.up"
         }
     }
@@ -285,7 +350,7 @@ struct DashboardView: View {
         switch state {
         case .done, .alreadyBackedUp: return .green
         case .failed: return .red
-        case .cancelled, .waitingToRetry: return .orange
+        case .cancelled, .waitingToRetry, .waitingForICloud: return .orange
         default: return BackupTheme.blue
         }
     }

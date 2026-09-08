@@ -21,15 +21,15 @@ final class WorkerScript: @unchecked Sendable {
     }
 
     func worker() -> UploadWorker {
-        { [self] _, _, emit in
+        { [self] _, _, _, _, emit in
             let step: Step = lock.sync {
                 calls += 1; inFlight += 1; peakInFlight = max(peakInFlight, inFlight)
                 return steps.isEmpty ? fallback : steps.removeFirst()
             }
             defer { lock.sync { inFlight -= 1 } }
-            emit(.described(name: "IMG_\(calls).JPG", byteCount: 1234))
-            emit(.state(.hashing(fraction: 1)))
-            emit(.state(.uploading(fraction: 0.5)))
+            await emit(.described(name: "IMG_\(calls).JPG", byteCount: 1234))
+            await emit(.state(.hashing(fraction: 1)))
+            await emit(.state(.uploading(fraction: 0.5)))
             switch step {
             case .succeed(let outcome): return outcome
             case .fail(let error): throw error
@@ -204,6 +204,80 @@ final class UploadQueueTests: XCTestCase {
         XCTAssertEqual(script.calls, 2)
     }
 
+    func testBackgroundExpirationDoesNotCancelAnIOSOwnedFileTransfer() async {
+        let prepared = PreparedUpload(
+            uploadURL: URL(string: "https://example.com/upload")!, hash: Data(repeating: 1, count: 20),
+            filename: "photo.jpg", modified: Date(), byteCount: 10,
+            useQuota: false, saver: false, receipt: nil
+        )
+        let checkpoint = UploadCheckpoint(filePath: "/tmp/photo.jpg", filename: "photo.jpg",
+                                          modified: Date(), byteCount: 10, temporary: true,
+                                          prepared: prepared, continuesAfterProcessExit: true)
+        let worker: UploadWorker = { _, _, _, _, emit in
+            await emit(.checkpoint(checkpoint))
+            await emit(.state(.uploading(fraction: 0.25)))
+            while true { try await Task.sleep(nanoseconds: 5_000_000) }
+        }
+        let queue = UploadQueue(worker: worker, maxConcurrent: 1)
+        queue.enqueue(oneSource)
+        await settle(queue) { queue.items.first?.checkpoint == checkpoint }
+
+        queue.suspendForBackgroundExpiration()
+        try? await Task.sleep(nanoseconds: 20_000_000)
+
+        XCTAssertEqual(queue.items.first?.state, .uploading(fraction: 0.25))
+        XCTAssertEqual(queue.items.first?.checkpoint, checkpoint)
+        queue.cancelAll()
+        await settle(queue) { queue.items.first?.state == .cancelled }
+    }
+
+    func testURLSessionRelaunchOnlyPumpsCheckpointedTransfers() async {
+        let prepared = PreparedUpload(
+            uploadURL: URL(string: "https://example.com/upload")!, hash: Data(repeating: 3, count: 20),
+            filename: "ready.jpg", modified: Date(), byteCount: 10,
+            useQuota: false, saver: false, receipt: Data([1, 0])
+        )
+        let checkpoint = UploadCheckpoint(filePath: "/tmp/ready.jpg", filename: "ready.jpg",
+                                          modified: Date(), byteCount: 10, temporary: true,
+                                          prepared: prepared, continuesAfterProcessExit: true)
+        let normalID = UUID()
+        let readyID = UUID()
+        let persistence = MemoryUploadQueuePersistence(snapshot: UploadQueueSnapshot(
+            version: UploadQueueSnapshot.version,
+            accountIdentifier: "person@gmail.com",
+            items: [
+                PersistedUploadItem(id: normalID, source: .asset("normal"), name: "normal.jpg",
+                                    byteCount: 0, attempts: 0, failureReason: nil, failureRetryable: false),
+                PersistedUploadItem(id: readyID, source: .asset("ready"), name: "ready.jpg",
+                                    byteCount: 10, attempts: 0, failureReason: nil, failureRetryable: false,
+                                    checkpoint: checkpoint)
+            ],
+            completedSourceKeys: []
+        ))
+        let queue = UploadQueue(worker: WorkerScript([]).worker(), maxConcurrent: 1, persistence: persistence)
+        queue.setNetworkAccess(allowed: false, pauseReason: "Checking")
+        queue.resumeBackgroundTransferCompletions()
+        queue.activateAccount("person@gmail.com")
+        queue.setNetworkAccess(allowed: true)
+
+        await settle(queue) { queue.items.first(where: { $0.id == readyID })?.state == .done }
+        XCTAssertEqual(queue.items.first(where: { $0.id == normalID })?.state, .queued)
+    }
+
+    func testCloudOnlyAssetWaitsWithoutSpendingAnAttemptAndResumesInForeground() async {
+        let script = WorkerScript([.fail(MediaExporter.Failure.iCloudDownloadRequired)],
+                                  fallback: .succeed(.uploaded(mediaKey: "ABC")))
+        let queue = makeQueue(script, maxConcurrent: 1)
+        queue.setICloudDownloadsAllowed(false)
+        queue.enqueue(oneSource)
+        await settle(queue) { queue.items.first?.state == .waitingForICloud }
+        XCTAssertEqual(queue.items.first?.attempts, 0)
+
+        queue.setICloudDownloadsAllowed(true)
+        await settle(queue) { queue.items.first?.state == .done }
+        XCTAssertEqual(script.calls, 2)
+    }
+
     func testAutomaticEnqueueSkipsSourcesAlreadyTrackedOrRepeatedInOneBatch() async {
         let script = WorkerScript([])
         let queue = makeQueue(script, maxConcurrent: 1)
@@ -216,6 +290,60 @@ final class UploadQueueTests: XCTestCase {
         XCTAssertEqual(first.count, 1)
         XCTAssertTrue(second.isEmpty)
         XCTAssertEqual(queue.items.count, 1)
+    }
+
+    func testAutomaticEnqueueDoesNotDuplicateAnExistingFailedSource() async {
+        let failure = GPMCError(kind: .malformed, message: "bad media")
+        let script = WorkerScript([.fail(failure)], fallback: .fail(failure))
+        let queue = makeQueue(script, maxConcurrent: 1)
+        let source = MediaSource.file(URL(fileURLWithPath: "/tmp/permanent-failure"))
+
+        queue.enqueue([source], skippingExisting: true)
+        await settle(queue) { queue.items.first?.state.isFinished == true }
+        let second = queue.enqueue([source], skippingExisting: true)
+
+        XCTAssertTrue(second.isEmpty)
+        XCTAssertEqual(queue.items.count, 1)
+        XCTAssertEqual(script.calls, 1)
+    }
+
+    func testUploadProcessingPreferencesSurviveRelaunch() {
+        let suite = "UploadQueueTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let first = BackupPreferences(defaults: defaults)
+        first.storageSaver = true
+        first.useQuota = true
+
+        let restored = BackupPreferences(defaults: defaults)
+        XCTAssertTrue(restored.storageSaver)
+        XCTAssertTrue(restored.useQuota)
+    }
+
+    func testCancelledBackgroundTransportAlwaysReleasesItsCaller() async {
+        let transferID = UUID()
+        let request = URLRequest(url: URL(string: "https://example.com/upload")!)
+        let task = Task { () -> Bool in
+            do {
+                _ = try await BackgroundFileUploadTransport.shared.upload(
+                    request,
+                    fromFile: URL(fileURLWithPath: "/tmp/does-not-exist"),
+                    transferID: transferID,
+                    progress: { _, _ in }
+                )
+                return false
+            } catch is CancellationError {
+                return true
+            } catch {
+                return false
+            }
+        }
+
+        task.cancel()
+        let wasCancelled = await task.value
+        XCTAssertTrue(wasCancelled)
+        await BackgroundFileUploadTransport.shared.cancel(transferID: transferID)
     }
 
     func testPendingAssetQueueRestoresAfterRelaunch() async {
@@ -237,6 +365,54 @@ final class UploadQueueTests: XCTestCase {
         restored.setNetworkAccess(allowed: true)
         await settle(restored) { restored.items.first?.state == .done }
         XCTAssertEqual(secondScript.calls, 1)
+    }
+
+    func testUploadCheckpointRestoresAtTheTransferBoundary() async {
+        let persistence = MemoryUploadQueuePersistence()
+        let prepared = PreparedUpload(
+            uploadURL: URL(string: "https://example.com/upload")!, hash: Data(repeating: 2, count: 20),
+            filename: "IMG.JPG", modified: Date(timeIntervalSince1970: 100), byteCount: 123,
+            useQuota: false, saver: true, receipt: nil
+        )
+        let checkpoint = UploadCheckpoint(filePath: "/tmp/staged/IMG.JPG", filename: "IMG.JPG",
+                                          modified: prepared.modified, byteCount: 123,
+                                          temporary: true, prepared: prepared,
+                                          continuesAfterProcessExit: true)
+        let firstWorker: UploadWorker = { _, _, _, _, emit in
+            await emit(.checkpoint(checkpoint))
+            while true { try await Task.sleep(nanoseconds: 5_000_000) }
+        }
+        let first = UploadQueue(worker: firstWorker, maxConcurrent: 1, persistence: persistence)
+        first.activateAccount("person@gmail.com")
+        first.enqueue([.asset(localIdentifier: "asset-1")])
+
+        await settle(first) { persistence.snapshot?.items.first?.checkpoint == checkpoint }
+        XCTAssertEqual(persistence.snapshot?.items.first?.checkpoint, checkpoint)
+
+        let restored = UploadQueue(worker: WorkerScript([]).worker(), persistence: persistence)
+        restored.setNetworkAccess(allowed: false, pauseReason: "Waiting")
+        restored.activateAccount("person@gmail.com")
+        XCTAssertEqual(restored.items.first?.checkpoint, checkpoint)
+        XCTAssertEqual(restored.retainedStagingURLs, [checkpoint.fileURL])
+        first.cancelAll()
+    }
+
+    func testFilePersistenceKeepsCompletedKeysOutOfTheRewrittenQueueSnapshot() async throws {
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let persistence = FileUploadQueuePersistence(url: directory.appendingPathComponent("queue.json"))
+        let first = UploadQueue(worker: WorkerScript([]).worker(), maxConcurrent: 1, persistence: persistence)
+        first.activateAccount("person@gmail.com")
+        first.enqueue([.asset(localIdentifier: "asset-1")], skippingExisting: true)
+        await settle(first) { first.items.first?.state == .done }
+
+        XCTAssertEqual(try persistence.load()?.completedSourceKeys, [])
+
+        let restored = UploadQueue(worker: WorkerScript([]).worker(), persistence: persistence)
+        restored.setNetworkAccess(allowed: false, pauseReason: "Waiting")
+        restored.activateAccount("person@gmail.com")
+        XCTAssertTrue(restored.enqueue([.asset(localIdentifier: "asset-1")], skippingExisting: true).isEmpty)
     }
 
     func testCompletedAssetLedgerSurvivesRelaunchAndSkipsTheAsset() async {
@@ -307,6 +483,65 @@ final class UploadQueueTests: XCTestCase {
         XCTAssertEqual(queue.items[1].state, .cancelled)
         queue.cancel(queue.items[0].id)
         await settle(queue) { queue.items.allSatisfy { $0.state.isFinished } }
+        XCTAssertEqual(script.calls, 1)
+    }
+
+    func testCancelAllStopsRunningAndQueuedItems() async {
+        let script = WorkerScript([.block], fallback: .block)
+        let queue = makeQueue(script, maxConcurrent: 1)
+        queue.enqueue(sources(3))
+        await settle(queue) { queue.items.first?.state.isWorking == true }
+
+        queue.cancelAll()
+
+        await settle(queue) { queue.items.allSatisfy { $0.state == .cancelled } }
+        XCTAssertTrue(queue.isIdle)
+        XCTAssertEqual(script.calls, 1)
+    }
+
+    func testUserPauseHoldsQueuedItemsUntilResume() async {
+        let script = WorkerScript([.block], fallback: .succeed(.uploaded(mediaKey: "ABC")))
+        let queue = makeQueue(script, maxConcurrent: 1)
+        queue.enqueue(sources(2))
+        await settle(queue) { queue.items.first?.state.isWorking == true }
+
+        queue.pauseAfterCurrentUploads()
+        queue.cancel(queue.items[0].id)
+        await settle(queue) { queue.items[0].state == .cancelled }
+        try? await Task.sleep(nanoseconds: 20_000_000)
+
+        XCTAssertTrue(queue.isUserPaused)
+        XCTAssertEqual(queue.items[1].state, .queued)
+        XCTAssertEqual(script.calls, 1)
+
+        queue.resumeUserPausedUploads()
+        await settle(queue) { queue.items[1].state == .done }
+        XCTAssertFalse(queue.isUserPaused)
+        XCTAssertEqual(script.calls, 2)
+    }
+
+    func testUserPauseSurvivesQueueRestoration() async {
+        let persistence = MemoryUploadQueuePersistence()
+        let first = UploadQueue(worker: WorkerScript([]).worker(), persistence: persistence)
+        first.setNetworkAccess(allowed: false, pauseReason: "Waiting")
+        first.activateAccount("person@gmail.com")
+        first.enqueue(oneSource)
+        first.pauseAfterCurrentUploads()
+
+        let script = WorkerScript([])
+        let restored = UploadQueue(worker: script.worker(), persistence: persistence)
+        restored.setNetworkAccess(allowed: false, pauseReason: "Waiting")
+        restored.activateAccount("person@gmail.com")
+        restored.setNetworkAccess(allowed: true)
+        try? await Task.sleep(nanoseconds: 20_000_000)
+
+        XCTAssertTrue(restored.isUserPaused)
+        XCTAssertEqual(restored.items.first?.state, .queued)
+        XCTAssertEqual(script.calls, 0)
+
+        restored.resumeUserPausedUploads()
+        await settle(restored) { restored.items.first?.state == .done }
+        XCTAssertFalse(restored.isUserPaused)
         XCTAssertEqual(script.calls, 1)
     }
 

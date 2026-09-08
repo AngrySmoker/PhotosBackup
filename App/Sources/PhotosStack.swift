@@ -15,23 +15,25 @@ final class PhotosStack {
         let uploader = PhotosUploader(exporter: exporter) { await account.currentClient() }
         self.account = account
         self.exporter = exporter
-        self.queue = UploadQueue(worker: uploader.worker(), persistence: FileUploadQueuePersistence())
+        self.queue = UploadQueue(worker: uploader.worker(), persistence: FileUploadQueuePersistence(),
+                                 checkpointCleaner: uploader.checkpointCleaner())
         self.queue.onCredentialRejected = { [weak account] error in account?.report(error) }
     }
 
-    /// Restore the saved account and sweep away temp files from a previous run.
+    /// Restore the saved account and then sweep only staging files that no
+    /// durable queue checkpoint still owns.
     func start() async {
         if let startTask {
             await startTask.value
             return
         }
-        let task = Task { [exporter, account] in
-            await exporter.purge()
+        let task = Task { [account] in
             await account.restore()
         }
         startTask = task
         await task.value
         queue.activateAccount(account.status.email)
+        await exporter.purge(excluding: queue.retainedStagingURLs)
     }
 
     /// Hand a finished exchange to the account, then let the queue carry on.

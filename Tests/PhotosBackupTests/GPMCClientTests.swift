@@ -2,6 +2,29 @@ import XCTest
 import CryptoKit
 @testable import PhotosBackup
 
+private final class RecordingFileUploadTransport: FileUploadTransport, @unchecked Sendable {
+    let continuesAfterProcessExit = true
+    private let lock = NSLock()
+    private(set) var requests: [URLRequest] = []
+
+    private func record(_ request: URLRequest) {
+        lock.lock(); requests.append(request); lock.unlock()
+    }
+
+    func upload(_ request: URLRequest, fromFile file: URL, transferID: UUID,
+                progress: @escaping @Sendable (Int64, Int64) -> Void) async throws -> FileUploadResult {
+        record(request)
+        let size = Int64((try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+        progress(size, size)
+        let response = HTTPURLResponse(url: request.url!, statusCode: 200,
+                                       httpVersion: "HTTP/1.1", headerFields: [:])!
+        return FileUploadResult(data: Proto.string(1, "receipt"), response: response)
+    }
+
+    func forget(transferID: UUID) async {}
+    func cancel(transferID: UUID) async {}
+}
+
 final class GPMCClientTests: XCTestCase {
 
     // A credential body with every field `AuthData.required` insists on.
@@ -227,6 +250,23 @@ final class GPMCClientTests: XCTestCase {
         let expected = Data(Insecure.SHA1.hash(data: try Data(contentsOf: file))).base64EncodedString()
         XCTAssertEqual(initiate?.value(forHTTPHeaderField: "X-Goog-Hash"), "sha1=" + expected)
         XCTAssertEqual(initiate?.value(forHTTPHeaderField: "X-Upload-Content-Length"), "4096")
+    }
+
+    func testOnlyTheFilePutUsesTheInjectedTransportSeam() async throws {
+        StubProtocol.handler = Self.photosHandler()
+        let transport = RecordingFileUploadTransport()
+        let client = try GPMCClient(authData: Self.credential, session: StubProtocol.session(),
+                                    fileUploadTransport: transport)
+
+        let outcome = try await client.upload(file: try scratchFile(), filename: "IMG_0003.JPG",
+                                              useQuota: false, saver: false) { _ in }
+
+        XCTAssertEqual(outcome, .uploaded(mediaKey: "MEDIAKEY"))
+        XCTAssertEqual(transport.requests.count, 1)
+        XCTAssertEqual(transport.requests.first?.httpMethod, "PUT")
+        XCTAssertFalse(StubProtocol.seen.contains { $0.httpMethod == "PUT" })
+        XCTAssertTrue(StubProtocol.seen.contains { $0.stubPath.hasSuffix("/5084965799730810217") })
+        XCTAssertTrue(StubProtocol.seen.contains { $0.stubPath.hasSuffix("/16538846908252377752") })
     }
 
     func testAlreadyBackedUpIsDistinguishableFromAFreshUpload() async throws {

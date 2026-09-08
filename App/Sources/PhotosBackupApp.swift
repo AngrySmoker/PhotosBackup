@@ -2,6 +2,7 @@ import SwiftUI
 
 @main
 struct PhotosBackupApp: App {
+    @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var log: ProbeLog
     @StateObject private var connector: AccountConnector
     @StateObject private var account: PhotosAccount
@@ -19,6 +20,8 @@ struct PhotosBackupApp: App {
         let preferences = BackupPreferences()
         let albums = PhotoAlbumStore()
         let network = NetworkPolicyMonitor()
+        stack.queue.options.storageSaver = preferences.storageSaver
+        stack.queue.options.useQuota = preferences.useQuota
         let automaticBackup = AutomaticBackupCoordinator(
             photos: stack,
             account: stack.account,
@@ -27,6 +30,9 @@ struct PhotosBackupApp: App {
             albums: albums,
             network: network
         )
+        BackgroundFileUploadTransport.shared.setEventsDrainer { [weak automaticBackup] in
+            await automaticBackup?.handleBackgroundURLSessionEvents()
+        }
         // A successful exchange is what connects the account; the connector owns
         // the token, the stack owns everything downstream of it.
         sharedConnector.onExchange = { [weak stack] result in await stack?.connect(result) }
@@ -52,6 +58,7 @@ struct PhotosBackupApp: App {
                 .environmentObject(queue)
                 .environmentObject(preferences)
                 .environmentObject(albums)
+                .environmentObject(automaticBackup)
                 .task { await automaticBackup.start() }
                 .onChange(of: scenePhase) { phase in
                     switch phase {
@@ -64,6 +71,8 @@ struct PhotosBackupApp: App {
                     }
                 }
                 .onChange(of: preferences.connection) { _ in automaticBackup.connectionPreferenceDidChange() }
+                .onChange(of: preferences.storageSaver) { value in queue.options.storageSaver = value }
+                .onChange(of: preferences.useQuota) { value in queue.options.useQuota = value }
                 .onChange(of: preferences.automaticBackup) { _ in automaticBackup.backupConfigurationDidChange() }
                 .onChange(of: preferences.selectedAlbumIDs) { _ in automaticBackup.backupConfigurationDidChange() }
                 .onChange(of: preferences.completedOnboarding) { _ in automaticBackup.backupConfigurationDidChange() }

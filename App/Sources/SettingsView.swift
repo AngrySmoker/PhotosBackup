@@ -120,8 +120,8 @@ struct SettingsView: View {
                     .font(.footnote)
                     .foregroundStyle(.orange)
             }
-            Toggle("Storage Saver", isOn: $queue.options.storageSaver)
-            Toggle("Count Against Storage Quota", isOn: $queue.options.useQuota)
+            Toggle("Storage Saver", isOn: $preferences.storageSaver)
+            Toggle("Count Against Storage Quota", isOn: $preferences.useQuota)
         } header: {
             Text("Backup")
         } footer: {

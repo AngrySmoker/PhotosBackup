@@ -3,7 +3,9 @@ import SwiftUI
 struct UploadsView: View {
     @EnvironmentObject private var account: PhotosAccount
     @EnvironmentObject private var queue: UploadQueue
+    @EnvironmentObject private var preferences: BackupPreferences
     @State private var showPicker = false
+    @State private var showingStopBackupConfirmation = false
 
     var body: some View {
         NavigationView {
@@ -12,19 +14,25 @@ struct UploadsView: View {
                 if queue.activeCount > 0, let reason = queue.pauseReason { pausedSection(reason) }
                 if let warning = queue.persistenceWarning { persistenceWarningSection(warning) }
                 if queue.items.isEmpty { emptySection }
-                else { activitySection }
+                else {
+                    queueManagementSection
+                    activitySection
+                }
             }
             .listStyle(.insetGrouped)
             .navigationTitle("Activity")
-            .toolbar {
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    if queue.items.contains(where: { $0.state.isFinished }) {
-                        Button("Clear") { queue.clearFinished() }
-                    }
-                }
-            }
             .sheet(isPresented: $showPicker) {
                 PhotoPicker { sources in enqueue(sources) }.ignoresSafeArea()
+            }
+            .confirmationDialog(
+                "Stop all backups?",
+                isPresented: $showingStopBackupConfirmation,
+                titleVisibility: .visible
+            ) {
+                Button("Stop Backup", role: .destructive) { stopBackup() }
+                Button("Keep Backing Up", role: .cancel) {}
+            } message: {
+                Text(stopBackupMessage)
             }
         }
         .navigationViewStyle(.stack)
@@ -60,6 +68,49 @@ struct UploadsView: View {
             Text(reason).font(.footnote).foregroundStyle(.secondary)
             if queue.haltReason != nil {
                 Button("Resume Backup") { queue.resume() }.disabled(!account.status.isUsable)
+            }
+        }
+    }
+
+    private var queueManagementSection: some View {
+        Section("Queue Controls") {
+            if queue.activeCount > 0 {
+                if queue.isUserPaused {
+                    Button {
+                        queue.resumeUserPausedUploads()
+                    } label: {
+                        Label("Resume Backup", systemImage: "play.circle")
+                    }
+                    .disabled(!account.status.isUsable)
+                } else if queue.pauseReason == nil {
+                    Button {
+                        queue.pauseAfterCurrentUploads()
+                    } label: {
+                        Label("Pause After Current Uploads", systemImage: "pause.circle")
+                    }
+                }
+
+                Button(role: .destructive) {
+                    showingStopBackupConfirmation = true
+                } label: {
+                    Label("Stop Backup", systemImage: "stop.circle")
+                }
+            }
+
+            if queue.failedCount > 0 {
+                Button {
+                    queue.retryAllFailed()
+                } label: {
+                    Label("Retry Failed Uploads", systemImage: "arrow.clockwise.circle")
+                }
+            }
+
+            if queue.items.contains(where: { $0.state.isFinished }) {
+                Button {
+                    queue.clearFinished()
+                } label: {
+                    Label("Clear Finished Uploads", systemImage: "checkmark.circle")
+                }
             }
         }
     }
@@ -100,12 +151,19 @@ struct UploadsView: View {
                 Spacer()
                 if !queue.isIdle { Text("\(queue.activeCount) remaining") }
             }
-        } footer: {
-            HStack(spacing: 18) {
-                if queue.failedCount > 0 { Button("Retry Failed") { queue.retryAllFailed() } }
-                if !queue.isIdle { Button("Cancel All", role: .destructive) { queue.cancelAll() } }
-            }
         }
+    }
+
+    private var stopBackupMessage: String {
+        if preferences.automaticBackup {
+            return "Uploads in progress will be cancelled, the remaining queue will be stopped, and Automatic Backup will be turned off."
+        }
+        return "Uploads in progress will be cancelled and the remaining queue will be stopped."
+    }
+
+    private func stopBackup() {
+        preferences.automaticBackup = false
+        queue.cancelAll()
     }
 
     private func activityRow(_ item: UploadItem) -> some View {
@@ -143,7 +201,7 @@ struct UploadsView: View {
         case .done, .alreadyBackedUp: return "checkmark"
         case .failed: return "exclamationmark"
         case .cancelled: return "xmark"
-        case .queued, .waitingToRetry: return "clock"
+        case .queued, .waitingToRetry, .waitingForICloud: return "clock"
         default: return "arrow.up"
         }
     }
@@ -152,7 +210,7 @@ struct UploadsView: View {
         switch state {
         case .done, .alreadyBackedUp: return .green
         case .failed: return .red
-        case .cancelled, .waitingToRetry: return .orange
+        case .cancelled, .waitingToRetry, .waitingForICloud: return .orange
         default: return BackupTheme.blue
         }
     }

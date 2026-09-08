@@ -37,19 +37,21 @@ struct ExportedMedia: Equatable, Sendable {
 }
 
 /// Turns a `MediaSource` into a file `GPMCClient.upload` can read, and cleans
-/// up after itself. Everything lands under one directory in Caches so a crash
-/// leaves nothing the system will not reclaim.
+/// up after itself. Owned files live in protected, backup-excluded Application
+/// Support so iOS cannot evict a body that its background session still needs.
 actor MediaExporter {
     enum Failure: LocalizedError, Equatable {
         case missingAsset
         case noResource
         case unreadable(String)
         case liveOnly
+        case iCloudDownloadRequired
         var errorDescription: String? {
             switch self {
             case .missingAsset: return "That item is no longer in your photo library."
             case .noResource: return "That item has no file to upload."
             case .liveOnly: return "That item is a Live Photo motion track, which this release does not upload."
+            case .iCloudDownloadRequired: return "That item is only in iCloud. It will continue when the app is open."
             case .unreadable(let detail): return "Could not read that item: \(detail)"
             }
         }
@@ -58,7 +60,9 @@ actor MediaExporter {
     static let directoryName = "gpmc-uploads"
 
     static var root: URL {
-        let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        // Background URLSession upload bodies must not live in Caches: iOS may
+        // evict that directory while a multi-hour task still owns the file.
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         return base.appendingPathComponent(directoryName, isDirectory: true)
     }
 
@@ -94,21 +98,33 @@ actor MediaExporter {
     static func stage(named name: String) throws -> URL {
         let directory = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try? FileManager.default.setAttributes(
+            [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+            ofItemAtPath: directory.path
+        )
+        try? (directory as NSURL).setResourceValue(true, forKey: .isExcludedFromBackupKey)
         let safe = name.isEmpty ? "item" : name
         return directory.appendingPathComponent(safe)
     }
 
-    /// Delete anything left over from a previous run. Call once at launch.
-    func purge() {
-        try? FileManager.default.removeItem(at: Self.root)
+    /// Remove only orphaned staging directories. Files named by restored queue
+    /// checkpoints may still be feeding an iOS-owned background upload.
+    func purge(excluding retainedFiles: Set<URL> = []) {
+        let retainedDirectories = Set(retainedFiles.map { $0.standardizedFileURL.deletingLastPathComponent() })
+        guard let children = try? FileManager.default.contentsOfDirectory(
+            at: Self.root, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]
+        ) else { return }
+        for child in children where !retainedDirectories.contains(child.standardizedFileURL) {
+            try? FileManager.default.removeItem(at: child)
+        }
     }
 
-    func export(_ source: MediaSource) async throws -> ExportedMedia {
+    func export(_ source: MediaSource, allowsNetworkAccess: Bool = true) async throws -> ExportedMedia {
         switch source {
         case .file(let url):
             return try describe(url, filename: url.lastPathComponent, modified: nil, temporary: false)
         case .asset(let identifier):
-            return try await exportAsset(identifier)
+            return try await exportAsset(identifier, allowsNetworkAccess: allowsNetworkAccess)
         case .picked(let picked):
             let url = try await Self.copyToStaging(from: picked.provider)
             return try describe(url, filename: url.lastPathComponent, modified: nil, temporary: true)
@@ -121,7 +137,7 @@ actor MediaExporter {
         try? FileManager.default.removeItem(at: media.url.deletingLastPathComponent())
     }
 
-    private func exportAsset(_ identifier: String) async throws -> ExportedMedia {
+    private func exportAsset(_ identifier: String, allowsNetworkAccess: Bool) async throws -> ExportedMedia {
         guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil).firstObject else {
             throw Failure.missingAsset
         }
@@ -135,12 +151,18 @@ actor MediaExporter {
         }
         let destination = try Self.stage(named: resource.originalFilename)
         let options = PHAssetResourceRequestOptions()
-        options.isNetworkAccessAllowed = true
+        options.isNetworkAccessAllowed = allowsNetworkAccess
         do {
             try await PHAssetResourceManager.default().writeData(for: resource, toFile: destination, options: options)
         } catch {
             try? FileManager.default.removeItem(at: destination.deletingLastPathComponent())
             if Task.isCancelled { throw CancellationError() }
+            let nsError = error as NSError
+            if !allowsNetworkAccess,
+               nsError.domain == PHPhotosErrorDomain,
+               nsError.code == 3164 {
+                throw Failure.iCloudDownloadRequired
+            }
             throw Failure.unreadable(error.localizedDescription)
         }
         return try describe(destination, filename: resource.originalFilename,
@@ -148,6 +170,12 @@ actor MediaExporter {
     }
 
     private func describe(_ url: URL, filename: String, modified: Date?, temporary: Bool) throws -> ExportedMedia {
+        if temporary {
+            try? FileManager.default.setAttributes(
+                [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+                ofItemAtPath: url.path
+            )
+        }
         let values = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
         let size = Int64(values?.fileSize ?? 0)
         guard size > 0 else { throw Failure.unreadable("the file is empty") }

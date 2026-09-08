@@ -45,6 +45,43 @@ enum UploadPhase: Equatable, Sendable {
     case finalizing
 }
 
+/// Result of the preflight half of an upload. The expensive PUT is deliberately
+/// split from the RPCs around it so production can hand only that file transfer
+/// to a background URL session while tests keep using their injected session.
+enum UploadPreparation: Equatable, Sendable {
+    case alreadyBackedUp(mediaKey: String)
+    case ready(PreparedUpload)
+}
+
+/// Everything needed to resume at the PUT or commit boundary after a process
+/// relaunch. The app persists this alongside its queue item.
+struct PreparedUpload: Codable, Equatable, Sendable {
+    let uploadURL: URL
+    let hash: Data
+    let filename: String
+    let modified: Date
+    let byteCount: Int64
+    let useQuota: Bool
+    let saver: Bool
+    var receipt: Data?
+}
+
+struct FileUploadResult: @unchecked Sendable {
+    let data: Data
+    let response: HTTPURLResponse
+}
+
+/// Transport seam for the file PUT. Background URL sessions cannot use the
+/// async upload convenience API or URLProtocol, so the app supplies a delegate-
+/// driven implementation while unit tests retain this foreground implementation.
+protocol FileUploadTransport: Sendable {
+    var continuesAfterProcessExit: Bool { get }
+    func upload(_ request: URLRequest, fromFile file: URL, transferID: UUID,
+                progress: @escaping @Sendable (Int64, Int64) -> Void) async throws -> FileUploadResult
+    func cancel(transferID: UUID) async
+    func forget(transferID: UUID) async
+}
+
 struct AuthData {
     let values: [String: String]
     static let required = ["androidId", "client_sig", "callerSig", "device_country", "Email", "google_play_services_version", "lang", "oauth2_foreground", "sdk_version", "service", "Token"]
@@ -80,6 +117,36 @@ private final class ProgressDelegate: NSObject, URLSessionTaskDelegate {
     }
 }
 
+final class ForegroundFileUploadTransport: FileUploadTransport, @unchecked Sendable {
+    let continuesAfterProcessExit = false
+    private let session: URLSession
+
+    init(session: URLSession) { self.session = session }
+
+    func upload(_ request: URLRequest, fromFile file: URL, transferID: UUID,
+                progress: @escaping @Sendable (Int64, Int64) -> Void) async throws -> FileUploadResult {
+        let delegate = ProgressDelegate(progress)
+        do {
+            let (data, response) = try await session.upload(for: request, fromFile: file, delegate: delegate)
+            guard let http = response as? HTTPURLResponse else {
+                throw GPMCError(message: "Invalid server response.")
+            }
+            return FileUploadResult(data: data, response: http)
+        } catch let error as URLError where error.code == .cancelled {
+            throw CancellationError()
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let error as GPMCError {
+            throw error
+        } catch {
+            throw GPMCError(kind: .transport, message: "Could not reach Google: \(error.localizedDescription)")
+        }
+    }
+
+    func forget(transferID: UUID) async {}
+    func cancel(transferID: UUID) async {}
+}
+
 /// Thread-safe request policy shared by every client created for an account.
 /// Queue-level path monitoring controls when work starts; these request flags
 /// are the second line of defence that prevents a task from moving to cellular.
@@ -106,22 +173,27 @@ actor GPMCClient {
     private let auth: AuthData
     private let session: URLSession
     private let networkPolicy: UploadRequestNetworkPolicy
+    private let fileUploadTransport: any FileUploadTransport
     private var token = ""
     private var expiry = Date.distantPast
     private let userAgent = "com.google.android.apps.photos/49029607 (Linux; U; Android 9; en_US; Pixel XL; Build/PQ2A.190205.001; Cronet/127.0.6510.5) (gzip)"
     init(authData: String,
          session: URLSession? = nil,
-         networkPolicy: UploadRequestNetworkPolicy = UploadRequestNetworkPolicy()) throws {
+         networkPolicy: UploadRequestNetworkPolicy = UploadRequestNetworkPolicy(),
+         fileUploadTransport: (any FileUploadTransport)? = nil) throws {
         auth = try AuthData(authData)
         self.networkPolicy = networkPolicy
         if let session {
             self.session = session
+            self.fileUploadTransport = fileUploadTransport ?? ForegroundFileUploadTransport(session: session)
         } else {
             let configuration = URLSessionConfiguration.default
             configuration.waitsForConnectivity = true
             configuration.timeoutIntervalForRequest = 120
             configuration.timeoutIntervalForResource = 60 * 60
-            self.session = URLSession(configuration: configuration)
+            let session = URLSession(configuration: configuration)
+            self.session = session
+            self.fileUploadTransport = fileUploadTransport ?? ForegroundFileUploadTransport(session: session)
         }
     }
     var accountEmail: String { auth.values["Email"] ?? "" }
@@ -155,13 +227,12 @@ actor GPMCClient {
         }
         return detail.isEmpty ? "" : " Google said: \(detail)"
     }
-    private func send(_ originalRequest: URLRequest, file: URL?, delegate: URLSessionTaskDelegate?) async throws -> (Data, URLResponse) {
+    private func send(_ originalRequest: URLRequest) async throws -> (Data, URLResponse) {
         try Task.checkCancellation()
         var request = originalRequest
         networkPolicy.apply(to: &request)
         do {
-            if let file { return try await session.upload(for: request, fromFile: file, delegate: delegate) }
-            return try await session.data(for: request, delegate: delegate)
+            return try await session.data(for: request)
         } catch let error as URLError where error.code == .cancelled {
             throw CancellationError()
         } catch is CancellationError {
@@ -177,7 +248,7 @@ actor GPMCClient {
         request.setValue("com.google.android.apps.photos", forHTTPHeaderField: "app")
         request.setValue(auth.values["androidId"], forHTTPHeaderField: "device")
         request.setValue("GoogleAuth/1.4 (Pixel XL PQ2A.190205.001); gzip", forHTTPHeaderField: "User-Agent")
-        let (data, response) = try await send(request, file: nil, delegate: nil)
+        let (data, response) = try await send(request)
         var fields: [String: String] = [:]
         for line in String(decoding: data, as: UTF8.self).split(whereSeparator: \.isNewline) {
             let parts = line.split(separator: "=", maxSplits: 1)
@@ -205,7 +276,7 @@ actor GPMCClient {
         let check = Proto.bytes(1, Proto.bytes(1, Proto.bytes(1, dummyHash)) + Proto.bytes(2, Data()))
         _ = try await rpc(Self.hashCheckMethod, body: check)
     }
-    private func request(_ url: URL, method: String = "POST", body: Data? = nil, file: URL? = nil, headers: [String: String] = [:], delegate: URLSessionTaskDelegate? = nil, allowReauth: Bool = true) async throws -> (Data, HTTPURLResponse) {
+    private func request(_ url: URL, method: String = "POST", body: Data? = nil, headers: [String: String] = [:], allowReauth: Bool = true) async throws -> (Data, HTTPURLResponse) {
         if expiry <= Date().addingTimeInterval(30) { try await authenticate() }
         var request = URLRequest(url: url); request.httpMethod = method; request.timeoutInterval = 120
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
@@ -213,15 +284,15 @@ actor GPMCClient {
         request.setValue("en_US", forHTTPHeaderField: "Accept-Language")
         request.setValue("application/x-protobuf", forHTTPHeaderField: "Content-Type")
         for (key, value) in headers { request.setValue(value, forHTTPHeaderField: key) }
-        if file == nil { request.httpBody = body }
-        let result = try await send(request, file: file, delegate: delegate)
+        request.httpBody = body
+        let result = try await send(request)
         // The expiry check above only covers a token that ages out between
         // calls. A token revoked elsewhere dies mid-session, so spend one forced
-        // refresh on it — but never on a body-carrying upload, which has to be
-        // restarted from its own upload ID anyway.
-        if allowReauth, file == nil, let http = result.1 as? HTTPURLResponse, http.statusCode == 401 || http.statusCode == 403 {
+        // refresh on the small replayable data request. File PUTs bypass this
+        // helper and retain their own upload ID.
+        if allowReauth, let http = result.1 as? HTTPURLResponse, http.statusCode == 401 || http.statusCode == 403 {
             expiry = .distantPast
-            return try await self.request(url, method: method, body: body, file: file, headers: headers, delegate: delegate, allowReauth: false)
+            return try await self.request(url, method: method, body: body, headers: headers, allowReauth: false)
         }
         return try checked(result.0, result.1)
     }
@@ -241,11 +312,11 @@ actor GPMCClient {
                           body: body, headers: ext ? Self.extHeaders : [:]).0
     }
 
-    /// SHA-1 the file, ask whether Google already holds it, and otherwise
-    /// upload and commit it. `modified` overrides the file's own timestamp —
-    /// pass the library asset's creation date, which survives the copy to a
-    /// temp file where the filesystem date does not.
-    func upload(file: URL, filename: String, modified: Date? = nil, useQuota: Bool, saver: Bool, phase: @escaping @Sendable (UploadPhase) -> Void) async throws -> UploadOutcome {
+    /// Hash and de-duplicate while the app is awake, then obtain the resumable
+    /// upload URL. No long-running body transfer happens in this method.
+    func prepareUpload(file: URL, filename: String, modified: Date? = nil,
+                       useQuota: Bool, saver: Bool,
+                       phase: @escaping @Sendable (UploadPhase) -> Void) async throws -> UploadPreparation {
         let declared = (try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? 0
         guard declared > 0 else { throw GPMCError(message: "That item is empty; there is nothing to upload.") }
         phase(.hashing(fraction: 0))
@@ -259,7 +330,9 @@ actor GPMCClient {
         phase(.checkingDuplicate)
         let check = Proto.bytes(1, Proto.bytes(1, Proto.bytes(1, hash)) + Proto.bytes(2, Data()))
         let existing = try await rpc(Self.hashCheckMethod, body: check)
-        if let key = try Proto.string(at: [1, 2, 2, 1], in: existing) { return .alreadyBackedUp(mediaKey: key) }
+        if let key = try Proto.string(at: [1, 2, 2, 1], in: existing) {
+            return .alreadyBackedUp(mediaKey: key)
+        }
         phase(.preparing)
         let endpoint = URL(string: "https://photos.googleapis.com/data/upload/uploadmedia/interactive")!
         let body = Proto.int(1, 2) + Proto.int(2, 2) + Proto.int(3, 1) + Proto.int(4, 3) + Proto.int(7, size)
@@ -267,18 +340,75 @@ actor GPMCClient {
         guard let uploadID = response.value(forHTTPHeaderField: "X-GUploader-UploadID"), !uploadID.isEmpty else { throw GPMCError(message: "Google did not return an upload ID.") }
         var components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false)!
         components.queryItems = [URLQueryItem(name: "upload_id", value: uploadID)]
-        let total = Int64(size)
-        phase(.sending(sent: 0, total: total))
-        let progress = ProgressDelegate { sent, expected in phase(.sending(sent: sent, total: expected > 0 ? expected : total)) }
-        let (receipt, _) = try await request(components.url!, method: "PUT", file: file, headers: ["Content-Type": "application/octet-stream"], delegate: progress)
-        _ = try Proto.fields(receipt)
-        phase(.finalizing)
         let date = modified ?? (try? file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date()
-        let stamp = UInt64(max(0, date.timeIntervalSince1970))
-        let metadata = Proto.bytes(1, receipt) + Proto.string(2, filename) + Proto.bytes(3, hash) + Proto.bytes(4, Proto.int(1, stamp) + Proto.int(2, 46_000_000)) + Proto.int(7, saver ? 1 : 3) + Proto.int(10, 1)
-        let device = Proto.string(3, useQuota ? "Pixel 8" : (saver ? "Pixel 2" : "Pixel XL")) + Proto.string(4, "Google") + Proto.int(5, 28)
+        return .ready(PreparedUpload(uploadURL: components.url!, hash: hash, filename: filename,
+                                     modified: date, byteCount: Int64(size), useQuota: useQuota,
+                                     saver: saver, receipt: nil))
+    }
+
+    /// Run (or reattach to) the file PUT through the injected transport.
+    func transfer(_ prepared: PreparedUpload, file: URL, transferID: UUID,
+                  phase: @escaping @Sendable (UploadPhase) -> Void) async throws -> PreparedUpload {
+        if prepared.receipt != nil { return prepared }
+        if expiry <= Date().addingTimeInterval(30) { try await authenticate() }
+        var request = URLRequest(url: prepared.uploadURL)
+        request.httpMethod = "PUT"
+        request.timeoutInterval = 7 * 24 * 60 * 60
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+        request.setValue("en_US", forHTTPHeaderField: "Accept-Language")
+        request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+        networkPolicy.apply(to: &request)
+        let total = prepared.byteCount
+        phase(.sending(sent: 0, total: total))
+        let result = try await fileUploadTransport.upload(request, fromFile: file, transferID: transferID) { sent, expected in
+            phase(.sending(sent: sent, total: expected > 0 ? expected : total))
+        }
+        let (receipt, _) = try checked(result.data, result.response)
+        _ = try Proto.fields(receipt)
+        var completed = prepared
+        completed.receipt = receipt
+        return completed
+    }
+
+    /// Commit the receipt. This is intentionally a small data request that runs
+    /// during the background-session relaunch window.
+    func commit(_ prepared: PreparedUpload, phase: @escaping @Sendable (UploadPhase) -> Void) async throws -> UploadOutcome {
+        guard let receipt = prepared.receipt else {
+            throw GPMCError(message: "The upload has not finished transferring yet.")
+        }
+        phase(.finalizing)
+        let stamp = UInt64(max(0, prepared.modified.timeIntervalSince1970))
+        let metadata = Proto.bytes(1, receipt) + Proto.string(2, prepared.filename) + Proto.bytes(3, prepared.hash) + Proto.bytes(4, Proto.int(1, stamp) + Proto.int(2, 46_000_000)) + Proto.int(7, prepared.saver ? 1 : 3) + Proto.int(10, 1)
+        let device = Proto.string(3, prepared.useQuota ? "Pixel 8" : (prepared.saver ? "Pixel 2" : "Pixel XL")) + Proto.string(4, "Google") + Proto.int(5, 28)
         let committed = try await rpc(Self.commitMethod, body: Proto.bytes(1, metadata) + Proto.bytes(2, device) + Proto.bytes(3, Data([1, 3])), ext: true)
         guard let key = try Proto.string(at: [1, 3, 1], in: committed) else { throw GPMCError(message: "Google rejected the upload during finalization.") }
         return .uploaded(mediaKey: key)
+    }
+
+    func forgetTransfer(_ transferID: UUID) async {
+        await fileUploadTransport.forget(transferID: transferID)
+    }
+
+    func cancelTransfer(_ transferID: UUID) async {
+        await fileUploadTransport.cancel(transferID: transferID)
+    }
+
+    var usesBackgroundFileTransfers: Bool { fileUploadTransport.continuesAfterProcessExit }
+
+    /// Convenience orchestration retained for callers and the existing protocol-
+    /// based test suite. Production's PhotosUploader persists each boundary.
+    func upload(file: URL, filename: String, modified: Date? = nil, useQuota: Bool, saver: Bool,
+                phase: @escaping @Sendable (UploadPhase) -> Void) async throws -> UploadOutcome {
+        switch try await prepareUpload(file: file, filename: filename, modified: modified,
+                                       useQuota: useQuota, saver: saver, phase: phase) {
+        case .alreadyBackedUp(let key):
+            return .alreadyBackedUp(mediaKey: key)
+        case .ready(let prepared):
+            let transferID = UUID()
+            let completed = try await transfer(prepared, file: file, transferID: transferID, phase: phase)
+            defer { Task { await self.forgetTransfer(transferID) } }
+            return try await commit(completed, phase: phase)
+        }
     }
 }

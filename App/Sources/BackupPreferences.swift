@@ -30,12 +30,16 @@ final class BackupPreferences: ObservableObject {
         static let connection = "backup.connection"
         static let completedOnboarding = "app.completedOnboarding"
         static let backedUpCount = "backup.completedCount"
+        static let storageSaver = "backup.storageSaver"
+        static let useQuota = "backup.useQuota"
     }
 
     @Published var selectedAlbumIDs: Set<String> { didSet { saveAlbumIDs() } }
     @Published var automaticBackup: Bool { didSet { defaults.set(automaticBackup, forKey: Key.automaticBackup) } }
     @Published var connection: BackupConnection { didSet { defaults.set(connection.rawValue, forKey: Key.connection) } }
     @Published var completedOnboarding: Bool { didSet { defaults.set(completedOnboarding, forKey: Key.completedOnboarding) } }
+    @Published var storageSaver: Bool { didSet { defaults.set(storageSaver, forKey: Key.storageSaver) } }
+    @Published var useQuota: Bool { didSet { defaults.set(useQuota, forKey: Key.useQuota) } }
     @Published private(set) var backedUpCount: Int
 
     private let defaults: UserDefaults
@@ -47,6 +51,8 @@ final class BackupPreferences: ObservableObject {
         automaticBackup = defaults.object(forKey: Key.automaticBackup) as? Bool ?? true
         connection = BackupConnection(rawValue: defaults.string(forKey: Key.connection) ?? "") ?? .wifiOnly
         completedOnboarding = defaults.bool(forKey: Key.completedOnboarding)
+        storageSaver = defaults.bool(forKey: Key.storageSaver)
+        useQuota = defaults.bool(forKey: Key.useQuota)
         backedUpCount = defaults.integer(forKey: Key.backedUpCount)
     }
 
@@ -164,6 +170,32 @@ final class PhotoAlbumStore: ObservableObject {
             }
             return sources
         }
+    }
+
+    /// Restrict a PhotoKit persistent-change batch to the selected albums.
+    /// The changed identifier set is normally tiny, while the full-scan method
+    /// above remains the iOS 15 and expired-token fallback.
+    func sources(for albumIDs: Set<String>, matching identifiers: Set<String>) -> [MediaSource] {
+        guard !identifiers.isEmpty else { return [] }
+        if albumIDs.contains(PhotoAlbum.allPhotosID) {
+            let assets = PHAsset.fetchAssets(withLocalIdentifiers: Array(identifiers), options: Self.allPhotosOptions())
+            var result: [MediaSource] = []
+            assets.enumerateObjects { asset, _, _ in
+                result.append(.asset(localIdentifier: asset.localIdentifier))
+            }
+            return result
+        }
+
+        var matched = Set<String>()
+        for album in albums where albumIDs.contains(album.id) {
+            guard let collection = album.collection else { continue }
+            let assets = PHAsset.fetchAssets(in: collection, options: nil)
+            assets.enumerateObjects { asset, _, stop in
+                if identifiers.contains(asset.localIdentifier) { matched.insert(asset.localIdentifier) }
+                if matched.count == identifiers.count { stop.pointee = true }
+            }
+        }
+        return matched.map { .asset(localIdentifier: $0) }
     }
 
     /// Images and videos across the whole library, newest first, for the

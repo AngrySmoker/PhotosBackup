@@ -1,12 +1,13 @@
 import BackgroundTasks
 import Foundation
 import OSLog
+import UIKit
 
 /// Owns opportunistic automatic-backup runs in both foreground and system
 /// background execution windows. iOS decides when a processing request runs;
 /// every invocation submits its successor so the work remains recurring.
 @MainActor
-final class AutomaticBackupCoordinator {
+final class AutomaticBackupCoordinator: ObservableObject {
     static let taskIdentifier = "com.g8row.photosbackup.background-backup"
     private static let logger = Logger(subsystem: "com.g8row.photosbackup", category: "automatic-backup")
 
@@ -16,25 +17,34 @@ final class AutomaticBackupCoordinator {
     private let preferences: BackupPreferences
     private let albums: PhotoAlbumStore
     private let network: NetworkPolicyMonitor
+    private let libraryChanges: PhotoLibraryChangeTracker
 
     private var registered = false
     private var ranForegroundBackup = false
     private var isForeground = true
     private var shouldRunAfterActivation = false
     private var backgroundOperation: Task<Void, Never>?
+    private var foregroundOperation: Task<Void, Never>?
+    private var foregroundRunID: UUID?
+#if DEBUG
+    @Published private(set) var debugSimulationStatus = "Ready"
+    static let lldbSimulationCommand = "e -l objc -- (void)[[BGTaskScheduler sharedScheduler] _simulateLaunchForTaskWithIdentifier:@\"\(taskIdentifier)\"]"
+#endif
 
     init(photos: PhotosStack,
          account: PhotosAccount,
          queue: UploadQueue,
          preferences: BackupPreferences,
          albums: PhotoAlbumStore,
-         network: NetworkPolicyMonitor) {
+         network: NetworkPolicyMonitor,
+         libraryChanges: PhotoLibraryChangeTracker? = nil) {
         self.photos = photos
         self.account = account
         self.queue = queue
         self.preferences = preferences
         self.albums = albums
         self.network = network
+        self.libraryChanges = libraryChanges ?? PhotoLibraryChangeTracker()
 
         registered = BGTaskScheduler.shared.register(
             forTaskWithIdentifier: Self.taskIdentifier,
@@ -49,6 +59,8 @@ final class AutomaticBackupCoordinator {
     }
 
     func start() async {
+        isForeground = UIApplication.shared.applicationState == .active
+        queue.setICloudDownloadsAllowed(isForeground)
         await photos.start()
         applyNetworkPolicy()
         updateSchedule()
@@ -66,24 +78,31 @@ final class AutomaticBackupCoordinator {
     }
 
     func backupConfigurationDidChange() {
+        cancelForegroundScan()
         ranForegroundBackup = false
         updateSchedule()
         runForegroundBackupIfNeeded()
     }
 
     func accountDidChange() {
+        cancelForegroundScan()
+        ranForegroundBackup = false
         queue.activateAccount(account.status.email)
+        updateSchedule()
         runForegroundBackupIfNeeded()
     }
 
     func applicationDidEnterBackground() {
+        cancelForegroundScan()
         isForeground = false
+        queue.setICloudDownloadsAllowed(false)
         shouldRunAfterActivation = true
         updateSchedule()
     }
 
     func applicationDidBecomeActive() {
         isForeground = true
+        queue.setICloudDownloadsAllowed(true)
         queue.resumeSystemWork()
         if shouldRunAfterActivation {
             shouldRunAfterActivation = false
@@ -118,24 +137,59 @@ final class AutomaticBackupCoordinator {
         preferences.completedOnboarding
             && preferences.automaticBackup
             && !preferences.selectedAlbumIDs.isEmpty
+            && account.status.isUsable
     }
 
     private func runForegroundBackupIfNeeded() {
         guard isForeground,
               !ranForegroundBackup,
               shouldSchedule,
+              !queue.isUserPaused,
               account.status.isUsable,
               preferences.connection.decision(for: network.status).allowsUploads else { return }
 
         albums.refresh()
         guard albums.canRead else { return }
         ranForegroundBackup = true
-        queue.enqueue(albums.sources(for: preferences.selectedAlbumIDs), skippingExisting: true, limit: 250)
+        let sources = albums.sources(for: preferences.selectedAlbumIDs)
+        let runID = UUID()
+        foregroundRunID = runID
+        foregroundOperation = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.performForegroundBackup(sources)
+            if self.foregroundRunID == runID {
+                self.foregroundOperation = nil
+                self.foregroundRunID = nil
+            }
+        }
+    }
+
+    /// Keep the in-memory queue bounded without stopping an initial backup after
+    /// its first page. Completed and failed source keys make each rescan cheap
+    /// and ensure the loop eventually reaches every selected asset.
+    private func performForegroundBackup(_ sources: [MediaSource]) async {
+        while isForeground, !Task.isCancelled, account.status.isUsable, shouldSchedule {
+            let accepted = queue.enqueue(sources, skippingExisting: true, limit: 250)
+            if accepted.isEmpty { return }
+            while queue.activeCount > 0 {
+                if Task.isCancelled || !isForeground || !account.status.isUsable || !shouldSchedule
+                    || queue.haltReason != nil { return }
+                try? await Task.sleep(nanoseconds: 200_000_000)
+            }
+        }
+    }
+
+    private func cancelForegroundScan() {
+        foregroundOperation?.cancel()
+        foregroundOperation = nil
+        foregroundRunID = nil
     }
 
     private func begin(_ task: BGProcessingTask) {
         Self.logger.info("Beginning an iOS background-processing window")
+        isForeground = false
         updateSchedule()
+        queue.setICloudDownloadsAllowed(false)
         queue.resumeSystemWork()
         backgroundOperation?.cancel()
 
@@ -163,6 +217,9 @@ final class AutomaticBackupCoordinator {
         _ = await network.waitForInitialStatus()
         applyNetworkPolicy()
 
+        // A user pause is durable and must not be bypassed by a scheduled run.
+        guard !queue.isUserPaused else { return true }
+
         guard shouldSchedule,
               account.status.isUsable,
               preferences.connection.decision(for: network.status).allowsUploads else { return false }
@@ -170,8 +227,48 @@ final class AutomaticBackupCoordinator {
         albums.refresh()
         guard albums.canRead else { return false }
         let failuresBefore = queue.failedCount
-        queue.enqueue(albums.sources(for: preferences.selectedAlbumIDs), skippingExisting: true, limit: 25)
+        let scan = libraryChanges.scan(albums: albums,
+                                       selectedAlbumIDs: preferences.selectedAlbumIDs,
+                                       accountIdentifier: account.status.email)
+        let accepted = queue.enqueue(scan.sources, skippingExisting: true, limit: 25)
+        // Do not advance past a large import until repeated bounded runs have
+        // durably handed every changed asset to the queue.
+        if accepted.isEmpty, queue.persistenceWarning == nil { libraryChanges.commit(scan) }
         let settled = await queue.waitUntilSettled()
         return settled && queue.failedCount == failuresBefore
     }
+
+    /// Called from the background URL-session delegate before iOS receives its
+    /// relaunch completion handler. It restores the queue and lets completed
+    /// PUT receipts reach the small commit RPC.
+    func handleBackgroundURLSessionEvents() async {
+        isForeground = UIApplication.shared.applicationState == .active
+        queue.setICloudDownloadsAllowed(isForeground)
+        if isForeground { queue.resumeSystemWork() }
+        else { queue.resumeBackgroundTransferCompletions() }
+        await photos.start()
+        _ = await network.waitForInitialStatus()
+        applyNetworkPolicy()
+        if isForeground { queue.resumeSystemWork() }
+        else { queue.resumeBackgroundTransferCompletions() }
+        await queue.waitUntilBackgroundTransfersHandled()
+        isForeground = UIApplication.shared.applicationState == .active
+        if isForeground { queue.resumeSystemWork() }
+        else { queue.finishBackgroundTransferCompletions() }
+    }
+
+#if DEBUG
+    func simulateRun() {
+        guard backgroundOperation == nil else { return }
+        debugSimulationStatus = "Running…"
+        queue.setICloudDownloadsAllowed(false)
+        backgroundOperation = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let success = await self.performBackgroundBackup()
+            self.debugSimulationStatus = success ? "Finished successfully" : "Finished with deferred or failed work"
+            if self.isForeground { self.queue.setICloudDownloadsAllowed(true) }
+            self.backgroundOperation = nil
+        }
+    }
+#endif
 }

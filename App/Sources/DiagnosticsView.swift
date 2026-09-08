@@ -4,6 +4,9 @@ import SwiftUI
 struct DiagnosticsView: View {
     @EnvironmentObject private var log: ProbeLog
     @EnvironmentObject private var probe: AccountConnector
+#if DEBUG
+    @EnvironmentObject private var automaticBackup: AutomaticBackupCoordinator
+#endif
     @State private var manualToken = ""
     @State private var showAdvanced = false
     @State private var showingConnect = false
@@ -13,6 +16,28 @@ struct DiagnosticsView: View {
             Section("Environment") {
                 LabeledRow("iOS", value: UIDevice.current.systemVersion)
             }
+
+#if DEBUG
+            Section {
+                Button {
+                    automaticBackup.simulateRun()
+                } label: {
+                    Label("Simulate Background Run", systemImage: "play.circle")
+                }
+                Text(automaticBackup.debugSimulationStatus)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Button("Copy LLDB Launch Command") {
+                    UIPasteboard.general.string = AutomaticBackupCoordinator.lldbSimulationCommand
+                }
+            } header: {
+                Text("Background Debugging")
+            } footer: {
+                Text(AutomaticBackupCoordinator.lldbSimulationCommand)
+                    .font(.caption2.monospaced())
+                    .textSelection(.enabled)
+            }
+#endif
 
             Section("Connection Flow") {
                 Button { showingConnect = true } label: {

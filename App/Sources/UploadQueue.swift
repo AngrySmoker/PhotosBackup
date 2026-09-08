@@ -6,6 +6,9 @@ struct UploadOptions: Equatable, Sendable {
     var useQuota = false
     /// Ask Google to re-encode ("Storage saver") instead of keeping the original.
     var storageSaver = false
+    /// Background processing must never spend its short CPU window downloading
+    /// a cloud-only PhotoKit resource. Foreground work may opt back in.
+    var allowsICloudDownload = true
 }
 
 /// One row of the activity list.
@@ -13,6 +16,7 @@ struct UploadItem: Identifiable, Equatable, Sendable {
     enum State: Equatable, Sendable {
         case queued
         case waitingToRetry(attempt: Int)
+        case waitingForICloud
         case exporting
         case hashing(fraction: Double)
         case checkingDuplicate
@@ -50,6 +54,7 @@ struct UploadItem: Identifiable, Equatable, Sendable {
             switch self {
             case .queued: return "Waiting"
             case .waitingToRetry(let attempt): return "Retrying (attempt \(attempt + 1))"
+            case .waitingForICloud: return "Waiting for foreground to download from iCloud"
             case .exporting: return "Preparing"
             case .hashing: return "Checking"
             case .checkingDuplicate: return "Looking for a copy"
@@ -70,6 +75,7 @@ struct UploadItem: Identifiable, Equatable, Sendable {
     var state: State
     var attempts: Int
     var mediaKey: String?
+    var checkpoint: UploadCheckpoint?
 
     init(id: UUID = UUID(), source: MediaSource, name: String = "Preparing…") {
         self.id = id; self.source = source; self.name = name
@@ -81,10 +87,12 @@ struct UploadItem: Identifiable, Equatable, Sendable {
 enum UploadEvent: Equatable, Sendable {
     case described(name: String, byteCount: Int64)
     case state(UploadItem.State)
+    case checkpoint(UploadCheckpoint?)
 }
 
-typealias UploadEventSink = @Sendable (UploadEvent) -> Void
-typealias UploadWorker = @Sendable (MediaSource, UploadOptions, @escaping UploadEventSink) async throws -> UploadOutcome
+typealias UploadEventSink = @Sendable (UploadEvent) async -> Void
+typealias UploadWorker = @Sendable (UUID, MediaSource, UploadCheckpoint?, UploadOptions, @escaping UploadEventSink) async throws -> UploadOutcome
+typealias UploadCheckpointCleaner = @Sendable (UUID, UploadCheckpoint) async -> Void
 
 private extension MediaSource {
     /// Album scans can contain the same asset through multiple selected albums.
@@ -116,6 +124,8 @@ final class UploadQueue: ObservableObject {
     @Published private(set) var networkPauseReason: String?
     /// Set when iOS ends a background execution window before the queue drains.
     @Published private(set) var systemPauseReason: String?
+    /// A durable user pause. Current uploads finish; new uploads wait.
+    @Published private(set) var isUserPaused = false
     /// A non-fatal warning when the durable queue cannot be read or written.
     @Published private(set) var persistenceWarning: String?
     @Published var options = UploadOptions()
@@ -128,16 +138,20 @@ final class UploadQueue: ObservableObject {
     private let worker: UploadWorker
     private let sleeper: @Sendable (Double) async -> Void
     private let persistence: UploadQueuePersisting?
+    private let checkpointCleaner: UploadCheckpointCleaner?
     private var running: [UUID: Task<Void, Never>] = [:]
     private var userCancelled: Set<UUID> = []
     private var requeueCancelled: Set<UUID> = []
     private var accountIdentifier: String?
     private var completedSourceKeys: Set<String> = []
+    private var completionLedgerHealthy = true
+    private var drainsBackgroundCompletionsOnly = false
 
     init(worker: @escaping UploadWorker,
          maxConcurrent: Int = 2,
          maxAttempts: Int = 3,
          persistence: UploadQueuePersisting? = nil,
+         checkpointCleaner: UploadCheckpointCleaner? = nil,
          sleeper: @escaping @Sendable (Double) async -> Void = { seconds in
              try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
          }) {
@@ -145,6 +159,7 @@ final class UploadQueue: ObservableObject {
         self.maxConcurrent = max(1, maxConcurrent)
         self.maxAttempts = max(1, maxAttempts)
         self.persistence = persistence
+        self.checkpointCleaner = checkpointCleaner
         self.sleeper = sleeper
     }
 
@@ -153,7 +168,13 @@ final class UploadQueue: ObservableObject {
     var activeCount: Int { items.filter { !$0.state.isFinished }.count }
     var failedCount: Int { items.filter { if case .failed = $0.state { return true }; return false }.count }
     var isIdle: Bool { activeCount == 0 }
-    var pauseReason: String? { haltReason ?? networkPauseReason ?? systemPauseReason }
+    var pauseReason: String? {
+        haltReason
+            ?? (isUserPaused ? "Paused by you; uploads already in progress will finish" : nil)
+            ?? networkPauseReason
+            ?? systemPauseReason
+    }
+    var retainedStagingURLs: Set<URL> { Set(items.compactMap { $0.checkpoint?.fileURL }) }
     var overallFraction: Double {
         let tracked = items.filter { !$0.state.isFinished || $0.state == .done || $0.state == .alreadyBackedUp }
         guard !tracked.isEmpty else { return 0 }
@@ -167,7 +188,10 @@ final class UploadQueue: ObservableObject {
         var accepted: [UploadItem] = []
         var trackedKeys = completedSourceKeys.union(items.compactMap { item -> String? in
             switch item.state {
-            case .failed, .cancelled: return nil
+            // A failed row is already the durable retry handle for its source.
+            // Automatic rescans must not append another identical failed row on
+            // every background window; the Activity UI can retry that row.
+            case .cancelled: return nil
             default: return item.source.queueDeduplicationKey
             }
         })
@@ -204,12 +228,29 @@ final class UploadQueue: ObservableObject {
             items[index].state = .cancelled
             userCancelled.remove(id)
             requeueCancelled.remove(id)
+            cleanCheckpoint(for: index)
             persist()
         }
     }
 
     func cancelAll() {
+        isUserPaused = false
         for item in items where !item.state.isFinished { cancel(item.id) }
+        persist()
+    }
+
+    /// Stop scheduling new work without throwing away queue state or staged files.
+    func pauseAfterCurrentUploads() {
+        guard activeCount > 0, !isUserPaused else { return }
+        isUserPaused = true
+        persist()
+    }
+
+    func resumeUserPausedUploads() {
+        guard isUserPaused else { return }
+        isUserPaused = false
+        persist()
+        pump()
     }
 
     func retry(_ id: UUID) {
@@ -237,28 +278,46 @@ final class UploadQueue: ObservableObject {
         let normalized = next.flatMap { $0.isEmpty ? nil : $0 }
         guard normalized != accountIdentifier else { return }
 
-        if accountIdentifier != nil { persist() }
-        cancelRunningForRequeue()
+        if accountIdentifier != nil {
+            persist()
+            for index in items.indices { cleanCheckpoint(for: index) }
+            for task in running.values { task.cancel() }
+        }
         accountIdentifier = normalized
         items = []
         completedSourceKeys = []
+        completionLedgerHealthy = true
         haltReason = nil
         systemPauseReason = nil
+        isUserPaused = false
         persistenceWarning = nil
 
         guard let normalized, let persistence else { return }
         do {
+            let ledgerKeys = try persistence.loadCompletedSourceKeys(for: normalized)
             guard let snapshot = try persistence.load(),
                   snapshot.version == UploadQueueSnapshot.version,
                   snapshot.accountIdentifier == normalized else {
+                completedSourceKeys = Set(ledgerKeys)
                 persist()
                 return
             }
+            if persistence.storesCompletionLedgerSeparately {
+                for key in snapshot.completedSourceKeys {
+                    do { try persistence.recordCompletedSourceKey(key, for: normalized) }
+                    catch { completionLedgerHealthy = false }
+                }
+            }
             completedSourceKeys = Set(snapshot.completedSourceKeys)
-            items = snapshot.items.map { stored in
+            completedSourceKeys.formUnion(ledgerKeys)
+            isUserPaused = snapshot.isUserPaused ?? false
+            items = snapshot.items.compactMap { stored in
+                if let key = stored.source.mediaSource.queueDeduplicationKey,
+                   completedSourceKeys.contains(key) { return nil }
                 var item = UploadItem(id: stored.id, source: stored.source.mediaSource, name: stored.name)
                 item.byteCount = stored.byteCount
                 item.attempts = stored.attempts
+                item.checkpoint = stored.checkpoint
                 if let reason = stored.failureReason {
                     item.state = .failed(reason: reason, retryable: stored.failureRetryable)
                 } else {
@@ -266,6 +325,8 @@ final class UploadQueue: ObservableObject {
                 }
                 return item
             }
+            if persistence.storesCompletionLedgerSeparately,
+               !snapshot.completedSourceKeys.isEmpty { persist() }
             pump()
         } catch {
             persistenceWarning = "The saved upload queue could not be restored: \(error.localizedDescription)"
@@ -298,9 +359,36 @@ final class UploadQueue: ObservableObject {
     }
 
     func resumeSystemWork() {
-        guard systemPauseReason != nil else { return }
+        drainsBackgroundCompletionsOnly = false
         systemPauseReason = nil
         pump()
+    }
+
+    /// A background-URLSession wake is for consuming transfer results, not for
+    /// starting a fresh library export. Set this before queue restoration.
+    func resumeBackgroundTransferCompletions() {
+        drainsBackgroundCompletionsOnly = true
+        systemPauseReason = nil
+        pump()
+    }
+
+    func finishBackgroundTransferCompletions() {
+        drainsBackgroundCompletionsOnly = false
+        suspendForBackgroundExpiration()
+    }
+
+    func setICloudDownloadsAllowed(_ allowed: Bool) {
+        guard options.allowsICloudDownload != allowed else { return }
+        options.allowsICloudDownload = allowed
+        if allowed {
+            for index in items.indices where items[index].state == .waitingForICloud {
+                items[index].state = .queued
+            }
+            persist()
+            pump()
+        } else {
+            cancelRunningForRequeue()
+        }
     }
 
     /// Wait for all unfinished queue work. Cancellation is how a background
@@ -309,16 +397,41 @@ final class UploadQueue: ObservableObject {
         while !isIdle {
             if Task.isCancelled { return false }
             if networkPauseReason != nil || systemPauseReason != nil { return false }
+            if isUserPaused && running.isEmpty { return false }
+            if running.isEmpty && items.allSatisfy({ $0.state.isFinished || $0.state == .waitingForICloud }) {
+                return haltReason == nil
+            }
             try? await Task.sleep(nanoseconds: 200_000_000)
         }
         return haltReason == nil
     }
 
+    /// Used by the app delegate relaunch path. Do not hold iOS's completion
+    /// handler for unrelated queued work; only wait until received PUT results
+    /// have either committed or been durably retained.
+    func waitUntilBackgroundTransfersHandled() async {
+        let deadline = Date().addingTimeInterval(20)
+        while Date() < deadline, items.contains(where: { item in
+            guard let prepared = item.checkpoint?.prepared else { return false }
+            return prepared.receipt != nil || (running[item.id] != nil && item.state.isWorking)
+        }) {
+            if networkPauseReason != nil || systemPauseReason != nil { return }
+            if Task.isCancelled { return }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+    }
+
     // MARK: - Scheduling
 
     private func pump() {
-        guard pauseReason == nil else { return }
-        while running.count < maxConcurrent, let index = items.firstIndex(where: { $0.state == .queued }) {
+        guard haltReason == nil, networkPauseReason == nil, systemPauseReason == nil else { return }
+        while running.count < maxConcurrent, let index = items.firstIndex(where: {
+            guard $0.state == .queued else { return false }
+            let ownsBackgroundTransfer = $0.checkpoint?.isBackgroundTransfer == true
+            if drainsBackgroundCompletionsOnly { return ownsBackgroundTransfer }
+            if isUserPaused { return ownsBackgroundTransfer }
+            return true
+        }) {
             start(items[index].id)
         }
     }
@@ -328,20 +441,17 @@ final class UploadQueue: ObservableObject {
         items[index].state = .exporting
         items[index].attempts += 1
         let source = items[index].source
+        let checkpoint = items[index].checkpoint
         let options = self.options
         let worker = self.worker
         running[id] = Task { [weak self] in
-            var sink: AsyncStream<UploadEvent>.Continuation!
-            let stream = AsyncStream<UploadEvent> { sink = $0 }
-            let events = sink!
-            let drain = Task { @MainActor [weak self] in
-                for await event in stream { self?.apply(event, to: id) }
-            }
             let outcome: Result<UploadOutcome, Error>
-            do { outcome = .success(try await worker(source, options, { events.yield($0) })) }
+            do {
+                outcome = .success(try await worker(id, source, checkpoint, options) { [weak self] event in
+                    await self?.apply(event, to: id)
+                })
+            }
             catch { outcome = .failure(error) }
-            events.finish()
-            await drain.value
             self?.finish(id, outcome)
         }
     }
@@ -355,6 +465,9 @@ final class UploadQueue: ObservableObject {
         case .state(let state):
             guard !items[index].state.isFinished else { return }
             items[index].state = state
+        case .checkpoint(let checkpoint):
+            items[index].checkpoint = checkpoint
+            persist()
         }
     }
 
@@ -367,15 +480,26 @@ final class UploadQueue: ObservableObject {
             items[index].mediaKey = result.mediaKey
             items[index].state = { if case .alreadyBackedUp = result { return .alreadyBackedUp } else { return .done } }()
             if let key = items[index].source.queueDeduplicationKey { completedSourceKeys.insert(key) }
+            items[index].checkpoint = nil
+            recordCompletion(for: items[index])
             persist()
         case .failure(let error):
             if userCancelled.remove(id) != nil {
-                requeueCancelled.remove(id); items[index].state = .cancelled; persist(); return
+                requeueCancelled.remove(id); items[index].state = .cancelled
+                cleanCheckpoint(for: index); persist(); return
             }
             // Policy, credential and background-expiration pauses all cancel
             // in-flight work for requeue. A later pump restarts it unchanged.
             if requeueCancelled.remove(id) != nil { items[index].state = .queued; persist(); return }
-            if error is CancellationError { items[index].state = .cancelled; persist(); return }
+            if error is CancellationError {
+                items[index].state = .cancelled; cleanCheckpoint(for: index); persist(); return
+            }
+            if error as? MediaExporter.Failure == .iCloudDownloadRequired {
+                items[index].attempts = max(0, items[index].attempts - 1)
+                items[index].state = .waitingForICloud
+                persist()
+                return
+            }
             let gpmc = error as? GPMCError
             let reason = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             if let gpmc, gpmc.kind == .credentialRejected || gpmc.kind == .tokenBound {
@@ -392,6 +516,7 @@ final class UploadQueue: ObservableObject {
                 scheduleRetry(id, after: min(30, pow(2, Double(attempt))))
             } else {
                 items[index].state = .failed(reason: reason, retryable: retryable)
+                cleanCheckpoint(for: index)
                 persist()
             }
         }
@@ -406,6 +531,10 @@ final class UploadQueue: ObservableObject {
 
     private func cancelRunningForRequeue() {
         for (id, task) in running {
+            if let index = items.firstIndex(where: { $0.id == id }),
+               items[index].checkpoint?.isBackgroundTransfer == true {
+                continue
+            }
             requeueCancelled.insert(id)
             task.cancel()
         }
@@ -425,34 +554,60 @@ final class UploadQueue: ObservableObject {
     }
 
     private func persist() {
+        if activeCount == 0 { isUserPaused = false }
         guard let accountIdentifier, let persistence else { return }
         let storedItems = items.compactMap { item -> PersistedUploadItem? in
-            guard let source = PersistedMediaSource(item.source) else { return nil }
+            guard let source = PersistedMediaSource(item.source)
+                    ?? item.checkpoint.map({ .file($0.filePath) }) else { return nil }
             switch item.state {
             case .alreadyBackedUp, .done, .cancelled:
                 return nil
             case .failed(let reason, let retryable):
                 return PersistedUploadItem(id: item.id, source: source, name: item.name,
                                            byteCount: item.byteCount, attempts: item.attempts,
-                                           failureReason: reason, failureRetryable: retryable)
+                                           failureReason: reason, failureRetryable: retryable,
+                                           checkpoint: item.checkpoint)
             default:
                 // Working and retry-delay states intentionally restore queued.
                 return PersistedUploadItem(id: item.id, source: source, name: item.name,
                                            byteCount: item.byteCount, attempts: item.attempts,
-                                           failureReason: nil, failureRetryable: false)
+                                           failureReason: nil, failureRetryable: false,
+                                           checkpoint: item.checkpoint)
             }
         }
         let snapshot = UploadQueueSnapshot(
             version: UploadQueueSnapshot.version,
             accountIdentifier: accountIdentifier,
             items: storedItems,
-            completedSourceKeys: completedSourceKeys.sorted()
+            completedSourceKeys: persistence.storesCompletionLedgerSeparately && completionLedgerHealthy
+                ? [] : Array(completedSourceKeys),
+            isUserPaused: isUserPaused
         )
         do {
             try persistence.save(snapshot)
-            persistenceWarning = nil
+            if completionLedgerHealthy { persistenceWarning = nil }
         } catch {
             persistenceWarning = "Upload progress could not be saved: \(error.localizedDescription)"
         }
+    }
+
+    private func recordCompletion(for item: UploadItem) {
+        guard let accountIdentifier, let persistence,
+              let key = item.source.queueDeduplicationKey,
+              persistence.storesCompletionLedgerSeparately else { return }
+        do {
+            try persistence.recordCompletedSourceKey(key, for: accountIdentifier)
+        } catch {
+            completionLedgerHealthy = false
+            persistenceWarning = "Upload completion could not be saved: \(error.localizedDescription)"
+        }
+    }
+
+    private func cleanCheckpoint(for index: Int) {
+        guard let checkpoint = items[index].checkpoint else { return }
+        let id = items[index].id
+        items[index].checkpoint = nil
+        guard let checkpointCleaner else { return }
+        Task { await checkpointCleaner(id, checkpoint) }
     }
 }
