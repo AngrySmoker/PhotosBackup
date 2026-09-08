@@ -123,6 +123,19 @@ tool re-signs it with the Apple ID configured on the device.
 Prebuilt unsigned IPAs are attached to each
 [GitHub release](https://github.com/g8row/PhotosBackup/releases).
 
+> [!TIP]
+> On your iPhone (with SideStore or AltStore installed), one-tap install of
+> the latest release:
+>
+> - [Install with SideStore](sidestore://install?url=https://github.com/g8row/PhotosBackup/releases/latest/download/PhotosBackup.ipa)
+> - [Install with AltStore](altstore://install?url=https://github.com/g8row/PhotosBackup/releases/latest/download/PhotosBackup.ipa)
+>
+> These links use the
+> [SideStore](https://docs.sidestore.io/docs/advanced/url-schema) and
+> [AltStore](https://noah978.gitbook.io/altstore-docs/url-schemes) install URL
+> schemes and do nothing on a Mac or PC — open this page on the iPhone, or
+> AirDrop the IPA and install from Files instead.
+
 - AirDrop `PhotosBackup.ipa` to the iPhone and save it in Files.
 - Turn on LocalDevVPN.
 - In SideStore, tap +, choose `PhotosBackup.ipa`, and install it.
