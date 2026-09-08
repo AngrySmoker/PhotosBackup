@@ -144,7 +144,7 @@ struct DashboardView: View {
                 }
             }
             if selectedAlbums.isEmpty {
-                Text("No albums selected yet. Choose albums from the Folders tab.")
+                Text("No albums selected yet. Choose albums from the Albums tab.")
                     .font(.subheadline).foregroundStyle(.secondary)
             } else {
                 ForEach(Array(selectedAlbums.prefix(4).enumerated()), id: \.element.id) { index, album in

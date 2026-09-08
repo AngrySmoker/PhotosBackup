@@ -202,7 +202,7 @@ struct OnboardingView: View {
             VStack(spacing: 7) {
                 Text("CHOOSE ALBUMS").font(.caption.weight(.bold)).tracking(1.2).foregroundStyle(BackupTheme.blue)
                 Text("What should we back up?").font(.largeTitle.bold()).multilineTextAlignment(.center)
-                Text("You can change this anytime in Folders.")
+                Text("You can change this anytime in Albums.")
                     .font(.body).foregroundStyle(.secondary)
             }
             .padding(.horizontal, 24)
@@ -355,7 +355,7 @@ struct OnboardingView: View {
     private var completionMessage: String {
         let count = preferences.selectedAlbumIDs.count
         return count == 0
-            ? "Your account is connected. You can choose albums from the Folders tab."
+            ? "Your account is connected. You can choose albums from the Albums tab."
             : "Your account is connected, and we’ll keep \(count) selected \(count == 1 ? "album" : "albums") protected."
     }
 

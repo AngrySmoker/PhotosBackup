@@ -43,7 +43,7 @@ private struct MainAppView: View {
                 .tag(0)
 
             FolderSelectionView()
-                .tabItem { Label("Folders", systemImage: "rectangle.stack.fill") }
+                .tabItem { Label("Albums", systemImage: "rectangle.stack.fill") }
                 .tag(1)
 
             UploadsView()

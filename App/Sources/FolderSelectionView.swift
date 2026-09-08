@@ -29,7 +29,7 @@ struct FolderSelectionView: View {
                 }
             }
             .background(BackupTheme.background)
-            .navigationTitle("Folders")
+            .navigationTitle("Albums")
             .searchable(text: $searchText, prompt: "Search albums")
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
