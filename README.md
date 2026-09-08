@@ -42,9 +42,27 @@ an unbound master token and Photos credential, and an authenticated
 The Xcode project, app target, and scheme are named `PhotosBackup`; the
 user-facing app is named **Photos Backup**.
 
+Latest release: **0.0.2** ([releases](https://github.com/g8row/PhotosBackup/releases)).
+75 offline unit tests pass (2 live tests skipped) on iPhone 16 Pro simulator.
+
+### App identity (since 0.0.2)
+
+| Piece | Value |
+| --- | --- |
+| App bundle ID | `com.g8row.photosbackup` |
+| Extension bundle ID | `com.g8row.photosbackup.extension` |
+| App Group | `group.com.g8row.photosbackup` |
+| URL-scheme handoff | `photosbackup://` |
+| Background task | `com.g8row.photosbackup.background-backup` |
+
+> [!IMPORTANT]
+> The bundle ID and Keychain service changed in 0.0.2. After updating from an
+> older build, reconnect the Google account once, then force-quit and reopen
+> to confirm it stays connected.
+
 ## Requirements
 
-- macOS with Xcode and an installed iOS Simulator runtime
+- macOS with Xcode 16.4 and an installed iOS Simulator runtime
 - [XcodeGen](https://github.com/yonaskolb/XcodeGen) 2.40 or newer
 - iOS 16.0 or newer
 - A Google account for the live connection flow
@@ -87,11 +105,32 @@ The repository includes a packaging script for SideStore/AltStore-style
 sideloading:
 
 ```sh
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer ./Scripts/make-ipa.sh
+./Scripts/make-ipa.sh
+```
+
+The script defaults to `DEVELOPER_DIR=/Applications/Xcode-16.4.0.app/Contents/Developer`.
+Override it only if Xcode lives elsewhere:
+
+```sh
+DEVELOPER_DIR=/path/to/Xcode.app/Contents/Developer ./Scripts/make-ipa.sh
 ```
 
 The unsigned package is written to `build/PhotosBackup.ipa`. The sideloading
 tool re-signs it with the Apple ID configured on the device.
+
+## Install via SideStore
+
+Prebuilt unsigned IPAs are attached to each
+[GitHub release](https://github.com/g8row/PhotosBackup/releases).
+
+- AirDrop `PhotosBackup.ipa` to the iPhone and save it in Files.
+- Turn on LocalDevVPN.
+- In SideStore, tap +, choose `PhotosBackup.ipa`, and install it.
+- If asked whether to retain app extensions, keep Photos Backup Connect.
+- After updating across the 0.0.2 bundle-ID change, reconnect the Google
+  account once.
+- If needed, re-enable the extension under Settings → Apps → Safari →
+  Extensions → Photos Backup Connect and allow `accounts.google.com`.
 
 ## Connect a Google account
 
@@ -193,6 +232,9 @@ Never commit tokens or captured account credentials.
 
 ```text
 App/Sources/                  SwiftUI app, onboarding, account, and upload queue
+App/Sources/AutomaticBackupCoordinator.swift  BGProcessingTask scheduling
+App/Sources/NetworkPolicy.swift               Wi-Fi-only / cellular enforcement
+App/Sources/UploadQueuePersistence.swift      Durable account-scoped queue
 App/Resources/                Info.plist and app icon assets
 Extension/Sources/            Native Safari extension handler
 Extension/WebResources/       WebExtension manifest, scripts, popup, and icons
