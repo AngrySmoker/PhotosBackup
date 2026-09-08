@@ -74,7 +74,7 @@ TEST_RUNNER_GPMC_LIVE=1 TEST_RUNNER_GPMC_OAUTH_TOKEN=oauth_XXXX xcodebuild ... t
 | 6 | App ingests the token, single use | **PASS** | Live: `token length 80; source cleared after read`. |
 | 7 | Exchange `oauth_token` → master token | **PASS** | Live, on a fresh token: master token issued for `alexguroov@gmail.com`, androidId `636428d840be3e65`. |
 | 8 | Exchange master token → Photos access token | **PASS** | Access token issued, expires in 16 hr. **No `TokenEncrypted=1`** — this account's credential is unbound, so token binding does not need porting for it. |
-| 9 | Read-only Photos request succeeds | **FIXED, AWAITING RETEST** | First live run returned HTTP 400 — the port sent the `x-goog-ext-*-bin` headers on the hash lookup, which upstream sends only on commit/album calls. Fixed and covered by a regression test; needs one more fresh token to confirm green. |
+| 9 | Read-only Photos request succeeds | **FIXED, AWAITING RETEST** | Two live runs returned HTTP 400. Real cause: `request()` stopped assigning `httpBody`, so every protobuf RPC posted an empty body. Fixed, with a regression test that reads the outgoing body. Needs one fresh token to confirm green. |
 
 ## Test log
 
@@ -191,23 +191,61 @@ was confirmed to fail against the old behaviour before being kept.
 
 **Still to confirm:** step 9 green on a fresh token.
 
+### 2026-09-08 — attempt 4 (step 9 still 400; real cause found)
+
+Steps 1-8 green again on a fresh token (androidId `09397f559fa298da`, access
+token 17 hr). Step 9 still **HTTP 400**, so the attempt-3 header change was not
+the cause.
+
+Checked the request against gotohp @ 0637c745 field by field before touching
+anything else. The message body is byte-identical to `generated/HashCheck.pb.go`
+(`HashCheck{field1{field1{sha1Hash}, field2{}}}`); the credential pairs, the
+`oauth2:openid …/photos.native` scope, `lang=en_US` and the derived User-Agent
+all match upstream exactly. Nothing in the protocol was wrong.
+
+**Real cause: the request body was never sent.** When `GPMCClient.request()` was
+refactored to route through a shared `send(_:file:delegate:)` helper, the
+`request.httpBody = body` assignment was dropped — the original had it inline in
+the non-file branch. Every protobuf RPC was posting `Content-Type:
+application/x-protobuf` with **zero bytes**, which Google answers with 400. The
+compiler said nothing: `body` still looked used, because the re-auth retry path
+passes it along.
+
+This affected every RPC, not just the probe: the duplicate check and the commit
+call in `upload()` were equally empty.
+
+**Fixed**, and covered by `testRpcActuallySendsItsProtobufBody`, which drains
+`httpBodyStream` (URLProtocol never sees `httpBody`) and was confirmed to fail
+against the broken build.
+
+Two diagnostics added so the next wire-format bug is not another guessing round:
+
+- Non-2xx errors now quote Google's response body (`GPMCClient.explanation`) —
+  printable bodies verbatim, protobuf ones as a hex prefix. Previously the body
+  was discarded and only the status code survived.
+- **Re-run read-only check** in the app repeats step 9 against the credential
+  already held in memory. The Photos access token lasts ~17 hours while an
+  `oauth_token` is single-use, so iterating no longer costs an interactive
+  sign-in each time.
+
 ## Manual test script (next run — confirm step 9)
 
-Steps 1-8 are settled. Only step 9 is open, and the fix for it is untested
-against the live endpoint.
+Steps 1-8 are settled. Only step 9 is open.
+
+Because the app now keeps the exchange result in memory, this no longer needs a
+sign-in **if the app has not been relaunched since the last exchange**: just tap
+**Re-run read-only check**.
+
+Otherwise, one fresh token:
 
 1. Rebuild + reinstall (commands above), launch `GPMCAuthProbe`.
-2. Tap **Open Google EmbeddedSetup in Safari**. EmbeddedSetup always starts a
-   full add-account sign-in — an existing Safari session is not reused, so the
-   account password is required here.
-3. Sign in and tap **I agree**. The page then hangs on a spinner; expected.
-4. **GPMC Connect** popup → **Connect account**, **once**. Accept the
-   `gpmcprobe://` dialog once; **cancel** any second one — accepting it
-   re-ingests a spent token and paints step 7 red for no reason.
-5. Return to the app. Step 9 should now be green. If it is still 400, capture
-   the response body before changing anything: the remaining suspects are the
-   `Accept-Encoding: gzip` header (upstream sets it explicitly; URLSession
-   manages its own) and the all-zero dummy hash.
+2. **Open Google EmbeddedSetup in Safari** → sign in → **I agree**. The page
+   then hangs on a spinner; expected.
+3. **GPMC Connect** popup → **Connect account**, **once**. Accept the
+   `gpmcprobe://` dialog once; **cancel** any second one.
+4. Step 9 should be green. If it is not, the failure text now carries Google's
+   own explanation — capture that line verbatim before changing anything, and
+   use **Re-run read-only check** to iterate without burning another sign-in.
 
 ## If the route is confirmed dead
 

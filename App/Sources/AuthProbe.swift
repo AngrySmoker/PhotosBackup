@@ -10,6 +10,10 @@ final class AuthProbe: ObservableObject {
     /// Called with a usable exchange result so the Photos side can adopt the
     /// credential. Set by the app entry point.
     var onExchange: ((TokenExchange.Result) async -> Void)?
+    /// Held in memory only, for the life of the process. A fresh oauth_token
+    /// costs a full interactive sign-in, so while the Photos wire format is
+    /// being debugged step 9 has to be repeatable against the same credential.
+    @Published private(set) var lastResult: TokenExchange.Result?
 
     init(log: ProbeLog) {
         self.log = log
@@ -64,8 +68,22 @@ final class AuthProbe: ObservableObject {
             return
         }
 
+        lastResult = result
         await onExchange?(result)
+        await checkReadAccess(result)
+    }
 
+    /// Re-run step 9 against the credential from the last exchange. The Photos
+    /// access token outlives the single-use oauth_token by many hours, so this
+    /// is the cheap way to iterate on the read path.
+    func rerunReadAccess() async {
+        guard let result = lastResult, !running else { return }
+        running = true
+        defer { running = false }
+        await checkReadAccess(result)
+    }
+
+    private func checkReadAccess(_ result: TokenExchange.Result) async {
         log.set(ProbeLog.readAccess, .running)
         do {
             let client = try GPMCClient(authData: result.authData)

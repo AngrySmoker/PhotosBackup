@@ -63,6 +63,44 @@ final class GPMCClientTests: XCTestCase {
         XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/x-protobuf")
     }
 
+    /// A refactor once routed every request through a shared `send` helper and
+    /// dropped `httpBody` on the way, so each protobuf RPC posted an empty body
+    /// and Google answered 400. Nothing caught it: `body` still looked used
+    /// because the re-auth retry passes it along. Assert the bytes go out.
+    func testRpcActuallySendsItsProtobufBody() async throws {
+        StubProtocol.handler = { request in
+            if request.url?.host == "android.googleapis.com" {
+                return .text("Auth=ya29.token\nExpiry=\(Self.farFuture)\n")
+            }
+            return .ok(Data())
+        }
+        let client = try GPMCClient(authData: Self.credential, session: StubProtocol.session())
+        _ = try? await client.validateReadAccess()
+
+        let lookup = StubProtocol.seen.first { $0.url?.absoluteString.hasSuffix("5084965799730810217") == true }
+        let request = try XCTUnwrap(lookup, "the hash lookup was never sent")
+        let sent = Self.body(of: request)
+        XCTAssertFalse(sent.isEmpty, "the hash lookup posted an empty body")
+        // HashCheck { field1 { field1 { sha1Hash } , field2 {} } } — the 20-byte
+        // hash has to appear inside it.
+        XCTAssertTrue(sent.count >= 20)
+    }
+
+    /// URLProtocol sees a streamed body, not `httpBody`, so read whichever is set.
+    static func body(of request: URLRequest) -> Data {
+        if let body = request.httpBody { return body }
+        guard let stream = request.httpBodyStream else { return Data() }
+        stream.open(); defer { stream.close() }
+        var out = Data()
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        while stream.hasBytesAvailable {
+            let read = stream.read(&buffer, maxLength: buffer.count)
+            if read <= 0 { break }
+            out.append(contentsOf: buffer[0..<read])
+        }
+        return out
+    }
+
     func testRetryClassification() {
         XCTAssertTrue(GPMCError(kind: .transport, message: "x").isRetryable)
         XCTAssertTrue(GPMCError(kind: .server(503), message: "x").isRetryable)

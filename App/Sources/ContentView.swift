@@ -16,6 +16,7 @@ struct ContentView: View {
                 environmentSection
                 flowSection
                 checklistSection
+                retrySection
                 uploadsSection
                 advancedSection
             }
@@ -101,6 +102,17 @@ struct ContentView: View {
     }
 
     // MARK: - Advanced
+
+    @ViewBuilder private var retrySection: some View {
+        if probe.lastResult != nil {
+            Section {
+                Button("Re-run read-only check") { Task { await probe.rerunReadAccess() } }
+                    .disabled(probe.running)
+                Text("Reuses the credential from this session's exchange, so it does not need another sign-in.")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
+        }
+    }
 
     private var uploadsSection: some View {
         Section {

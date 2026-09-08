@@ -93,8 +93,30 @@ actor GPMCClient {
         if http.statusCode == 401 || http.statusCode == 403 {
             throw GPMCError(kind: .credentialRejected, message: "Google rejected the stored credential (HTTP \(http.statusCode)). Connect the account again.")
         }
-        guard (200..<300).contains(http.statusCode) else { throw GPMCError(kind: .server(http.statusCode), message: "Google returned HTTP \(http.statusCode). Check your connection and try again.") }
+        guard (200..<300).contains(http.statusCode) else {
+            throw GPMCError(kind: .server(http.statusCode),
+                            message: "Google returned HTTP \(http.statusCode). Check your connection and try again."
+                                + Self.explanation(data))
+        }
         return (data, http)
+    }
+    /// Google's error bodies are the only thing that says *why* a request was
+    /// rejected, and dropping them turns every wire-format bug into a bare
+    /// status code. Printable bodies are quoted as-is; protobuf ones are shown
+    /// as a hex prefix, which is still enough to identify the failure.
+    static func explanation(_ data: Data, limit: Int = 240) -> String {
+        guard !data.isEmpty else { return "" }
+        let text = String(decoding: data, as: UTF8.self)
+        let printable = !text.isEmpty && text.unicodeScalars.allSatisfy {
+            $0 == "\n" || $0 == "\t" || ($0.value >= 0x20 && $0.value != 0x7F)
+        }
+        let detail: String
+        if printable {
+            detail = text.trimmingCharacters(in: .whitespacesAndNewlines).prefix(limit).description
+        } else {
+            detail = "0x" + data.prefix(limit / 4).map { String(format: "%02x", $0) }.joined()
+        }
+        return detail.isEmpty ? "" : " Google said: \(detail)"
     }
     private func send(_ request: URLRequest, file: URL?, delegate: URLSessionTaskDelegate?) async throws -> (Data, URLResponse) {
         try Task.checkCancellation()
@@ -152,6 +174,7 @@ actor GPMCClient {
         request.setValue("en_US", forHTTPHeaderField: "Accept-Language")
         request.setValue("application/x-protobuf", forHTTPHeaderField: "Content-Type")
         for (key, value) in headers { request.setValue(value, forHTTPHeaderField: key) }
+        if file == nil { request.httpBody = body }
         let result = try await send(request, file: file, delegate: delegate)
         // The expiry check above only covers a token that ages out between
         // calls. A token revoked elsewhere dies mid-session, so spend one forced
