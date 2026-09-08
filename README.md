@@ -29,6 +29,7 @@ without a desktop companion or hosted service.
   library assets per Google account.
 - Show per-album backup progress, and re-upload assets edited after backup.
 - Upload in original quality or request Google's Storage Saver processing.
+- Choose how many uploads run at once, from 1 to 10.
 - Enforce Wi-Fi-only or Wi-Fi-and-cellular policy at queue and request level,
   cancelling in-flight background transfers when the allowed transport is lost.
 - Request recurring iOS background-processing windows for selected-album backup.
@@ -47,8 +48,8 @@ Photos credential, and an authenticated `photosdata-pa` request succeeds.
 The Xcode project, app target, and scheme are named `PhotosBackup`; the
 user-facing app is named **Photos Backup**.
 
-Latest release: **0.3.1** ([releases](https://github.com/g8row/PhotosBackup/releases)).
-99 tests run on an iPhone simulator: 96 pass, with 2 opt-in live tests
+Latest release: **0.3.2** ([releases](https://github.com/g8row/PhotosBackup/releases)).
+102 tests run on an iPhone simulator: 99 pass, with 2 opt-in live tests
 and 1 simulator Keychain test skipped.
 
 ### App identity (since 0.0.2)
