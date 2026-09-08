@@ -18,50 +18,75 @@ const NATIVE_APP_ID = "com.g8row.photosbackup.extension";
 /// Every cookie store Safari exposes, plus `undefined` for "whatever the
 /// default is". iOS Safari hands out more than one persistent store, and a
 /// `cookies.get()` / `getAll()` call that omits `storeId` only searches the
-/// default one — which on iOS is *not* the store the browsing tabs use. That
-/// silently returns zero cookies for every site and looks exactly like a
-/// missing permission. So: always sweep every store.
+/// default one — which on iOS is *not* always the store the browsing tabs use.
+/// Observed on a real device (iOS 17): getAllCookieStores() reports 1 store,
+/// the oauth_token is visible in Safari's cookie jar, yet an exact query
+/// against only the listed store misses it. So: always sweep every listed
+/// store AND the default.
 async function cookieStoreIds() {
+  const ids = [];
   try {
     const stores = await browser.cookies.getAllCookieStores();
-    const ids = (stores || []).map((s) => s.id).filter(Boolean);
-    return ids.length ? ids : [undefined];
-  } catch (_) {
-    return [undefined];
-  }
+    for (const s of stores || []) if (s && s.id) ids.push(s.id);
+  } catch (_) {}
+  ids.push(undefined); // the default store, always
+  return [...new Set(ids)];
 }
 
 async function readOAuthToken() {
   let lastError = null;
   let sawStore = false;
-  try {
-    for (const storeId of await cookieStoreIds()) {
-      sawStore = true;
-      const query = { url: COOKIE_URL, name: COOKIE_NAME };
-      if (storeId !== undefined) query.storeId = storeId;
-      let cookie = null;
-      try {
-        cookie = await browser.cookies.get(query);
-      } catch (err) {
-        lastError = err;
-        continue;
-      }
-      if (cookie && cookie.value) {
+  const stores = await cookieStoreIds();
+  // Fast path: exact url + name per store.
+  for (const storeId of stores) {
+    sawStore = true;
+    const query = { url: COOKIE_URL, name: COOKIE_NAME };
+    if (storeId !== undefined) query.storeId = storeId;
+    let cookie = null;
+    try {
+      cookie = await browser.cookies.get(query);
+    } catch (err) {
+      lastError = err;
+      continue;
+    }
+    if (cookie && cookie.value) {
+      return {
+        ok: true,
+        value: cookie.value,
+        domain: cookie.domain,
+        storeId: storeId || null,
+        secure: cookie.secure,
+        httpOnly: cookie.httpOnly,
+        session: cookie.session,
+        expirationDate: cookie.expirationDate || null,
+      };
+    }
+  }
+  // Fallback: domain-wide listing per store, matched by name in JS. Catches
+  // host-only vs domain-cookie scoping differences the exact query can miss.
+  for (const storeId of stores) {
+    const q = { domain: "accounts.google.com" };
+    if (storeId !== undefined) q.storeId = storeId;
+    try {
+      const all = await browser.cookies.getAll(q);
+      const hit = (all || []).find((c) => c && c.name === COOKIE_NAME && c.value);
+      if (hit) {
         return {
           ok: true,
-          value: cookie.value,
-          domain: cookie.domain,
+          value: hit.value,
+          domain: hit.domain,
           storeId: storeId || null,
-          secure: cookie.secure,
-          httpOnly: cookie.httpOnly,
-          session: cookie.session,
-          expirationDate: cookie.expirationDate || null,
+          secure: hit.secure,
+          httpOnly: hit.httpOnly,
+          session: hit.session,
+          expirationDate: hit.expirationDate || null,
+          via: "domain-fallback",
         };
       }
+    } catch (err) {
+      lastError = err;
+      continue;
     }
-  } catch (err) {
-    // Most commonly: host permission for accounts.google.com not granted yet.
-    return { ok: false, reason: "cookies-api-error", detail: String(err) };
   }
   if (lastError && !sawStore) {
     return { ok: false, reason: "cookies-api-error", detail: String(lastError) };
