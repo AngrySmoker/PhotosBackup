@@ -127,14 +127,13 @@ Prebuilt unsigned IPAs are attached to each
 > On your iPhone (with SideStore or AltStore installed), one-tap install of
 > the latest release:
 >
-> - [Install with SideStore](sidestore://install?url=https://github.com/g8row/PhotosBackup/releases/latest/download/PhotosBackup.ipa)
-> - [Install with AltStore](altstore://install?url=https://github.com/g8row/PhotosBackup/releases/latest/download/PhotosBackup.ipa)
+> - **[Install Photos Backup](https://g8row.github.io/PhotosBackup/install.html)** —
+>   open on the iPhone and tap Install with SideStore / AltStore.
 >
-> These links use the
-> [SideStore](https://docs.sidestore.io/docs/advanced/url-schema) and
-> [AltStore](https://noah978.gitbook.io/altstore-docs/url-schemes) install URL
-> schemes and do nothing on a Mac or PC — open this page on the iPhone, or
-> AirDrop the IPA and install from Files instead.
+> GitHub strips custom `sidestore://` / `altstore://` URL schemes in markdown,
+> so the buttons live on that page instead of directly in this README. It
+> installs
+> `https://github.com/g8row/PhotosBackup/releases/latest/download/PhotosBackup.ipa`.
 
 - AirDrop `PhotosBackup.ipa` to the iPhone and save it in Files.
 - Turn on LocalDevVPN.
