@@ -28,7 +28,8 @@ Concrete parameters:
 |---|---|---|
 | Minimum iOS | 16.0 | Safari web extensions with MV3 + `browser.cookies`; `NavigationStack`. Revisit to 17 only if a needed API forces it. |
 | Auth route | Safari extension → `oauth_token` → gotohp exchange | Only route that keeps full GPMC functionality *and* can run on-device. Public Photos API scopes are not equivalent and are a separate product decision. |
-| Handoff (extension → app) | App Group container, single-use, file-protected | Shared process-less channel; `gpmcprobe://` URL handoff exists **only** as a probe fallback for unsigned builds and must not ship. |
+| Handoff (extension → app) | App Group when the signing team can provision it, `gpmcprobe://` URL otherwise | Both are implemented and selected at runtime. **Superseded 2026-09-08** — the original "URL handoff must not ship" no longer holds; see Distribution below. |
+| Distribution | Unsigned `.ipa`, sideloaded with SideStore (`Scripts/make-ipa.sh`) | No App Store review, no paid membership required. SideStore re-signs on device with the user's Apple ID. |
 | Upstream refs | GPMC `94b1b267…` for protocol; gotohp `0637c745…` for auth + protocol fixes | Preserve MIT notices from both. |
 | First-release scope | Account connect + explicit photo/video upload + activity queue. Live Photos, background transfer hardening, Android-credential import (incl. token binding) are follow-ups. | Keep the first release provable end to end. |
 
@@ -58,10 +59,43 @@ A team is still required to **ship**: the App Group handoff and the Keychain bot
 need one. Without it the credential cannot be persisted, so a connected account
 is session-only — surfaced as a warning, not a rejection.
 
+## Distribution: SideStore sideload (2026-09-08)
+
+Target is an unsigned `.ipa` that SideStore re-signs on device. That choice has
+teeth, because a **free personal team cannot provision App Groups** — the
+capability is restricted to paid Apple Developer Program membership, along with
+push, iCloud, associated domains and Sign in with Apple.
+
+Consequences, in descending order of how much they hurt:
+
+1. **The `gpmcprobe://` URL handoff becomes the shipping channel**, not a probe
+   fallback. The App Group path stays in the code and is preferred whenever the
+   entitlement provisions, so a paid-team build is unaffected.
+2. **The URL channel is weaker than the App Group one.** It carries a live,
+   single-use `oauth_token` through a custom scheme, and iOS scheme registration
+   is not exclusive: another installed app registering `gpmcprobe` could receive
+   the token. The exposure is one single-use token that the app consumes
+   immediately, but it is a real difference and is accepted deliberately for a
+   personal sideload. It should be reconsidered before any wider distribution.
+3. **A free-team build expires every 7 days** and must be refreshed. SideStore
+   automates this, but the app must tolerate being re-signed — nothing may
+   assume a stable signing identity. The Keychain record survives a refresh only
+   while the team and bundle ID are unchanged; treat "connect the account again"
+   as a normal, expected path rather than an error state.
+4. **The Safari extension needs its own App ID**, so app + extension consume two
+   of the free account's limited slots.
+5. **The Keychain works once signed at all**, free team included — the
+   entitlement gap that made the credential session-only on the simulator is not
+   a paid-membership problem.
+
+If a paid membership is available, none of 1-4 apply and the App Group path is
+the better one; the code needs no change either way.
+
 ## Consequences
 
 - The app carries a Safari web extension target and its review surface.
 - Token binding (`TokenEncrypted=1`) is explicitly detected and rejected for
   now, not silently mishandled — see `TokenExchange` and `GPMCClient`.
-- Shipping requires a real Apple Developer team for the App Group entitlement;
-  the probe documents the unsigned-simulator gap.
+- Shipping via SideStore requires only a free Apple ID, at the cost of the
+  weaker URL handoff and a 7-day refresh cycle. A paid team buys back the App
+  Group channel and a year between refreshes.

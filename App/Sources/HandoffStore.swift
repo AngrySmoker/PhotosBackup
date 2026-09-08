@@ -10,10 +10,19 @@ struct Handoff: Equatable {
 
 /// Receives the extension's handoff and enforces single use.
 ///
-/// Two inbound channels:
-///   - App Group file, written by `SafariWebExtensionHandler` (production path).
-///   - `gpmcprobe://token?value=…` URL, used only when the App Group entitlement
-///     is inert (unsigned simulator build). Probe-only; never ship this.
+/// Two inbound channels, and which one is primary depends on how the build is
+/// signed:
+///   - App Group file, written by `SafariWebExtensionHandler`. Preferred, but
+///     the entitlement needs a **paid** team — a free personal team cannot
+///     provision App Groups at all.
+///   - `gpmcprobe://token?value=…` URL. The fallback, and therefore the *only*
+///     channel on a free-account sideload (SideStore / AltStore).
+///
+/// The URL channel carries a live single-use `oauth_token` through a custom
+/// scheme, and iOS does not make scheme registration exclusive: another
+/// installed app registering `gpmcprobe` could receive it instead. That is an
+/// accepted risk for a personally sideloaded build, not a good idea for general
+/// distribution — see docs/ADR-001-auth-route.md.
 ///
 /// The token is held in memory just long enough for the exchange to run; the
 /// source (file or nothing) is cleared immediately on read.
@@ -60,7 +69,7 @@ final class HandoffStore: ObservableObject {
         return handoff
     }
 
-    /// Ingest the probe-only `gpmcprobe://token?value=…` URL.
+    /// Ingest the `gpmcprobe://token?value=…` URL handoff.
     @discardableResult
     func ingest(url: URL) -> Handoff? {
         guard url.scheme == "gpmcprobe", url.host == "token",

@@ -274,6 +274,35 @@ the full exchange (`ContentView` → `AuthProbe.runExchange`). That path plus
 Whether `TokenEncrypted=1` shows up there determines if token binding
 (`gotohp backend/tokenbinding.go`) must be ported before shipping.
 
+## Building an IPA for SideStore
+
+```sh
+./Scripts/make-ipa.sh          # -> build/GPMCAuthProbe.ipa
+```
+
+The IPA is **deliberately unsigned**. SideStore re-signs it on device with the
+user's own Apple ID and applies whatever entitlements that account can
+provision.
+
+What that means in practice, on a **free** Apple ID:
+
+- **No App Group.** The capability needs a paid membership, so the extension →
+  app handoff runs over `gpmcprobe://`. Both channels are implemented and chosen
+  at runtime, so nothing needs changing — but see ADR-001 for the security
+  tradeoff, which is real.
+- **The Keychain works.** The `errSecMissingEntitlement` seen on the simulator
+  is an unsigned-build artefact, not a paid-membership one, so the credential
+  persists and the account survives relaunches.
+- **7-day expiry.** SideStore refreshes it. Re-signing may invalidate the stored
+  credential, so reconnecting the account is a normal path, not a failure.
+- App + Safari extension are two separate App IDs, against a limited free-tier
+  allowance.
+
+After installing, the extension still has to be enabled by hand: Settings →
+Apps → Safari → Extensions → **GPMC Connect** → on, and **All Websites →
+Allow**. Enabling alone is not enough; the all-sites grant is what makes the
+cookie read work.
+
 ## Files
 
 ```

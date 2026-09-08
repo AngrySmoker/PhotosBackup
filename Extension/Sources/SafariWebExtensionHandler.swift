@@ -9,9 +9,11 @@ import os.log
 /// incoming token, drop it into the App Group as a single-use, timestamped
 /// file, and report back which channel was used.
 ///
-/// If no App Group is available (unsigned simulator build — the entitlement is
-/// inert), it returns `channel: "none"` plus the raw token so the popup can
-/// fall back to the `gpmcprobe://` URL handoff for the feasibility probe.
+/// If no App Group is available — an unsigned build, or any build signed by a
+/// free personal team, which cannot provision the entitlement — it returns
+/// `channel: "none"` plus the raw token so the popup can fall back to the
+/// `gpmcprobe://` URL handoff. On a free-account sideload that fallback is the
+/// only channel there is.
 final class SafariWebExtensionHandler: NSObject, NSExtensionRequestHandling {
 
     private static let appGroupID = "group.dev.gpmc.authprobe"
