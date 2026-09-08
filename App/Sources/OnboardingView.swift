@@ -13,10 +13,10 @@ struct OnboardingView: View {
 
     @State private var step = 0
     @State private var appeared = false
+    @State private var showingConnect = false
 
-    private let setupURL = URL(string: "https://accounts.google.com/EmbeddedSetup")!
     private let gpmcURL = URL(string: "https://github.com/xob0t/gpmc")!
-    private let pageCount = 8
+    private let pageCount = 7
 
     var body: some View {
         ZStack {
@@ -25,17 +25,26 @@ struct OnboardingView: View {
                 topBar
                 TabView(selection: $step) {
                     welcome.tag(0)
-                    enableExtension.tag(1)
-                    safariInstructions.tag(2)
-                    connectionCheck.tag(3)
-                    permission.tag(4)
-                    chooseFolders.tag(5)
-                    connectionPreference.tag(6)
-                    complete.tag(7)
+                    connectAccount.tag(1)
+                    connectionCheck.tag(2)
+                    permission.tag(3)
+                    chooseFolders.tag(4)
+                    connectionPreference.tag(5)
+                    complete.tag(6)
                 }
                 .tabViewStyle(.page(indexDisplayMode: .never))
                 .animation(.easeInOut(duration: 0.25), value: step)
             }
+        }
+        .fullScreenCover(isPresented: $showingConnect) {
+            AccountConnectView(
+                onCaptured: { token in
+                    showingConnect = false
+                    withAnimation { step = 2 }
+                    Task { await probe.ingestWebToken(token) }
+                },
+                onCancel: { showingConnect = false }
+            )
         }
         .preferredColorScheme(.light)
         .onAppear {
@@ -44,11 +53,11 @@ struct OnboardingView: View {
             albums.refresh()
         }
         .onChange(of: account.status) { status in
-            guard step == 3, status.isUsable else { return }
+            guard step == 2, status.isUsable else { return }
             advanceAfterVerifiedConnection()
         }
         .onChange(of: log.steps) { _ in
-            guard step == 3 else { return }
+            guard step == 2 else { return }
             advanceAfterVerifiedConnection()
         }
     }
@@ -129,42 +138,22 @@ struct OnboardingView: View {
         )
     }
 
-    private var enableExtension: some View {
-        tutorialPage(
-            scene: .enableExtension,
-            eyebrow: "FIRST, ENABLE THE EXTENSION",
-            title: "Turn on Photos Backup Connect",
-            message: "Go to Settings → Apps → Safari → Extensions → Photos Backup Connect. Turn it on and allow accounts.google.com.",
-            primaryTitle: "Open Settings",
-            primaryAction: openAppSettings,
-            secondaryTitle: "I’ve Enabled the Extension",
-            secondaryAction: next
-        )
-    }
-
-    private var safariInstructions: some View {
-        GeometryReader { geometry in
-            ScrollView {
-                VStack(spacing: 0) {
-                    SafariConnectionGuide().padding(.top, 18)
-                    Spacer(minLength: 20)
-                    Text("BEFORE YOU OPEN SAFARI").font(.caption.weight(.bold)).tracking(1.3).foregroundStyle(BackupTheme.blue)
-                    Text("Here’s what to do in Safari").font(.title.bold()).multilineTextAlignment(.center).padding(.top, 7)
-                    Text("Finish every step before returning. The Google page may keep spinning after you tap I agree — that’s expected.")
-                        .font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center).lineSpacing(2).padding(.top, 9)
-                    Spacer(minLength: 20)
-                    Button("Open Safari & Sign In") {
-                        withAnimation { step = 3 }
-                        openURL(setupURL)
-                    }
-                    .buttonStyle(PrimaryButtonStyle())
+    private var connectAccount: some View {
+        onboardingPage(
+            artwork: AnyView(
+                ZStack {
+                    Circle().fill(BackupTheme.blue.opacity(0.10)).frame(width: 220, height: 220)
+                    Image(systemName: "person.badge.key.fill")
+                        .font(.system(size: 74, weight: .medium))
+                        .foregroundStyle(BackupTheme.blue)
                 }
-                .padding(.horizontal, 24)
-                .padding(.bottom, 22)
-                .frame(minHeight: geometry.size.height)
-            }
-            .scrollIndicators(.hidden)
-        }
+            ),
+            eyebrow: "CONNECT YOUR ACCOUNT",
+            title: "Sign in with Google",
+            message: "Connect your Google account to back up to Google Photos. Sign-in opens in a secure in-app window — sign in, then tap I agree.",
+            primaryTitle: "Connect Google Account",
+            primaryAction: { showingConnect = true }
+        )
     }
 
     private var connectionCheck: some View {
@@ -188,12 +177,16 @@ struct OnboardingView: View {
                     Text(connectionMessage).font(.body).foregroundStyle(.secondary).multilineTextAlignment(.center).lineSpacing(3).padding(.top, 12)
                     Spacer(minLength: 28)
                     if !connectionVerified {
-                        Button(probe.running ? "Checking Connection…" : "Check Again") { checkForHandoff() }
-                            .buttonStyle(PrimaryButtonStyle()).disabled(probe.running)
-                        Button("Return to Safari") { openURL(setupURL) }
-                            .font(.headline)
-                            .frame(minHeight: 44)
-                            .padding(.top, 8)
+                        Button(probe.running ? "Verifying…" : (connectionFailed ? "Try Again" : "Check Again")) {
+                            if connectionFailed { showingConnect = true } else { checkForHandoff() }
+                        }
+                        .buttonStyle(PrimaryButtonStyle()).disabled(probe.running)
+                        if !probe.running {
+                            Button("Connect a Different Account") { showingConnect = true }
+                                .font(.headline)
+                                .frame(minHeight: 44)
+                                .padding(.top, 8)
+                        }
                     }
                 }
                 .padding(.horizontal, 24)
@@ -352,47 +345,6 @@ struct OnboardingView: View {
         }
     }
 
-    private func tutorialPage(
-        scene: SafariTutorialCard.Scene,
-        eyebrow: String,
-        title: String,
-        message: String,
-        primaryTitle: String,
-        primaryAction: @escaping () -> Void,
-        secondaryTitle: String? = nil,
-        secondaryAction: @escaping () -> Void = {},
-        isWorking: Bool = false
-    ) -> some View {
-        GeometryReader { geometry in
-            ScrollView {
-                VStack(spacing: 0) {
-                    SafariTutorialCard(scene: scene).padding(.top, 18)
-                    Spacer(minLength: 20)
-                    Text(eyebrow).font(.caption.weight(.bold)).tracking(1.3).foregroundStyle(BackupTheme.blue)
-                    Text(title).font(.title.bold()).multilineTextAlignment(.center).padding(.top, 7)
-                    Text(message).font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center).lineSpacing(2).padding(.top, 9)
-                    Spacer(minLength: 20)
-                    if isWorking {
-                        HStack { ProgressView(); Text("Connecting securely…") }
-                            .font(.headline).foregroundStyle(.secondary).frame(height: 50)
-                    } else {
-                        Button(primaryTitle, action: primaryAction).buttonStyle(PrimaryButtonStyle())
-                    }
-                    if let secondaryTitle {
-                        Button(secondaryTitle, action: secondaryAction)
-                            .font(.headline)
-                            .frame(minHeight: 44)
-                            .padding(.top, 8)
-                    }
-                }
-                .padding(.horizontal, 24)
-                .padding(.bottom, 22)
-                .frame(minHeight: geometry.size.height)
-            }
-            .scrollIndicators(.hidden)
-        }
-    }
-
     private var permissionButtonTitle: String {
         switch albums.authorization {
         case .authorized, .limited: return "Continue"
@@ -437,23 +389,23 @@ struct OnboardingView: View {
     private var connectionEyebrow: String {
         if connectionVerified { return "CONNECTION VERIFIED" }
         if connectionFailed { return "COULDN’T CONNECT" }
-        return probe.running ? "VERIFYING ACCOUNT" : "WAITING FOR SAFARI"
+        return probe.running ? "VERIFYING ACCOUNT" : "WAITING TO CONNECT"
     }
 
     private var connectionTitle: String {
         if connectionVerified { return "You’re connected" }
         if connectionFailed { return "Let’s try that again" }
-        return probe.running ? "Checking your account…" : "Finish in Safari"
+        return probe.running ? "Checking your account…" : "Finish connecting"
     }
 
     private var connectionMessage: String {
         if connectionVerified { return "Photos Backup verified your Google Photos account. You’re ready to continue." }
         if connectionFailed {
-            return "We received the sign-in, but couldn’t verify it. Return to Safari, sign in again, tap I agree, then reconnect from the extension."
+            return "We received the sign-in, but couldn’t verify it. Tap Try Again, sign in, and tap I agree."
         }
         return probe.running
-            ? "We securely received the extension handoff and are verifying your Google Photos access."
-            : "After tapping Connect to App in the extension, return here. We’ll verify everything before continuing."
+            ? "We securely captured your sign-in and are verifying your Google Photos access."
+            : "Sign in and tap I agree in the connect window. We’ll verify everything before continuing."
     }
 
     private func logState(_ id: String) -> ProbeStep.State? {
@@ -472,7 +424,7 @@ struct OnboardingView: View {
         guard connectionVerified else { return }
         Task {
             try? await Task.sleep(nanoseconds: 700_000_000)
-            if step == 3, connectionVerified { withAnimation { step = 4 } }
+            if step == 2, connectionVerified { withAnimation { step = 3 } }
         }
     }
 }

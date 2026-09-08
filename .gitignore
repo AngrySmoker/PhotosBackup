@@ -27,3 +27,6 @@ acc.txt
 
 # Per-worktree derived data (agents build in parallel).
 .dd/
+
+# Unzipped IPA payload (build output)
+Payload/

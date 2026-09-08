@@ -7,7 +7,7 @@ struct DiagnosticsView: View {
     @EnvironmentObject private var probe: AccountConnector
     @State private var manualToken = ""
     @State private var showAdvanced = false
-    private let setupURL = URL(string: "https://accounts.google.com/EmbeddedSetup")!
+    @State private var showingConnect = false
 
     var body: some View {
         List {
@@ -21,7 +21,9 @@ struct DiagnosticsView: View {
             }
 
             Section("Connection Flow") {
-                Link(destination: setupURL) { Label("Open Google EmbeddedSetup", systemImage: "safari") }
+                Button { showingConnect = true } label: {
+                    Label("Connect Google Account", systemImage: "person.badge.key")
+                }
                 if let pending = handoff.pending {
                     LabeledContent("Pending token") {
                         Text("\(String(pending.oauthToken.prefix(6)))…\(String(pending.oauthToken.suffix(4)))").monospaced()
@@ -70,5 +72,14 @@ struct DiagnosticsView: View {
         }
         .navigationTitle("Diagnostics")
         .navigationBarTitleDisplayMode(.inline)
+        .fullScreenCover(isPresented: $showingConnect) {
+            AccountConnectView(
+                onCaptured: { token in
+                    showingConnect = false
+                    Task { await probe.ingestWebToken(token) }
+                },
+                onCancel: { showingConnect = false }
+            )
+        }
     }
 }

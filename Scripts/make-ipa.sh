@@ -26,10 +26,6 @@ xcodebuild -project PhotosBackup.xcodeproj -scheme PhotosBackup \
 
 APP="$BUILD_DIR/Build/Products/$CONFIG-iphoneos/PhotosBackup.app"
 [ -d "$APP" ] || { echo "no .app at $APP" >&2; exit 1; }
-[ -d "$APP/PlugIns/PhotosBackupExtension.appex" ] \
-  || { echo "the Safari extension is missing from the bundle" >&2; exit 1; }
-[ -f "$APP/PlugIns/PhotosBackupExtension.appex/manifest.json" ] \
-  || { echo "manifest.json is not at the extension bundle root" >&2; exit 1; }
 
 STAGE="$BUILD_DIR/stage"
 mkdir -p "$STAGE/Payload" "$PWD/build"

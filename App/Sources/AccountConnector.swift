@@ -35,6 +35,19 @@ final class AccountConnector: ObservableObject {
         consume()
     }
 
+    /// Capture path for the in-app WKWebView connector: the app reads the
+    /// HttpOnly `oauth_token` straight from its own web view's cookie store, so
+    /// there is no extension, host-permission grant, or native handoff to record
+    /// — only the read and everything downstream of it. See AccountConnectView.
+    func ingestWebToken(_ token: String) async {
+        log.set(ProbeLog.extensionEnabled, .passed, "Google sign-in completed in-app")
+        log.set(ProbeLog.hostPermission, .passed, "oauth_token cookie present in the web view store")
+        log.set(ProbeLog.cookieRead, .passed, "read from the app's WKWebView cookie store (HttpOnly)")
+        log.set(ProbeLog.nativeHandoff, .passed, "captured in-process — no extension handoff")
+        log.set(ProbeLog.appIngest, .passed, "token length \(token.count); web view session discarded")
+        await runExchange(oauthToken: token)
+    }
+
     func runExchange(oauthToken: String) async {
         guard !running else { return }
         running = true

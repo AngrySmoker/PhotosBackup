@@ -99,3 +99,39 @@ the better one; the code needs no change either way.
 - Shipping via SideStore requires only a free Apple ID, at the cost of the
   weaker URL handoff and a 7-day refresh cycle. A paid team buys back the App
   Group channel and a year between refreshes.
+
+## Update 2026-09-08 — route changed to an in-app WKWebView (iOS 17 regression)
+
+**Symptom.** On **iOS 17** the Safari extension reports "no completed sign-in":
+`browser.cookies` returns only non-HttpOnly cookies, so the HttpOnly
+`oauth_token` is invisible. The route's every prior "pass" (attempts 1–5) was on
+an **iOS 18.6** simulator, where the extension `cookies` API *does* return
+HttpOnly cookies. So the capture mechanism was iOS-18-only the whole time.
+
+**Evidence (same iOS 17.2 device).** Safari's real cookie jar for
+`accounts.google.com` held `__Host-GAPS` (httpOnly), `NID` (httpOnly) and `OTZ`
+(not httpOnly). The extension's `cookies.getAll` returned **only `OTZ`** — the
+two HttpOnly cookies were filtered out. A planted non-HttpOnly cookie
+round-tripped fine, confirming the filter is specifically on HttpOnly.
+
+**Decision.** Drop the Safari web extension. Host `EmbeddedSetup` in an in-app
+`WKWebView` and read `oauth_token` from the view's own
+`WKHTTPCookieStore.getAllCookies()`, which returns HttpOnly cookies on iOS
+16/17/18 alike (the app owns the store; no extension sandbox filtering applies).
+
+**Validated on iOS 17.2**, same device that failed with the extension: a plain
+`WKWebView` with a full mobile-Safari user agent runs the real
+`EmbeddedSetupAndroid` flow (no "browser may not be secure" block), and after
+**I agree** `getAllCookies()` returned `oauth_token` (httpOnly, len 80) plus
+`user_id`. `TokenExchange` is unchanged.
+
+**Consequences.**
+- Minimum iOS returns to a clean **16.0** — no iOS-18 floor needed.
+- The `photosbackup://` URL handoff and the App Group channel are **gone**, and
+  with them the URL-scheme token-exposure risk (Distribution risk #2 above).
+- New: `AccountConnectView` (`App/Sources/AccountConnectWebView.swift`). The
+  connect step in onboarding, the Settings sheet, and Diagnostics all present it.
+- Now **vestigial**, pending removal: `Extension/` (target dropped from
+  `project.yml`), `HandoffStore`, the `photosbackup` URL type in `Info.plist`,
+  and the App Group entitlement. Left in place this pass to keep the change
+  self-contained; none is on the live path.

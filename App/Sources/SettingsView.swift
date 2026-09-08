@@ -4,9 +4,7 @@ import UIKit
 struct SettingsView: View {
     @EnvironmentObject private var account: PhotosAccount
     @EnvironmentObject private var queue: UploadQueue
-    @EnvironmentObject private var log: ProbeLog
     @EnvironmentObject private var preferences: BackupPreferences
-    @Environment(\.openURL) private var openURL
 
     let showTutorial: () -> Void
     @State private var confirmDisconnect = false
@@ -132,18 +130,11 @@ struct SettingsView: View {
 
     private var safariSection: some View {
         Section {
-            LabeledContent("Photos Backup Connect") {
-                Text(extensionStatus)
-                    .foregroundStyle(extensionReady ? Color.green : Color.orange)
-            }
-            Button("View Connection Tutorial") { showTutorial() }
-            Button("Open Settings") {
-                if let url = URL(string: UIApplication.openSettingsURLString) { openURL(url) }
-            }
+            Button("Connect Account") { showTutorial() }
         } header: {
-            Text("Safari Extension")
+            Text("Connection")
         } footer: {
-            Text("Enable it at Settings → Apps → Safari → Extensions → Photos Backup Connect. The extension securely passes your Google sign-in back to this app.")
+            Text("Sign in to Google in a secure in-app window to connect your Google Photos account.")
         }
     }
 
@@ -185,12 +176,6 @@ struct SettingsView: View {
         }
     }
 
-    private var extensionReady: Bool {
-        log.steps.first(where: { $0.id == ProbeLog.extensionEnabled })?.state == .passed
-    }
-
-    private var extensionStatus: String { extensionReady ? "Enabled" : "Not verified" }
-
     private var appVersion: String {
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "—"
         let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "—"
@@ -198,84 +183,20 @@ struct SettingsView: View {
     }
 }
 
+/// Presents the in-app Google account connection flow (see AccountConnectView)
+/// and runs the token exchange on capture. Shown as a sheet from the dashboard
+/// and Settings.
 struct ConnectionTutorialView: View {
-    @EnvironmentObject private var account: PhotosAccount
     @EnvironmentObject private var probe: AccountConnector
     @Environment(\.dismiss) private var dismiss
-    @Environment(\.openURL) private var openURL
-    @State private var step = 0
-
-    private let setupURL = URL(string: "https://accounts.google.com/EmbeddedSetup")!
 
     var body: some View {
-        NavigationStack {
-            VStack(spacing: 0) {
-                TabView(selection: $step) {
-                    tutorial(scene: .enableExtension, title: "Enable the extension first", detail: "Go to Settings → Apps → Safari → Extensions → Photos Backup Connect. Turn it on and allow accounts.google.com.", button: "Open Settings") {
-                        if let url = URL(string: UIApplication.openSettingsURLString) { openURL(url) }
-                    }.tag(0)
-                    safariGuidePage.tag(1)
-                    tutorial(scene: .connect, title: account.status.isUsable ? "You’re connected" : "Connect your account", detail: account.status.isUsable ? "Photos Backup is ready to use." : "In Safari, open the extension and tap Connect account.", button: account.status.isUsable ? "Done" : "Return to Safari") {
-                        if account.status.isUsable { dismiss() } else { openURL(setupURL) }
-                    }.tag(2)
-                }
-                .tabViewStyle(.page(indexDisplayMode: .always))
-            }
-            .background(BackupTheme.background)
-            .navigationTitle("Connect Account")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Close") { dismiss() } } }
-            .onChange(of: account.status) { if $0.isUsable { step = 2 } }
-        }
-    }
-
-    private var safariGuidePage: some View {
-        GeometryReader { geometry in
-            ScrollView {
-                VStack(spacing: 18) {
-                    Spacer(minLength: 24)
-                    SafariConnectionGuide().padding(.horizontal, 24)
-                    Text("Finish the connection in Safari").font(.title.bold()).multilineTextAlignment(.center)
-                    Text("Sign in, tap I agree, open Photos Backup Connect, then tap Connect to App.")
-                        .font(.body).foregroundStyle(.secondary).multilineTextAlignment(.center).padding(.horizontal, 30)
-                    Button("Open Safari & Sign In") {
-                        step = 2
-                        openURL(setupURL)
-                    }
-                    .buttonStyle(PrimaryButtonStyle()).padding(.horizontal, 24)
-                    Spacer(minLength: 24)
-                }
-                .padding(.bottom, 26)
-                .frame(minHeight: geometry.size.height)
-            }
-            .scrollIndicators(.hidden)
-        }
-    }
-
-    private func tutorial(scene: SafariTutorialCard.Scene, title: String, detail: String, button: String, action: @escaping () -> Void) -> some View {
-        GeometryReader { geometry in
-            ScrollView {
-                VStack(spacing: 18) {
-                    Spacer(minLength: 24)
-                    SafariTutorialCard(scene: scene)
-                    Text(title).font(.title.bold()).multilineTextAlignment(.center)
-                    Text(detail).font(.body).foregroundStyle(.secondary).multilineTextAlignment(.center).padding(.horizontal, 30)
-                    if probe.running {
-                        HStack { ProgressView(); Text("Connecting…") }.font(.headline).frame(height: 52)
-                    } else {
-                        Button(button, action: action).buttonStyle(PrimaryButtonStyle()).padding(.horizontal, 24)
-                    }
-                    if step < 2 {
-                        Button("Next") { withAnimation { step += 1 } }
-                            .font(.headline)
-                            .frame(minHeight: 44)
-                    }
-                    Spacer(minLength: 24)
-                }
-                .padding(.bottom, 26)
-                .frame(minHeight: geometry.size.height)
-            }
-            .scrollIndicators(.hidden)
-        }
+        AccountConnectView(
+            onCaptured: { token in
+                dismiss()
+                Task { await probe.ingestWebToken(token) }
+            },
+            onCancel: { dismiss() }
+        )
     }
 }

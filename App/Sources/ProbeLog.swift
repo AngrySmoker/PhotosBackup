@@ -55,11 +55,11 @@ final class ProbeLog: ObservableObject {
 
     init() {
         steps = [
-            ProbeStep(id: Self.build, title: "App + Safari extension build & launch"),
-            ProbeStep(id: Self.extensionEnabled, title: "Extension enabled in Safari settings"),
-            ProbeStep(id: Self.hostPermission, title: "Host permission granted for accounts.google.com"),
-            ProbeStep(id: Self.cookieRead, title: "Extension reads the oauth_token cookie"),
-            ProbeStep(id: Self.nativeHandoff, title: "Cookie handed to native code"),
+            ProbeStep(id: Self.build, title: "App build & launch"),
+            ProbeStep(id: Self.extensionEnabled, title: "Google sign-in completed in-app"),
+            ProbeStep(id: Self.hostPermission, title: "oauth_token cookie present"),
+            ProbeStep(id: Self.cookieRead, title: "App reads the oauth_token cookie"),
+            ProbeStep(id: Self.nativeHandoff, title: "Token captured from the web view"),
             ProbeStep(id: Self.appIngest, title: "App ingests the handed-off token (single use)"),
             ProbeStep(id: Self.masterToken, title: "Exchange oauth_token → Android master token"),
             ProbeStep(id: Self.photosToken, title: "Exchange master token → Photos access token"),
