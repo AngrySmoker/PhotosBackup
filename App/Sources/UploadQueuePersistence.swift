@@ -267,13 +267,21 @@ struct FileUploadQueuePersistence: UploadQueuePersisting {
 
 final class MemoryUploadQueuePersistence: UploadQueuePersisting {
     var snapshot: UploadQueueSnapshot?
+    /// How many whole-snapshot writes the queue has asked for. The real file
+    /// store encodes and atomically replaces the file on each one, so a bulk
+    /// command that writes per row is a main-thread stall proportional to the
+    /// square of the queue length.
+    private(set) var saveCount = 0
 
     init(snapshot: UploadQueueSnapshot? = nil) {
         self.snapshot = snapshot
     }
 
     func load() throws -> UploadQueueSnapshot? { snapshot }
-    func save(_ snapshot: UploadQueueSnapshot) throws { self.snapshot = snapshot }
+    func save(_ snapshot: UploadQueueSnapshot) throws {
+        saveCount += 1
+        self.snapshot = snapshot
+    }
 
     func recordCompletedSourceKey(_ key: String, for accountIdentifier: String) throws {
         guard let snapshot, snapshot.accountIdentifier == accountIdentifier,

@@ -265,10 +265,33 @@ final class UploadQueue: ObservableObject {
     /// resulting rows are dropped rather than kept as durable "don't retry this"
     /// markers — Stop means start over, so a later rescan must be free to pick
     /// these sources up again.
+    ///
+    /// Deliberately does not go through `cancel(_:)` row by row. That path
+    /// writes the whole snapshot for every row it touches, so stopping a
+    /// full-library queue meant thousands of encode-and-replace passes over a
+    /// file that is itself thousands of rows long — all on the main actor,
+    /// which locked the UI up for as long as it took. One pass, one write.
     func cancelAll() {
         isUserPaused = false
-        discardsCancelledRows = true
-        for item in items where !item.state.isFinished { cancel(item.id) }
+        var cancelledInFlight = false
+        for index in items.indices where !items[index].state.isFinished {
+            let id = items[index].id
+            if let task = running[id] {
+                // Settles in `finish`, which drops the row rather than keeping
+                // it, because `discardsCancelledRows` is set below.
+                userCancelled.insert(id)
+                task.cancel()
+                cancelledInFlight = true
+            } else {
+                userCancelled.remove(id)
+                requeueCancelled.remove(id)
+                items[index].state = .cancelled
+                cleanCheckpoint(for: index)
+            }
+        }
+        // Only meaningful while in-flight rows are still settling; leaving it
+        // set would silently discard the next single-row cancel as well.
+        discardsCancelledRows = cancelledInFlight
         items.removeAll { $0.state == .cancelled }
         persistNow()
     }
@@ -308,14 +331,15 @@ final class UploadQueue: ObservableObject {
     func retry(_ id: UUID) {
         guard let index = items.firstIndex(where: { $0.id == id }), items[index].state.isFinished,
               items[index].state != .done, items[index].state != .alreadyBackedUp else { return }
-        items[index].attempts = 0
-        items[index].state = .queued
+        requeue(at: index)
         persistNow()
         pump()
     }
 
+    /// Same one-pass-one-write rule as `cancelAll`: retrying row by row would
+    /// rewrite the entire snapshot once per failure.
     func retryAllFailed() {
-        for item in items { if case .failed = item.state { retry(item.id) } }
+        releaseFailures { _ in true }
     }
 
     /// Requeue failures a later attempt could plausibly fix, and report how
@@ -329,13 +353,28 @@ final class UploadQueue: ObservableObject {
     /// non-retryable (a missing asset, a refused credential) are left alone.
     @discardableResult
     func retryRetryableFailures() -> Int {
-        let retryable = items.filter { item in
-            if case .failed(_, let retryable) = item.state { return retryable }
-            return false
+        releaseFailures { $0 }
+    }
+
+    /// Requeue every failed row whose `retryable` flag the predicate accepts,
+    /// in a single pass with a single snapshot write. Returns how many moved.
+    @discardableResult
+    private func releaseFailures(_ isIncluded: (Bool) -> Bool) -> Int {
+        var released = 0
+        for index in items.indices {
+            guard case .failed(_, let retryable) = items[index].state, isIncluded(retryable) else { continue }
+            requeue(at: index)
+            released += 1
         }
-        guard !retryable.isEmpty else { return 0 }
-        for item in retryable { retry(item.id) }
-        return retryable.count
+        guard released > 0 else { return 0 }
+        persistNow()
+        pump()
+        return released
+    }
+
+    private func requeue(at index: Int) {
+        items[index].attempts = 0
+        items[index].state = .queued
     }
 
     func clearFinished() {

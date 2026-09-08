@@ -499,6 +499,62 @@ final class UploadQueueTests: XCTestCase {
         XCTAssertEqual(script.calls, 1)
     }
 
+    /// The Stop-button freeze: cancelling row by row wrote the whole snapshot
+    /// once per row, so a full-library queue paid thousands of synchronous
+    /// encode-and-replace passes on the main actor before the UI came back.
+    func testStopWritesTheSnapshotOnceNoMatterHowManyRowsItClears() async {
+        let persistence = MemoryUploadQueuePersistence()
+        let script = WorkerScript([], fallback: .block)
+        let queue = UploadQueue(worker: script.worker(), maxConcurrent: 1, persistence: persistence,
+                                sleeper: { _ in await Task.yield() })
+        queue.activateAccount("person@gmail.com")
+        queue.enqueue(sources(200))
+        await settle(queue) { queue.items.first?.state.isWorking == true }
+
+        let before = persistence.saveCount
+        queue.cancelAll()
+        XCTAssertEqual(persistence.saveCount - before, 1)
+
+        // The one in-flight row settles separately, and the queue is empty.
+        await settle(queue) { queue.items.isEmpty }
+    }
+
+    /// Same shape as Stop: Retry Failed walks the whole queue, so it must not
+    /// rewrite the snapshot once per failure either.
+    func testRetryAllFailedWritesTheSnapshotOnce() async {
+        let persistence = MemoryUploadQueuePersistence()
+        let error = GPMCError(kind: .malformed, message: "Google rejected the upload.")
+        let script = WorkerScript([], fallback: .fail(error))
+        let queue = UploadQueue(worker: script.worker(), maxConcurrent: 1, maxAttempts: 1,
+                                persistence: persistence, sleeper: { _ in await Task.yield() })
+        queue.activateAccount("person@gmail.com")
+        queue.enqueue(sources(20))
+        await settle(queue) { queue.failedCount == 20 }
+        queue.setNetworkAccess(allowed: false, pauseReason: "Waiting")
+
+        let before = persistence.saveCount
+        queue.retryAllFailed()
+        XCTAssertEqual(persistence.saveCount - before, 1)
+        XCTAssertEqual(queue.items.filter { $0.state == .queued }.count, 20)
+    }
+
+    /// Stop must not leave the queue in "drop the next cancelled row" mode:
+    /// after it settles, a single-row cancel is a durable marker again.
+    func testStopDoesNotLeaveLaterSingleCancelsBeingDiscarded() async {
+        let script = WorkerScript([], fallback: .block)
+        let queue = makeQueue(script, maxConcurrent: 1)
+        queue.enqueue(sources(2))
+        await settle(queue) { queue.items.first?.state.isWorking == true }
+        queue.cancelAll()
+        await settle(queue) { queue.items.isEmpty }
+
+        queue.enqueue(sources(1))
+        await settle(queue) { queue.items.first?.state.isWorking == true }
+        queue.cancel(queue.items[0].id)
+        await settle(queue) { queue.items.first?.state == .cancelled }
+        XCTAssertEqual(queue.items.count, 1)
+    }
+
     func testUserPauseHoldsQueuedItemsUntilResume() async {
         let script = WorkerScript([.block], fallback: .succeed(.uploaded(mediaKey: "ABC")))
         let queue = makeQueue(script, maxConcurrent: 1)
