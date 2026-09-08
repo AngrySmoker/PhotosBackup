@@ -409,10 +409,21 @@ final class UploadQueue: ObservableObject {
 
     /// A background-URLSession wake is for consuming transfer results, not for
     /// starting a fresh library export. Set this before queue restoration.
+    /// Prefer `noteBackgroundTransferCompletionsPending()` before restoration
+    /// (sets the filter without pumping an empty queue), then call this after
+    /// the queue is restored and policy applied to start the drain.
     func resumeBackgroundTransferCompletions() {
         drainsBackgroundCompletionsOnly = true
         systemPauseReason = nil
         pump()
+    }
+
+    /// Mark that a background-URLSession wake is pending without starting work
+    /// yet. Call this before `activateAccount` so its internal pump already
+    /// runs in drains-only mode instead of starting fresh exports.
+    func noteBackgroundTransferCompletionsPending() {
+        drainsBackgroundCompletionsOnly = true
+        systemPauseReason = nil
     }
 
     func finishBackgroundTransferCompletions() {
@@ -451,9 +462,11 @@ final class UploadQueue: ObservableObject {
 
     /// Used by the app delegate relaunch path. Do not hold iOS's completion
     /// handler for unrelated queued work; only wait until received PUT results
-    /// have either committed or been durably retained.
+    /// have either committed or been durably retained. The deadline leaves
+    /// margin for iOS's ~30s relaunch window while covering an auth refresh
+    /// plus the small commit RPC.
     func waitUntilBackgroundTransfersHandled() async {
-        let deadline = Date().addingTimeInterval(20)
+        let deadline = Date().addingTimeInterval(25)
         while Date() < deadline, items.contains(where: { item in
             guard let prepared = item.checkpoint?.prepared else { return false }
             return prepared.receipt != nil || (running[item.id] != nil && item.state.isWorking)

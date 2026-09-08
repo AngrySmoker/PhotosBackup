@@ -147,19 +147,27 @@ final class BackgroundFileUploadTransport: NSObject, FileUploadTransport, @unche
                 return
             }
             self.lock.lock()
-            guard !self.discarded.contains(transferID) else {
+            let wasDiscarded = self.discarded.contains(transferID)
+            if wasDiscarded {
                 self.starting.remove(transferID)
                 self.discarded.remove(transferID)
-                self.lock.unlock()
-                return
             }
-            // Keep task creation inside the same critical section as the
-            // cancellation marker check. A concurrent cancel will therefore
-            // either prevent creation or observe this task in getAllTasks().
+            self.lock.unlock()
+            guard !wasDiscarded else { return }
+            // Create outside the lock: `uploadTask(with:fromFile:)` must not
+            // run while holding `lock`. `starting` still contains the ID, so a
+            // concurrent cancel either finds this task via `getAllTasks` or
+            // leaves its marker for the re-check below.
             let task = self.session.uploadTask(with: request, fromFile: file)
             task.taskDescription = transferID.uuidString
+            self.lock.lock()
+            let racedDiscard = self.discarded.contains(transferID)
             self.starting.remove(transferID)
             self.lock.unlock()
+            if racedDiscard {
+                task.cancel()
+                return
+            }
             task.resume()
         }
     }

@@ -235,7 +235,15 @@ final class AutomaticBackupCoordinator: ObservableObject {
         // durably handed every changed asset to the queue.
         if accepted.isEmpty, queue.persistenceWarning == nil { libraryChanges.commit(scan) }
         let settled = await queue.waitUntilSettled()
-        return settled && queue.failedCount == failuresBefore
+        if !settled {
+            // Expiration or a policy pause cancels the wait, but the work
+            // remains durably queued for the next window. Report success
+            // unless the credential halted or new failures appeared,
+            // otherwise iOS backs off a window that did everything it could.
+            if queue.haltReason == nil && queue.failedCount == failuresBefore { return true }
+            return false
+        }
+        return queue.failedCount == failuresBefore
     }
 
     /// Called from the background URL-session delegate before iOS receives its
@@ -243,12 +251,18 @@ final class AutomaticBackupCoordinator: ObservableObject {
     /// PUT receipts reach the small commit RPC.
     func handleBackgroundURLSessionEvents() async {
         isForeground = UIApplication.shared.applicationState == .active
-        queue.setICloudDownloadsAllowed(isForeground)
-        if isForeground { queue.resumeSystemWork() }
-        else { queue.resumeBackgroundTransferCompletions() }
+        if !isForeground {
+            // Filter before restoration so `activateAccount`'s internal pump
+            // cannot start fresh exports, and pause network so nothing pumps
+            // before the real policy is applied below.
+            queue.noteBackgroundTransferCompletionsPending()
+            queue.setNetworkAccess(allowed: false, pauseReason: "Restoring background transfers")
+        }
         await photos.start()
         _ = await network.waitForInitialStatus()
         applyNetworkPolicy()
+        isForeground = UIApplication.shared.applicationState == .active
+        queue.setICloudDownloadsAllowed(isForeground)
         if isForeground { queue.resumeSystemWork() }
         else { queue.resumeBackgroundTransferCompletions() }
         await queue.waitUntilBackgroundTransfersHandled()
