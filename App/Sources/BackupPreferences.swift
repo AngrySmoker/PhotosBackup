@@ -157,19 +157,23 @@ final class PhotoAlbumStore: ObservableObject {
     }
 
     func sources(for albumIDs: Set<String>) -> [MediaSource] {
-        albums.filter { albumIDs.contains($0.id) }.flatMap { album -> [MediaSource] in
+        // Albums overlap (and "All Photos" contains all of them), so dedup by
+        // asset identifier — otherwise one asset becomes several queue sources.
+        var seen = Set<String>()
+        var sources: [MediaSource] = []
+        for album in albums where albumIDs.contains(album.id) {
             let assets: PHFetchResult<PHAsset>
             if let collection = album.collection {
                 assets = PHAsset.fetchAssets(in: collection, options: nil)
             } else {
                 assets = PHAsset.fetchAssets(with: Self.allPhotosOptions())
             }
-            var sources: [MediaSource] = []
             assets.enumerateObjects { asset, _, _ in
+                guard seen.insert(asset.localIdentifier).inserted else { return }
                 sources.append(.asset(localIdentifier: asset.localIdentifier))
             }
-            return sources
         }
+        return sources
     }
 
     /// Restrict a PhotoKit persistent-change batch to the selected albums.

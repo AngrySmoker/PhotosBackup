@@ -16,7 +16,13 @@ struct DashboardView: View {
         albums.albums.filter { preferences.selectedAlbumIDs.contains($0.id) }
     }
 
-    private var selectedItemCount: Int { selectedAlbums.reduce(0) { $0 + $1.count } }
+    /// Unique-item estimate for the selection. "All Photos" spans the whole
+    /// image/video library, so when it is selected every other album is a
+    /// subset of it — summing per-album counts would count most assets twice.
+    private var selectedItemCount: Int {
+        if let all = selectedAlbums.first(where: { $0.isAllPhotos }) { return all.count }
+        return selectedAlbums.reduce(0) { $0 + $1.count }
+    }
 
     var body: some View {
         NavigationView {
