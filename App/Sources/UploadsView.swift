@@ -6,6 +6,15 @@ struct UploadsView: View {
     @EnvironmentObject private var preferences: BackupPreferences
     @State private var showPicker = false
     @State private var showingStopBackupConfirmation = false
+    @State private var inspectedFailure: FailureDetail?
+
+    /// A failed row's full text, snapshotted when it is tapped. The row itself
+    /// can be retried or cleared while the sheet is open.
+    private struct FailureDetail: Identifiable {
+        let id: UUID
+        let name: String
+        let reason: String
+    }
 
     var body: some View {
         NavigationView {
@@ -24,6 +33,7 @@ struct UploadsView: View {
             .sheet(isPresented: $showPicker) {
                 PhotoPicker { sources in enqueue(sources) }.ignoresSafeArea()
             }
+            .sheet(item: $inspectedFailure) { failure in failureSheet(failure) }
             .confirmationDialog(
                 "Stop all backups?",
                 isPresented: $showingStopBackupConfirmation,
@@ -188,12 +198,22 @@ struct UploadsView: View {
                     }
                 }
                 Text(item.state.label).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                if case .failed = item.state {
+                    // The reason above is clamped to two lines, and Google's
+                    // own explanation is usually past the clamp.
+                    Text("Tap for details").font(.caption2).foregroundStyle(BackupTheme.blue)
+                }
                 if let fraction = item.state.fraction, item.state.isWorking {
                     ProgressView(value: fraction).tint(BackupTheme.blue)
                 }
             }
         }
         .padding(.vertical, 4)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            guard case .failed(let reason, _) = item.state else { return }
+            inspectedFailure = FailureDetail(id: item.id, name: item.name, reason: reason)
+        }
         .swipeActions {
             if item.state.isFinished {
                 if item.state != .done && item.state != .alreadyBackedUp {
@@ -203,6 +223,44 @@ struct UploadsView: View {
                 Button("Cancel", role: .destructive) { queue.cancel(item.id) }
             }
         }
+    }
+
+    /// The whole reason, selectable and copyable. A support report is only as
+    /// good as the text the reporter can actually get out of the app.
+    private func failureSheet(_ failure: FailureDetail) -> some View {
+        NavigationView {
+            List {
+                Section("Item") { Text(failure.name).font(.subheadline) }
+                Section("What Google said") {
+                    Text(failure.reason)
+                        .font(.footnote)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Section {
+                    Button {
+                        UIPasteboard.general.string = "\(failure.name)\n\(failure.reason)"
+                    } label: {
+                        Label("Copy Details", systemImage: "doc.on.doc")
+                    }
+                    Button {
+                        queue.retry(failure.id)
+                        inspectedFailure = nil
+                    } label: {
+                        Label("Retry This Item", systemImage: "arrow.clockwise")
+                    }
+                }
+            }
+            .listStyle(.insetGrouped)
+            .navigationTitle("Upload Failed")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { inspectedFailure = nil }
+                }
+            }
+        }
+        .navigationViewStyle(.stack)
     }
 
     private func symbol(_ state: UploadItem.State) -> String {

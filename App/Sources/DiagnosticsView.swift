@@ -4,6 +4,7 @@ import SwiftUI
 struct DiagnosticsView: View {
     @EnvironmentObject private var log: ProbeLog
     @EnvironmentObject private var probe: AccountConnector
+    @EnvironmentObject private var queue: UploadQueue
 #if DEBUG
     @EnvironmentObject private var automaticBackup: AutomaticBackupCoordinator
 #endif
@@ -54,6 +55,41 @@ struct DiagnosticsView: View {
                     .textSelection(.enabled)
             }
 #endif
+
+            if !queue.recentFailures.isEmpty {
+                Section {
+                    ForEach(queue.recentFailures) { failure in
+                        VStack(alignment: .leading, spacing: 3) {
+                            HStack {
+                                Text(failure.name).font(.caption.weight(.medium)).lineLimit(1)
+                                Spacer()
+                                if let code = failure.statusCode {
+                                    Text("code \(code)").font(.caption2.monospaced()).foregroundStyle(.secondary)
+                                }
+                            }
+                            Text(failure.reason)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        .padding(.vertical, 2)
+                    }
+                    Button("Copy All Failures") {
+                        UIPasteboard.general.string = queue.recentFailures
+                            .map(\.summary)
+                            .joined(separator: "\n")
+                    }
+                } header: {
+                    Text("Upload Failures")
+                } footer: {
+                    // The count is the part a bug report never has: one 400 and
+                    // four hundred of them read identically on a cleared queue.
+                    Text(queue.failureCount > queue.recentFailures.count
+                         ? "\(queue.failureCount) failures this session; showing the \(queue.recentFailures.count) most recent."
+                         : "\(queue.failureCount) failures this session.")
+                }
+            }
 
             Section("Connection Flow") {
                 Button { showingConnect = true } label: {

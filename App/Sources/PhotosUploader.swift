@@ -171,6 +171,7 @@ struct PhotosUploader {
                     // Persist the fallback so a relaunch does not send the
                     // retry through the same background transport again.
                     checkpoint.continuesAfterProcessExit = false
+                    checkpoint.retriedAfterInvalidReceipt = true
                 }
                 await emit(.checkpoint(checkpoint))
                 throw error
@@ -193,6 +194,15 @@ struct PhotosUploader {
                 await client.forgetTransfer(id)
                 checkpoint.prepared = nil
                 checkpoint.continuesAfterProcessExit = false
+                // One recovery per item. Google rejects the commit arguments
+                // for more than a stale upload token, and a rejection that
+                // survives a fresh preflight and transfer is one of those —
+                // re-uploading the bytes again would not fix it either.
+                guard checkpoint.retriedAfterInvalidReceipt != true else {
+                    await emit(.checkpoint(checkpoint))
+                    throw GPMCError(kind: .malformed, message: error.message, status: error.status)
+                }
+                checkpoint.retriedAfterInvalidReceipt = true
                 await emit(.checkpoint(checkpoint))
                 throw error
             }

@@ -174,6 +174,55 @@ final class UploadQueueTests: XCTestCase {
         XCTAssertEqual(script.calls, 1)
     }
 
+    /// A full Google account stops the queue as hard as a refused credential,
+    /// but reconnecting the account would fix nothing, so the app is not asked
+    /// to send the user through sign-in again.
+    func testAFullAccountHaltsTheQueueWithoutAskingForAReconnection() async {
+        let full = GPMCError(kind: .storageFull, message: "The Google account is out of storage.")
+        let script = WorkerScript([.fail(full)], fallback: .fail(full))
+        let queue = makeQueue(script, maxConcurrent: 1)
+        var reported: Error?
+        queue.onCredentialRejected = { reported = $0 }
+        queue.enqueue(sources(3))
+        await settle(queue) { queue.haltReason != nil }
+        XCTAssertEqual(queue.haltReason, "The Google account is out of storage.")
+        XCTAssertNil(reported, "a full account is not a credential problem")
+        XCTAssertTrue(queue.items.allSatisfy { $0.state == .queued })
+        try? await Task.sleep(nanoseconds: 20_000_000)
+        XCTAssertEqual(script.calls, 1)
+    }
+
+    /// The failure log outlives the rows. Retry and Clear Finished both take the
+    /// reason away, which is exactly when someone goes looking for it.
+    func testTheFailureLogOutlivesTheRowsAndCountsWhatItDropped() async {
+        let failure = GPMCError(kind: .server(400), message: "Google returned HTTP 400 during finalization.")
+        let script = WorkerScript([], fallback: .fail(failure))
+        let queue = makeQueue(script, maxConcurrent: 1, maxAttempts: 1)
+        queue.enqueue(sources(3))
+        await settle(queue) { queue.items.allSatisfy { $0.state.isFinished } }
+
+        XCTAssertEqual(queue.failureCount, 3)
+        XCTAssertEqual(queue.recentFailures.count, 3)
+        XCTAssertTrue(queue.recentFailures.allSatisfy { $0.reason.contains("during finalization") })
+        XCTAssertTrue(queue.recentFailures[0].summary.contains("during finalization"))
+
+        queue.clearFinished()
+        XCTAssertTrue(queue.items.isEmpty)
+        XCTAssertEqual(queue.recentFailures.count, 3, "clearing the rows must not clear the record")
+        XCTAssertEqual(queue.failureCount, 3)
+    }
+
+    func testTheFailureLogIsBoundedAndNewestFirst() async {
+        let script = WorkerScript([], fallback: .fail(GPMCError(kind: .server(400), message: "rejected")))
+        let queue = makeQueue(script, maxConcurrent: 1, maxAttempts: 1)
+        queue.enqueue(sources(30))
+        await settle(queue) { queue.items.allSatisfy { $0.state.isFinished } }
+        XCTAssertEqual(queue.failureCount, 30)
+        XCTAssertEqual(queue.recentFailures.count, 25)
+        XCTAssertEqual(queue.recentFailures.first?.name, queue.items.last?.name,
+                       "newest first, so the last row to fail is at the top")
+    }
+
     func testResumeAfterAHaltPicksTheQueueBackUp() async {
         let rejection = GPMCError(kind: .credentialRejected, message: "Connect the account again.")
         let script = WorkerScript([.fail(rejection)], fallback: .succeed(.uploaded(mediaKey: "ABC")))

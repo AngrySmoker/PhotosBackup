@@ -33,6 +33,10 @@ struct UploadCheckpoint: Codable, Equatable, Sendable {
     let temporary: Bool
     var prepared: PreparedUpload?
     var continuesAfterProcessExit: Bool? = nil
+    /// Set once an unusable receipt has already cost this item a fresh transfer.
+    /// A second identical rejection is not the receipt, so the item fails
+    /// instead of re-uploading its bytes for every remaining attempt.
+    var retriedAfterInvalidReceipt: Bool? = nil
 
     var fileURL: URL { URL(fileURLWithPath: filePath) }
     var isBackgroundTransfer: Bool { prepared != nil && continuesAfterProcessExit == true }

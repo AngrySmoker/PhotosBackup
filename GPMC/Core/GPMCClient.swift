@@ -1,6 +1,56 @@
 import Foundation
 import CryptoKit
 
+/// The `google.rpc.Status` Google puts in a protobuf error body: a canonical
+/// code in field 1, an English message in field 2. The code is the half worth
+/// branching on — the message is prose Google can reword at any time, and it
+/// only reads as English because every request pins `Accept-Language: en_US`.
+struct GoogleStatus: Equatable, Sendable {
+    /// `google.rpc.Code`, limited to the values this app can act on. Anything
+    /// else keeps its number in `rawCode` and changes no behaviour.
+    enum Code: Int, Equatable, Sendable {
+        case invalidArgument = 3
+        case deadlineExceeded = 4
+        case permissionDenied = 7
+        case resourceExhausted = 8
+        case failedPrecondition = 9
+        case aborted = 10
+        case unavailable = 14
+        case unauthenticated = 16
+    }
+    let rawCode: Int
+    let message: String?
+    var code: Code? { Code(rawValue: rawCode) }
+
+    /// Fails when the body is not a status: not protobuf, no code, or a code of
+    /// zero, which is `OK` and cannot describe a failure.
+    init?(_ data: Data) {
+        // `try?` flattens the throw and the "no such field" nil into one
+        // optional: either there is a code, or this is not a status.
+        guard !data.isEmpty, let number = try? Proto.number(1, in: data), number > 0,
+              let value = Int(exactly: number) else { return nil }
+        rawCode = value
+        message = (try? Proto.string(at: [2], in: data)) ?? nil
+    }
+
+    /// What this code means for the item it was raised against, or nil to keep
+    /// the classification the HTTP status already implies. Only the codes where
+    /// the app would do something different are mapped.
+    func kind(httpStatus: Int) -> GPMCError.Kind? {
+        switch code {
+        case .resourceExhausted:
+            // Rate limiting shares this code and arrives as 429, which is
+            // already classified as retryable. Anything else means the account
+            // itself has no room left, which retrying cannot fix.
+            return httpStatus == 429 ? nil : .storageFull
+        case .unauthenticated, .permissionDenied:
+            return .credentialRejected
+        default:
+            return nil
+        }
+    }
+}
+
 struct GPMCError: LocalizedError, Equatable {
     /// What went wrong, in the terms a caller has to act on: reconnect the
     /// account, try again later, or give up on this item.
@@ -11,10 +61,16 @@ struct GPMCError: LocalizedError, Equatable {
         case server(Int)          // Non-2xx from Google.
         case malformed            // A response we could not make sense of.
         case invalidUploadReceipt // Restart preflight/PUT; never replay this receipt.
+        case storageFull          // Google says the account has no room left.
     }
     let kind: Kind
     let message: String
-    init(kind: Kind = .malformed, message: String) { self.kind = kind; self.message = message }
+    /// The status Google returned, when it sent one. Carried so a caller can
+    /// read the canonical code rather than pattern-match the message text.
+    let status: GoogleStatus?
+    init(kind: Kind = .malformed, message: String, status: GoogleStatus? = nil) {
+        self.kind = kind; self.message = message; self.status = status
+    }
     var errorDescription: String? { message }
 
     /// `localizedDescription` collapses to "unknown error" for several URL
@@ -37,7 +93,7 @@ struct GPMCError: LocalizedError, Equatable {
         switch kind {
         case .transport, .invalidUploadReceipt: return true
         case .server(let code): return code == 408 || code == 429 || code >= 500
-        case .credentialRejected, .tokenBound, .malformed: return false
+        case .credentialRejected, .tokenBound, .malformed, .storageFull: return false
         }
     }
 }
@@ -225,19 +281,32 @@ actor GPMCClient {
             throw GPMCError(kind: .credentialRejected, message: "Google rejected the stored credential (HTTP \(http.statusCode)). Connect the account again.")
         }
         guard (200..<300).contains(http.statusCode) else {
-            throw GPMCError(kind: .server(http.statusCode),
-                            message: "Google returned HTTP \(http.statusCode) during \(operation)."
-                                + Self.explanation(data))
+            let status = GoogleStatus(data)
+            let detail = Self.explanation(data)
+            switch status?.kind(httpStatus: http.statusCode) {
+            case .storageFull:
+                throw GPMCError(kind: .storageFull,
+                                message: "The Google account is out of storage. Free up space in Google Photos, then resume."
+                                    + detail, status: status)
+            case .credentialRejected:
+                throw GPMCError(kind: .credentialRejected,
+                                message: "Google rejected the stored credential during \(operation). Connect the account again."
+                                    + detail, status: status)
+            default:
+                throw GPMCError(kind: .server(http.statusCode),
+                                message: "Google returned HTTP \(http.statusCode) during \(operation)."
+                                    + detail, status: status)
+            }
         }
         return (data, http)
     }
     /// Google's error bodies are the only thing that says *why* a request was
-    /// rejected. Decode google.rpc.Status.message (field 2) when present,
-    /// retaining the hex fallback for unknown or truncated binary responses.
+    /// rejected. Prefer the status message, fall back to a printable body, and
+    /// keep the hex prefix for anything else — a truncated or unknown binary
+    /// response is still enough to identify the failure.
     static func explanation(_ data: Data, limit: Int = 240) -> String {
         guard !data.isEmpty else { return "" }
-        let statusMessage = data.first == 0x08 ? (try? Proto.string(at: [2], in: data)) : nil
-        let text = statusMessage ?? String(decoding: data, as: UTF8.self)
+        let text = GoogleStatus(data)?.message ?? String(decoding: data, as: UTF8.self)
         let printable = !text.isEmpty && text.unicodeScalars.allSatisfy {
             $0 == "\n" || $0 == "\t" || ($0.value >= 0x20 && $0.value != 0x7F)
         }
@@ -407,6 +476,25 @@ actor GPMCClient {
         }
     }
 
+    /// Whether a commit failure says the receipt itself is unusable, so the
+    /// item is worth another preflight and transfer rather than being failed.
+    ///
+    /// `INVALID_ARGUMENT` is the structural signal: every other argument in the
+    /// commit body is rebuilt from the checkpoint on each attempt, so the only
+    /// one that can have gone stale since the PUT is the upload token inside
+    /// the receipt. A metadata bug of our own would land here too, and cost up
+    /// to `maxAttempts` transfers per item — bounded, and preflight's hash
+    /// lookup returns `alreadyBackedUp` for bytes that did reach Google.
+    ///
+    /// The message check is the fallback for a rejection that arrives without a
+    /// parseable status. It was the only signal before, and it is the wording
+    /// Google returned when this was reproduced live.
+    static func rejectsReceipt(_ error: GPMCError) -> Bool {
+        guard case .server = error.kind else { return false }
+        if let code = error.status?.code { return code == .invalidArgument }
+        return error.message.localizedCaseInsensitiveContains("valid blueprint")
+    }
+
     /// Commit the receipt. This is intentionally a small data request that runs
     /// during the background-session relaunch window.
     ///
@@ -426,11 +514,8 @@ actor GPMCClient {
         let committed: Data
         do {
             committed = try await rpc(Self.commitMethod, body: Proto.bytes(1, metadata) + Proto.bytes(2, device) + Proto.bytes(3, Data([1, 3])), ext: true)
-        } catch let error as GPMCError where error.kind == .server(400)
-                    && error.message.localizedCaseInsensitiveContains("At least one valid blueprint is required") {
-            // This particular rejection says the receipt cannot be committed.
-            // Retrying the same receipt cannot repair it; other 400s stay fatal.
-            throw GPMCError(kind: .invalidUploadReceipt, message: error.message)
+        } catch let error as GPMCError where Self.rejectsReceipt(error) {
+            throw GPMCError(kind: .invalidUploadReceipt, message: error.message, status: error.status)
         }
         guard let key = try Proto.string(at: [1, 3, 1], in: committed) else { throw GPMCError(message: "Google rejected the upload during finalization.") }
         return .uploaded(mediaKey: key)

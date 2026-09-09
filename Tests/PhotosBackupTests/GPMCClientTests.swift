@@ -363,11 +363,13 @@ final class GPMCClientTests: XCTestCase {
         XCTAssertEqual(StubProtocol.seen.filter { $0.httpMethod == "PUT" }.count, 1)
     }
 
-    func testUnrelated400DoesNotTriggerReceiptRecovery() async throws {
+    /// Any other canonical code on the commit call is a real rejection of the
+    /// upload, not of the receipt, and nothing about it is worth retrying.
+    func testUnrelatedStatusCodeOnCommitDoesNotTriggerReceiptRecovery() async throws {
         let handler = Self.photosHandler()
         StubProtocol.handler = { request in
             if request.stubPath.hasSuffix("/16538846908252377752") {
-                return StubProtocol.Reply(status: 400, body: Proto.int(1, 3) + Proto.string(2, "Invalid metadata"))
+                return StubProtocol.Reply(status: 400, body: Proto.int(1, 9) + Proto.string(2, "Invalid metadata"))
             }
             return handler(request)
         }
@@ -379,10 +381,109 @@ final class GPMCClientTests: XCTestCase {
         } catch let error as GPMCError {
             XCTAssertEqual(error.kind, .server(400))
             XCTAssertFalse(error.isRetryable)
+            XCTAssertEqual(error.status?.code, .failedPrecondition)
             XCTAssertTrue(error.message.contains("during finalization"))
             XCTAssertTrue(error.message.contains("Invalid metadata"))
             XCTAssertFalse(error.message.contains("Check your connection"))
         }
+    }
+
+    /// The canonical code is the signal, not Google's prose: the same rejection
+    /// worded differently has to be recognised the same way. The message check
+    /// is only there for a rejection that carries no parseable status.
+    func testReceiptRejectionIsRecognisedByCodeAndByMessageWithoutOne() async throws {
+        let bodies: [Data] = [
+            Proto.int(1, 3) + Proto.string(2, "Upload token is no longer valid"),
+            Data("At least one valid blueprint is required".utf8),
+        ]
+        for body in bodies {
+            let handler = Self.photosHandler()
+            StubProtocol.handler = { request in
+                request.stubPath.hasSuffix("/16538846908252377752")
+                    ? StubProtocol.Reply(status: 400, body: body)
+                    : handler(request)
+            }
+            let client = try GPMCClient(authData: Self.credential, session: StubProtocol.session())
+            await XCTAssertThrowsGPMC(kind: .invalidUploadReceipt) {
+                _ = try await client.upload(file: try self.scratchFile(), filename: "image.jpg",
+                                            useQuota: false, saver: false) { _ in }
+            }
+        }
+    }
+
+    /// `google.rpc.Status` says more than the HTTP status does. RESOURCE_EXHAUSTED
+    /// is a full account, which no amount of retrying will empty; the same code
+    /// under a 429 is rate limiting, which is exactly what retrying is for.
+    func testStatusCodeDecidesTheKindWhereTheHTTPStatusCannot() async throws {
+        let cases: [(Int, Data, GPMCError.Kind, Bool)] = [
+            (400, Proto.int(1, 8) + Proto.string(2, "Quota exceeded"), .storageFull, false),
+            (429, Proto.int(1, 8) + Proto.string(2, "Too many requests"), .server(429), true),
+            (400, Proto.int(1, 16) + Proto.string(2, "Request had invalid authentication"),
+             .credentialRejected, false),
+        ]
+        for (status, body, kind, retryable) in cases {
+            StubProtocol.handler = { request in
+                request.stubPath == "/auth"
+                    ? .text("Auth=ya29.token\nExpiry=\(Self.farFuture)\n")
+                    : StubProtocol.Reply(status: status, body: body)
+            }
+            let client = try GPMCClient(authData: Self.credential, session: StubProtocol.session())
+            do {
+                try await client.validateReadAccess()
+                XCTFail("expected a rejection for \(kind)")
+            } catch let error as GPMCError {
+                XCTAssertEqual(error.kind, kind)
+                XCTAssertEqual(error.isRetryable, retryable)
+                XCTAssertEqual(error.status?.rawCode, status == 429 ? 8 : (kind == .storageFull ? 8 : 16))
+            }
+        }
+    }
+
+    /// The storage message has to say what to do about it, and still carry what
+    /// Google said — support cannot act on "HTTP 400" alone.
+    func testAFullAccountExplainsItselfAndIsNotRetried() async throws {
+        StubProtocol.handler = { request in
+            request.stubPath == "/auth"
+                ? .text("Auth=ya29.token\nExpiry=\(Self.farFuture)\n")
+                : StubProtocol.Reply(status: 400,
+                                     body: Proto.int(1, 8) + Proto.string(2, "Quota exceeded for the account"))
+        }
+        let client = try GPMCClient(authData: Self.credential, session: StubProtocol.session())
+        do {
+            try await client.validateReadAccess()
+            XCTFail("expected a rejection")
+        } catch let error as GPMCError {
+            XCTAssertEqual(error.kind, .storageFull)
+            XCTAssertTrue(error.message.contains("out of storage"))
+            XCTAssertTrue(error.message.contains("Quota exceeded for the account"))
+        }
+    }
+
+    /// A status is only a status when it parses. Bodies that are not protobuf,
+    /// carry no code, or say OK have to stay unclassified rather than being
+    /// read as some arbitrary code.
+    func testOnlyRealStatusBodiesAreReadAsOne() {
+        XCTAssertEqual(GoogleStatus(Proto.int(1, 8) + Proto.string(2, "Quota exceeded"))?.code, .resourceExhausted)
+        XCTAssertEqual(GoogleStatus(Proto.string(2, "message first") + Proto.int(1, 3))?.code, .invalidArgument,
+                       "field order is not guaranteed on the wire")
+        XCTAssertEqual(GoogleStatus(Proto.int(1, 77))?.rawCode, 77)
+        XCTAssertNil(GoogleStatus(Proto.int(1, 77))?.code, "an unmapped code changes nothing")
+        XCTAssertNil(GoogleStatus(Proto.int(1, 0) + Proto.string(2, "OK")), "code 0 is not a failure")
+        XCTAssertNil(GoogleStatus(Data("Service Unavailable".utf8)))
+        XCTAssertNil(GoogleStatus(Data()))
+        XCTAssertNil(GoogleStatus(Proto.string(2, "no code here")))
+    }
+
+    func testVarintFieldsAreReadableAndMalformedBodiesThrow() throws {
+        let body = Proto.int(1, 8) + Proto.string(2, "text") + Proto.int(3, 300)
+        XCTAssertEqual(try Proto.number(1, in: body), 8)
+        XCTAssertEqual(try Proto.number(3, in: body), 300)
+        XCTAssertNil(try Proto.number(2, in: body), "a length-delimited field is not a varint")
+        XCTAssertNil(try Proto.number(9, in: body))
+        // Truncated length prefix: the reader must refuse rather than invent a value.
+        XCTAssertThrowsError(try Proto.number(1, in: Data(body.prefix(4))))
+        // The length-delimited reader still sees what it always did.
+        XCTAssertEqual(try Proto.fields(body)[2]?.first, Data("text".utf8))
     }
 
     @MainActor
@@ -410,8 +511,10 @@ final class GPMCClientTests: XCTestCase {
         XCTAssertEqual(StubProtocol.seen.filter { $0.stubPath.hasSuffix("/5084965799730810217") }.count, 1)
     }
 
+    /// Recovery is worth one fresh transfer, not the item's whole retry budget:
+    /// a rejection that survives a new receipt is not about the receipt.
     @MainActor
-    func testPersistentBlueprintRejectionStopsAtTheQueueRetryLimit() async throws {
+    func testPersistentReceiptRejectionCostsOneExtraTransferThenFails() async throws {
         let commits = Counter()
         let handler = Self.photosHandler()
         StubProtocol.handler = { request in
@@ -429,11 +532,16 @@ final class GPMCClientTests: XCTestCase {
         queue.enqueue([.file(try scratchFile())])
         let deadline = Date().addingTimeInterval(5)
         while !queue.isIdle, Date() < deadline { try await Task.sleep(nanoseconds: 2_000_000) }
-        guard case .failed = queue.items.first?.state else { return XCTFail("expected a bounded failure") }
-        XCTAssertEqual(queue.items.first?.attempts, 3)
-        XCTAssertEqual(commits.value, 3)
+        guard case .failed(let reason, let retryable) = queue.items.first?.state else {
+            return XCTFail("expected a bounded failure")
+        }
+        XCTAssertFalse(retryable)
+        XCTAssertTrue(reason.contains("At least one valid blueprint is required"),
+                      "the reason has to survive the reclassification: \(reason)")
+        XCTAssertEqual(queue.items.first?.attempts, 2)
+        XCTAssertEqual(commits.value, 2)
         XCTAssertEqual(transport.requests.count, 1)
-        XCTAssertEqual(StubProtocol.seen.filter { $0.httpMethod == "PUT" }.count, 2)
+        XCTAssertEqual(StubProtocol.seen.filter { $0.httpMethod == "PUT" }.count, 1)
     }
 
     func testOnlyTheFilePutUsesTheInjectedTransportSeam() async throws {

@@ -106,6 +106,23 @@ private extension MediaSource {
     }
 }
 
+/// One failure, kept after its row is gone so support has something to read.
+struct UploadFailure: Identifiable, Equatable {
+    let id = UUID()
+    let date = Date()
+    let name: String
+    let reason: String
+    /// `google.rpc.Code` when Google sent one, for a reader who needs the
+    /// canonical code rather than the prose.
+    let statusCode: Int?
+
+    var summary: String {
+        let stamp = date.formatted(date: .omitted, time: .standard)
+        return statusCode.map { "\(stamp)  \(name)  [code \($0)]  \(reason)" }
+            ?? "\(stamp)  \(name)  \(reason)"
+    }
+}
+
 /// The activity queue: a bounded number of items in flight, per-item progress,
 /// cancellation, and retry with backoff.
 ///
@@ -131,6 +148,14 @@ final class UploadQueue: ObservableObject {
     /// A non-fatal warning when the durable queue cannot be read or written.
     @Published private(set) var persistenceWarning: String?
     @Published var options = UploadOptions()
+    /// The most recent failures, newest first, and how many there have been in
+    /// this session. A row's reason lives on the row, which Retry and Clear
+    /// Finished both take away — so the only record of what Google actually
+    /// said used to disappear exactly when someone went looking for it. Bounded,
+    /// in memory only, and read by Diagnostics.
+    @Published private(set) var recentFailures: [UploadFailure] = []
+    @Published private(set) var failureCount = 0
+    private static let recentFailureLimit = 25
 
     /// Called once when Google refuses the credential, so the account state can follow.
     var onCredentialRejected: ((Error) -> Void)?
@@ -839,7 +864,12 @@ final class UploadQueue: ObservableObject {
             }
             let gpmc = error as? GPMCError
             let reason = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-            if let gpmc, gpmc.kind == .credentialRejected || gpmc.kind == .tokenBound {
+            // A refused credential and a full account both mean no other item
+            // can succeed either, so the queue stops rather than failing every
+            // remaining row one at a time. The row goes back to `queued` and
+            // picks up where it left off when the user resumes.
+            if let gpmc, gpmc.kind == .credentialRejected || gpmc.kind == .tokenBound
+                || gpmc.kind == .storageFull {
                 setState(.queued, at: index)
                 persist()
                 halt(gpmc)
@@ -853,6 +883,7 @@ final class UploadQueue: ObservableObject {
                 scheduleRetry(id, after: min(30, pow(2, Double(attempt))))
             } else {
                 setState(.failed(reason: reason, retryable: retryable), at: index)
+                recordFailure(name: items[index].name, reason: reason, status: gpmc?.status)
                 cleanCheckpoint(for: index)
                 persist()
             }
@@ -862,8 +893,22 @@ final class UploadQueue: ObservableObject {
     private func halt(_ error: GPMCError) {
         guard haltReason == nil else { return }
         haltReason = error.message
+        recordFailure(name: "Backup stopped", reason: error.message, status: error.status)
         cancelRunningForRequeue()
-        onCredentialRejected?(error)
+        // Only a credential failure asks the app to reconnect the account. A
+        // full account stops the queue just as hard, but the fix is in Google,
+        // and prompting for a reconnection there would send the user nowhere.
+        if error.kind == .credentialRejected || error.kind == .tokenBound {
+            onCredentialRejected?(error)
+        }
+    }
+
+    /// Keep the newest failures and drop the oldest, so a long backup that goes
+    /// wrong in one way does not bury the one that went wrong differently.
+    private func recordFailure(name: String, reason: String, status: GoogleStatus?) {
+        failureCount += 1
+        recentFailures.insert(UploadFailure(name: name, reason: reason, statusCode: status?.rawCode), at: 0)
+        if recentFailures.count > Self.recentFailureLimit { recentFailures.removeLast() }
     }
 
     private func cancelRunningForRequeue(includingBackgroundTransfers: Bool = false) {
