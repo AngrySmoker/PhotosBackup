@@ -325,6 +325,99 @@ final class GPMCClientTests: XCTestCase {
         XCTAssertEqual(counter.value, 2, "the RPC should be attempted twice, once per token")
         XCTAssertEqual(StubProtocol.seen.filter { $0.stubPath == "/auth" }.count, 2)
     }
+
+    // MARK: - Commit policy
+
+    /// `Proto.fields` returns only length-delimited fields, and the storage
+    /// policy is a varint inside a submessage, so walk the wire format here.
+    static func varint(_ field: Int, in data: Data) -> UInt64? {
+        let bytes = [UInt8](data)
+        var index = 0
+        func read() -> UInt64? {
+            var value: UInt64 = 0
+            for shift in stride(from: 0, through: 63, by: 7) {
+                guard index < bytes.count else { return nil }
+                let byte = bytes[index]; index += 1
+                value |= UInt64(byte & 127) << shift
+                if byte & 128 == 0 { return value }
+            }
+            return nil
+        }
+        while index < bytes.count {
+            guard let tag = read() else { return nil }
+            let number = Int(tag >> 3)
+            switch tag & 7 {
+            case 0:
+                guard let value = read() else { return nil }
+                if number == field { return value }
+            case 1: index += 8
+            case 5: index += 4
+            case 2:
+                guard let length = read(), index + Int(length) <= bytes.count else { return nil }
+                index += Int(length)
+            default: return nil
+            }
+        }
+        return nil
+    }
+
+    private static func preparedFixture() -> PreparedUpload {
+        PreparedUpload(uploadURL: URL(string: "https://example.com/upload")!,
+                       hash: Data(repeating: 7, count: 20), filename: "IMG_0009.JPG",
+                       modified: Date(timeIntervalSince1970: 1_600_000_000), byteCount: 4096,
+                       receipt: Proto.string(1, "receipt"))
+    }
+
+    /// Commit `prepared` under the given settings and return the two
+    /// submessages of the body that actually went out: the item metadata and
+    /// the spoofed upload device.
+    private func commitBody(_ prepared: PreparedUpload, useQuota: Bool,
+                            saver: Bool) async throws -> (metadata: Data, device: Data) {
+        StubProtocol.handler = Self.photosHandler()
+        let client = try GPMCClient(authData: Self.credential, session: StubProtocol.session())
+        _ = try await client.commit(prepared, useQuota: useQuota, saver: saver) { _ in }
+        let sent = StubProtocol.seen.first { $0.stubPath.hasSuffix("/16538846908252377752") }
+        let fields = try Proto.fields(Self.body(of: try XCTUnwrap(sent, "the commit RPC was never sent")))
+        return (try XCTUnwrap(fields[1]?.first, "no item metadata"),
+                try XCTUnwrap(fields[2]?.first, "no upload device"))
+    }
+
+    /// Storage policy 3 against the device that carries the original-quality
+    /// exemption. Nothing asserted these bytes before, and they are the entire
+    /// difference between an original-quality and a Storage Saver upload.
+    func testCommitAsksForOriginalQualityWhenStorageSaverIsOff() async throws {
+        let (metadata, device) = try await commitBody(Self.preparedFixture(), useQuota: false, saver: false)
+        XCTAssertEqual(Self.varint(7, in: metadata), 3)
+        XCTAssertTrue(String(decoding: device, as: UTF8.self).contains("Pixel XL"))
+    }
+
+    func testCommitAsksForStorageSaverWhenTheToggleIsOn() async throws {
+        let (metadata, device) = try await commitBody(Self.preparedFixture(), useQuota: false, saver: true)
+        XCTAssertEqual(Self.varint(7, in: metadata), 1)
+        XCTAssertTrue(String(decoding: device, as: UTF8.self).contains("Pixel 2"))
+    }
+
+    /// Counting against quota only swaps the device; it must not quietly ask
+    /// for Storage Saver on the user's behalf.
+    func testCountingAgainstQuotaSwapsTheDeviceButKeepsOriginalQuality() async throws {
+        let (metadata, device) = try await commitBody(Self.preparedFixture(), useQuota: true, saver: false)
+        XCTAssertEqual(Self.varint(7, in: metadata), 3)
+        XCTAssertTrue(String(decoding: device, as: UTF8.self).contains("Pixel 8"))
+    }
+
+    /// The regression. One prepared upload, committed twice under opposite
+    /// settings: a checkpoint can outlive the toggle it was made under, so the
+    /// policy has to come from the call and not from the persisted value.
+    func testCommitPolicyFollowsCurrentSettingsNotThePreparedCheckpoint() async throws {
+        let prepared = Self.preparedFixture()
+        let asSaver = try await commitBody(prepared, useQuota: false, saver: true)
+        let asOriginal = try await commitBody(prepared, useQuota: false, saver: false)
+        XCTAssertEqual(Self.varint(7, in: asSaver.metadata), 1)
+        XCTAssertEqual(Self.varint(7, in: asOriginal.metadata), 3)
+        XCTAssertTrue(String(decoding: asSaver.device, as: UTF8.self).contains("Pixel 2"))
+        XCTAssertTrue(String(decoding: asOriginal.device, as: UTF8.self).contains("Pixel XL"))
+    }
+
 }
 
 // MARK: - Helpers

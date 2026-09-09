@@ -208,7 +208,7 @@ final class UploadQueueTests: XCTestCase {
         let prepared = PreparedUpload(
             uploadURL: URL(string: "https://example.com/upload")!, hash: Data(repeating: 1, count: 20),
             filename: "photo.jpg", modified: Date(), byteCount: 10,
-            useQuota: false, saver: false, receipt: nil
+            receipt: nil
         )
         let checkpoint = UploadCheckpoint(filePath: "/tmp/photo.jpg", filename: "photo.jpg",
                                           modified: Date(), byteCount: 10, temporary: true,
@@ -235,7 +235,7 @@ final class UploadQueueTests: XCTestCase {
         let prepared = PreparedUpload(
             uploadURL: URL(string: "https://example.com/upload")!, hash: Data(repeating: 3, count: 20),
             filename: "ready.jpg", modified: Date(), byteCount: 10,
-            useQuota: false, saver: false, receipt: Data([1, 0])
+            receipt: Data([1, 0])
         )
         let checkpoint = UploadCheckpoint(filePath: "/tmp/ready.jpg", filename: "ready.jpg",
                                           modified: Date(), byteCount: 10, temporary: true,
@@ -349,6 +349,29 @@ final class UploadQueueTests: XCTestCase {
         XCTAssertTrue(restored.useQuota)
     }
 
+    /// 0.3.4 and earlier persisted `useQuota` and `saver` inside every prepared
+    /// checkpoint. Those keys are gone, and upgrading must not fail to decode a
+    /// queue that still carries them — a throw here would drop the user's
+    /// in-flight backup on first launch after the update.
+    func testLegacyQualityKeysInAPersistedCheckpointStillDecode() throws {
+        let prepared = PreparedUpload(
+            uploadURL: URL(string: "https://example.com/upload")!,
+            hash: Data(repeating: 4, count: 20), filename: "IMG.JPG",
+            modified: Date(timeIntervalSince1970: 100), byteCount: 123, receipt: nil
+        )
+        // Re-inject the removed keys rather than hand-writing the JSON, so the
+        // fixture cannot drift from whatever the coders actually emit.
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: try JSONEncoder().encode(prepared)) as? [String: Any]
+        )
+        object["useQuota"] = true
+        object["saver"] = true
+        let legacy = try JSONSerialization.data(withJSONObject: object)
+
+        let decoded = try JSONDecoder().decode(PreparedUpload.self, from: legacy)
+        XCTAssertEqual(decoded, prepared)
+    }
+
     func testCancelledBackgroundTransportAlwaysReleasesItsCaller() async {
         let transferID = UUID()
         let request = URLRequest(url: URL(string: "https://example.com/upload")!)
@@ -400,7 +423,7 @@ final class UploadQueueTests: XCTestCase {
         let prepared = PreparedUpload(
             uploadURL: URL(string: "https://example.com/upload")!, hash: Data(repeating: 2, count: 20),
             filename: "IMG.JPG", modified: Date(timeIntervalSince1970: 100), byteCount: 123,
-            useQuota: false, saver: true, receipt: nil
+            receipt: nil
         )
         let checkpoint = UploadCheckpoint(filePath: "/tmp/staged/IMG.JPG", filename: "IMG.JPG",
                                           modified: prepared.modified, byteCount: 123,
@@ -785,7 +808,7 @@ final class UploadQueueTests: XCTestCase {
         let prepared = PreparedUpload(
             uploadURL: URL(string: "https://example.com/upload")!, hash: Data(repeating: 1, count: 20),
             filename: "photo.jpg", modified: Date(), byteCount: 10,
-            useQuota: false, saver: false, receipt: nil
+            receipt: nil
         )
         let checkpoint = UploadCheckpoint(filePath: "/tmp/photo.jpg", filename: "photo.jpg",
                                           modified: Date(), byteCount: 10, temporary: true,

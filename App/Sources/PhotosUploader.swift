@@ -134,9 +134,7 @@ struct PhotosUploader {
                 let preparation = try await client.prepareUpload(
                     file: checkpoint.fileURL,
                     filename: checkpoint.filename,
-                    modified: checkpoint.modified,
-                    useQuota: options.useQuota,
-                    saver: options.storageSaver
+                    modified: checkpoint.modified
                 ) { phase in
                     relay.report(phase.itemState)
                 }
@@ -174,7 +172,12 @@ struct PhotosUploader {
             checkpoint.prepared = completed
             await emit(.checkpoint(checkpoint))
 
-            let outcome = try await client.commit(completed) { phase in
+            // Read from `options`, not from `completed`: a checkpoint restored
+            // from an earlier session predates any toggle the user has flipped
+            // since, and the committed policy has to be the current one.
+            let outcome = try await client.commit(completed,
+                                                  useQuota: options.useQuota,
+                                                  saver: options.storageSaver) { phase in
                 relay.report(phase.itemState)
             }
             await relay.flush()

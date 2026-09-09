@@ -71,14 +71,18 @@ enum UploadPreparation: Equatable, Sendable {
 
 /// Everything needed to resume at the PUT or commit boundary after a process
 /// relaunch. The app persists this alongside its queue item.
+///
+/// Deliberately carries no quality or quota choice. Those only ever reach the
+/// wire in `commit`, and a checkpoint can outlive the settings it was made
+/// under — persisting them meant an item prepared while Storage Saver was on
+/// kept committing as Storage Saver after the toggle went off, including across
+/// a relaunch. `commit` takes them from the live options instead.
 struct PreparedUpload: Codable, Equatable, Sendable {
     let uploadURL: URL
     let hash: Data
     let filename: String
     let modified: Date
     let byteCount: Int64
-    let useQuota: Bool
-    let saver: Bool
     var receipt: Data?
 }
 
@@ -332,7 +336,6 @@ actor GPMCClient {
     /// Hash and de-duplicate while the app is awake, then obtain the resumable
     /// upload URL. No long-running body transfer happens in this method.
     func prepareUpload(file: URL, filename: String, modified: Date? = nil,
-                       useQuota: Bool, saver: Bool,
                        phase: @escaping @Sendable (UploadPhase) -> Void) async throws -> UploadPreparation {
         let declared = (try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? 0
         guard declared > 0 else { throw GPMCError(message: "That item is empty; there is nothing to upload.") }
@@ -359,8 +362,7 @@ actor GPMCClient {
         components.queryItems = [URLQueryItem(name: "upload_id", value: uploadID)]
         let date = modified ?? (try? file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date()
         return .ready(PreparedUpload(uploadURL: components.url!, hash: hash, filename: filename,
-                                     modified: date, byteCount: Int64(size), useQuota: useQuota,
-                                     saver: saver, receipt: nil))
+                                     modified: date, byteCount: Int64(size), receipt: nil))
     }
 
     /// Run (or reattach to) the file PUT through the injected transport.
@@ -390,14 +392,19 @@ actor GPMCClient {
 
     /// Commit the receipt. This is intentionally a small data request that runs
     /// during the background-session relaunch window.
-    func commit(_ prepared: PreparedUpload, phase: @escaping @Sendable (UploadPhase) -> Void) async throws -> UploadOutcome {
+    ///
+    /// `useQuota` and `saver` are passed per call rather than read back off
+    /// `prepared`, so the committed policy is always the one the user has set
+    /// now, not the one in force when the item was prepared.
+    func commit(_ prepared: PreparedUpload, useQuota: Bool, saver: Bool,
+                phase: @escaping @Sendable (UploadPhase) -> Void) async throws -> UploadOutcome {
         guard let receipt = prepared.receipt else {
             throw GPMCError(message: "The upload has not finished transferring yet.")
         }
         phase(.finalizing)
         let stamp = UInt64(max(0, prepared.modified.timeIntervalSince1970))
-        let metadata = Proto.bytes(1, receipt) + Proto.string(2, prepared.filename) + Proto.bytes(3, prepared.hash) + Proto.bytes(4, Proto.int(1, stamp) + Proto.int(2, 46_000_000)) + Proto.int(7, prepared.saver ? 1 : 3) + Proto.int(10, 1)
-        let device = Proto.string(3, prepared.useQuota ? "Pixel 8" : (prepared.saver ? "Pixel 2" : "Pixel XL")) + Proto.string(4, "Google") + Proto.int(5, 28)
+        let metadata = Proto.bytes(1, receipt) + Proto.string(2, prepared.filename) + Proto.bytes(3, prepared.hash) + Proto.bytes(4, Proto.int(1, stamp) + Proto.int(2, 46_000_000)) + Proto.int(7, saver ? 1 : 3) + Proto.int(10, 1)
+        let device = Proto.string(3, useQuota ? "Pixel 8" : (saver ? "Pixel 2" : "Pixel XL")) + Proto.string(4, "Google") + Proto.int(5, 28)
         let committed = try await rpc(Self.commitMethod, body: Proto.bytes(1, metadata) + Proto.bytes(2, device) + Proto.bytes(3, Data([1, 3])), ext: true)
         guard let key = try Proto.string(at: [1, 3, 1], in: committed) else { throw GPMCError(message: "Google rejected the upload during finalization.") }
         return .uploaded(mediaKey: key)
@@ -418,14 +425,14 @@ actor GPMCClient {
     func upload(file: URL, filename: String, modified: Date? = nil, useQuota: Bool, saver: Bool,
                 phase: @escaping @Sendable (UploadPhase) -> Void) async throws -> UploadOutcome {
         switch try await prepareUpload(file: file, filename: filename, modified: modified,
-                                       useQuota: useQuota, saver: saver, phase: phase) {
+                                       phase: phase) {
         case .alreadyBackedUp(let key):
             return .alreadyBackedUp(mediaKey: key)
         case .ready(let prepared):
             let transferID = UUID()
             let completed = try await transfer(prepared, file: file, transferID: transferID, phase: phase)
             defer { Task { await self.forgetTransfer(transferID) } }
-            return try await commit(completed, phase: phase)
+            return try await commit(completed, useQuota: useQuota, saver: saver, phase: phase)
         }
     }
 }
