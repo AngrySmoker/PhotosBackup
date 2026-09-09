@@ -1,3 +1,16 @@
+# Photos Backup 0.4.1 — Smooth activity list
+
+*Version 0.4.1 · build 15 · [compare with 0.4.0](https://github.com/AngrySmoker/PhotosBackup/compare/0.4.0...0.4.1)*
+
+Fixes the app (and sometimes the whole phone) lagging while a large backup
+runs. The cause: every upload and hash progress tick republished the queue to
+the interface, dozens of times a second per row, so scrolling the Activity
+list re-rendered everything each time. Progress now publishes only when the
+whole percent actually moves and at most a few times a second per row — the
+bars still fill smoothly, phase labels (Preparing → Checking → Uploading →
+Finishing → Backed up) still change instantly, and nothing about what gets
+backed up, retried, or persisted has changed. 145 offline tests.
+
 # Photos Backup 0.4.0 — Run in Background
 
 *Version 0.4.0 · build 14 · [compare with 0.3.5](https://github.com/AngrySmoker/PhotosBackup/compare/0.3.5...0.4.0)*
