@@ -118,6 +118,75 @@ final class UploadQueueTests: XCTestCase {
         XCTAssertEqual(queue.failedCount, 0)
     }
 
+    // MARK: - Progress throttling
+
+    /// A mutable clock so the publish interval is deterministic.
+    private final class ClockBox: @unchecked Sendable {
+        var now = Date(timeIntervalSince1970: 0)
+    }
+
+    private func makeThrottledQueue(_ worker: @escaping UploadWorker, clock: ClockBox) -> UploadQueue {
+        UploadQueue(worker: worker, maxConcurrent: 1,
+                    sleeper: { _ in await Task.yield() },
+                    clock: { [clock] in clock.now })
+    }
+
+    /// A row that never leaves one phase and never crosses a whole percent
+    /// publishes nothing after its first tick. Every publish re-diffs every
+    /// view observing the queue, and the URL session ticks many times a second
+    /// per row — the storm that made a large backup jank the activity list.
+    func testSamePercentTicksAreNotPublished() async {
+        let clock = ClockBox()
+        let worker: UploadWorker = { _, _, _, _, emit in
+            await emit(.state(.uploading(0.10)))
+            await emit(.state(.uploading(0.101)))
+            await emit(.state(.uploading(0.109)))
+            while true { try await Task.sleep(nanoseconds: 5_000_000) }
+        }
+        let queue = makeThrottledQueue(worker, clock: clock)
+        queue.enqueue(oneSource)
+        await settle(queue) { queue.items.first?.state == .uploading(fraction: 0.10) }
+        XCTAssertEqual(queue.items.first?.state, .uploading(fraction: 0.10))
+        queue.cancelAll()
+        await settle(queue) { queue.isIdle }
+    }
+
+    /// A visible change inside the minimum interval is still dropped, and the
+    /// first change after the interval publishes — the throttle only drops
+    /// ticks, it never parks a newer value for longer than the interval.
+    func testTicksInsideTheIntervalAreSkippedAndAfterItPublish() async {
+        let clock = ClockBox()
+        let worker: UploadWorker = { _, _, _, _, emit in
+            await emit(.state(.uploading(0.10)))
+            clock.now.addTimeInterval(0.3)          // past the interval
+            await emit(.state(.uploading(0.11)))    // published
+            await emit(.state(.uploading(0.12)))    // inside the interval → skipped
+            while true { try await Task.sleep(nanoseconds: 5_000_000) }
+        }
+        let queue = makeThrottledQueue(worker, clock: clock)
+        queue.enqueue(oneSource)
+        await settle(queue) { queue.items.first?.state == .uploading(fraction: 0.11) }
+        XCTAssertEqual(queue.items.first?.state, .uploading(fraction: 0.11))
+        queue.cancelAll()
+        await settle(queue) { queue.isIdle }
+    }
+
+    /// A phase change is never throttled, even inside the interval — otherwise
+    /// a row could sit on a stale label at the moment its work moved on.
+    func testPhaseChangesPublishImmediatelyEvenInsideTheInterval() async {
+        let clock = ClockBox()
+        let worker: UploadWorker = { _, _, _, _, emit in
+            await emit(.state(.uploading(0.10)))
+            await emit(.state(.finalizing))         // phase change, clock frozen
+            while true { try await Task.sleep(nanoseconds: 5_000_000) }
+        }
+        let queue = makeThrottledQueue(worker, clock: clock)
+        queue.enqueue(oneSource)
+        await settle(queue) { queue.items.first?.state == .finalizing }
+        queue.cancelAll()
+        await settle(queue) { queue.isIdle }
+    }
+
     func testTransportFailuresRetryUpToMaxAttemptsThenFail() async {
         let error = GPMCError(kind: .transport, message: "Could not reach Google.")
         let script = WorkerScript([.fail(error), .fail(error), .fail(error)], fallback: .fail(error))

@@ -157,6 +157,10 @@ final class UploadQueue: ObservableObject {
     @Published private(set) var failureCount = 0
     private static let recentFailureLimit = 25
 
+    /// Progress ticks publish at most this often per row, whatever its byte
+    /// rate. See `shouldPublishProgress`.
+    private static let progressMinimumInterval: TimeInterval = 0.25
+
     /// Called once when Google refuses the credential, so the account state can follow.
     var onCredentialRejected: ((Error) -> Void)?
 
@@ -171,6 +175,8 @@ final class UploadQueue: ObservableObject {
     let maxAttempts: Int
     private let worker: UploadWorker
     private let sleeper: @Sendable (Double) async -> Void
+    /// Injectable so the progress-interval gate is deterministic in tests.
+    private let clock: @Sendable () -> Date
     private let persistence: UploadQueuePersisting?
     private let checkpointCleaner: UploadCheckpointCleaner?
     private var running: [UUID: Task<Void, Never>] = [:]
@@ -225,8 +231,43 @@ final class UploadQueue: ObservableObject {
     /// back whenever an earlier row returns to `.queued`, and the pause flags
     /// reset it because they change which rows count as startable.
     private var scanCursor = 0
+    /// The last time each row published a progress tick. `.uploading` and
+    /// `.hashing` fractions tick many times a second per row — the URL session
+    /// reports every socket write and the hasher every block — and every
+    /// publish makes SwiftUI re-diff every view that observes the queue. That
+    /// publish storm is what made scrolling the activity list of a large
+    /// backup jank the whole app. Whole-percent granularity plus this interval
+    /// publishes only what the user can actually see, a few times a second per
+    /// row instead of dozens.
+    private var lastProgressPublishedAt: [UUID: Date] = [:]
 
     private func index(of id: UUID) -> Int? { indexByID[id] }
+
+    /// Whether a progress tick is worth a publish. Within one phase — a row
+    /// already hashing or already uploading — a tick that does not move the
+    /// whole percent is invisible, and one inside `progressMinimumInterval`
+    /// would arrive before the user could see it, so both are dropped. The
+    /// throttle only drops ticks, never parks the newest value: the first
+    /// change after the interval publishes. Any phase change — starting to
+    /// hash, starting to upload, finishing — publishes immediately, so nothing
+    /// outside the two progress fractions behaves differently.
+    private func shouldPublishProgress(_ next: UploadItem.State, for id: UUID, at index: Int) -> Bool {
+        switch (items[index].state, next) {
+        case (.uploading(let shown), .uploading(let incoming)),
+             (.hashing(let shown), .hashing(let incoming)):
+            let shownPercent = (shown * 100).rounded(.down)
+            let incomingPercent = (incoming * 100).rounded(.down)
+            guard shownPercent != incomingPercent else { return false }
+            let now = clock()
+            if let last = lastProgressPublishedAt[id],
+               now.timeIntervalSince(last) < Self.progressMinimumInterval { return false }
+            lastProgressPublishedAt[id] = now
+            return true
+        default:
+            lastProgressPublishedAt[id] = nil
+            return true
+        }
+    }
 
     private func tally(_ state: UploadItem.State, by delta: Int) {
         switch state {
@@ -271,6 +312,7 @@ final class UploadQueue: ObservableObject {
         indexByID.removeAll(keepingCapacity: true)
         queuedSourceKeys.removeAll(keepingCapacity: true)
         fractionalIDs.removeAll(keepingCapacity: true)
+        lastProgressPublishedAt.removeAll(keepingCapacity: true)
         scanCursor = 0
         indexByID.reserveCapacity(items.count)
         for (offset, item) in items.enumerated() {
@@ -288,13 +330,15 @@ final class UploadQueue: ObservableObject {
          checkpointCleaner: UploadCheckpointCleaner? = nil,
          sleeper: @escaping @Sendable (Double) async -> Void = { seconds in
              try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
-         }) {
+         },
+         clock: @escaping @Sendable () -> Date = { Date() }) {
         self.worker = worker
         self.maxConcurrent = Self.clampedConcurrency(maxConcurrent)
         self.maxAttempts = max(1, maxAttempts)
         self.persistence = persistence
         self.checkpointCleaner = checkpointCleaner
         self.sleeper = sleeper
+        self.clock = clock
     }
 
     // MARK: - Aggregates for the UI
@@ -815,6 +859,7 @@ final class UploadQueue: ObservableObject {
             persist()
         case .state(let state):
             guard !items[index].state.isFinished else { return }
+            guard shouldPublishProgress(state, for: id, at: index) else { return }
             setState(state, at: index)
         case .checkpoint(let checkpoint):
             items[index].checkpoint = checkpoint
