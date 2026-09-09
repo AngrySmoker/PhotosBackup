@@ -46,10 +46,17 @@ jobs:
           set -o pipefail
           export DEVELOPER_DIR="$(xcode-select -p)"
           Scripts/make-ipa.sh Release 2>&1 | tee build-log.txt || {
-            echo "::error::xcodebuild failed. First errors from the log:"
-            grep -E "error:" build-log.txt | head -20 || true
+            echo "::error::xcodebuild failed. Last 60 lines of the log:"
+            tail -60 build-log.txt || true
             exit 1
           }
+
+      - name: Upload the build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build-log.txt
 
       - name: Name the IPA for this ref
         run: |
