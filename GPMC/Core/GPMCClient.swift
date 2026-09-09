@@ -10,6 +10,7 @@ struct GPMCError: LocalizedError, Equatable {
         case transport            // Network-level failure.
         case server(Int)          // Non-2xx from Google.
         case malformed            // A response we could not make sense of.
+        case invalidUploadReceipt // Restart preflight/PUT; never replay this receipt.
     }
     let kind: Kind
     let message: String
@@ -34,7 +35,7 @@ struct GPMCError: LocalizedError, Equatable {
     /// True when trying again may succeed without the user doing anything.
     var isRetryable: Bool {
         switch kind {
-        case .transport: return true
+        case .transport, .invalidUploadReceipt: return true
         case .server(let code): return code == 408 || code == 429 || code >= 500
         case .credentialRejected, .tokenBound, .malformed: return false
         }
@@ -218,25 +219,25 @@ actor GPMCClient {
     }
     var accountEmail: String { auth.values["Email"] ?? "" }
 
-    private func checked(_ data: Data, _ response: URLResponse) throws -> (Data, HTTPURLResponse) {
+    private func checked(_ data: Data, _ response: URLResponse, operation: String = "request") throws -> (Data, HTTPURLResponse) {
         guard let http = response as? HTTPURLResponse else { throw GPMCError(message: "Invalid server response.") }
         if http.statusCode == 401 || http.statusCode == 403 {
             throw GPMCError(kind: .credentialRejected, message: "Google rejected the stored credential (HTTP \(http.statusCode)). Connect the account again.")
         }
         guard (200..<300).contains(http.statusCode) else {
             throw GPMCError(kind: .server(http.statusCode),
-                            message: "Google returned HTTP \(http.statusCode). Check your connection and try again."
+                            message: "Google returned HTTP \(http.statusCode) during \(operation)."
                                 + Self.explanation(data))
         }
         return (data, http)
     }
     /// Google's error bodies are the only thing that says *why* a request was
-    /// rejected, and dropping them turns every wire-format bug into a bare
-    /// status code. Printable bodies are quoted as-is; protobuf ones are shown
-    /// as a hex prefix, which is still enough to identify the failure.
+    /// rejected. Decode google.rpc.Status.message (field 2) when present,
+    /// retaining the hex fallback for unknown or truncated binary responses.
     static func explanation(_ data: Data, limit: Int = 240) -> String {
         guard !data.isEmpty else { return "" }
-        let text = String(decoding: data, as: UTF8.self)
+        let statusMessage = data.first == 0x08 ? (try? Proto.string(at: [2], in: data)) : nil
+        let text = statusMessage ?? String(decoding: data, as: UTF8.self)
         let printable = !text.isEmpty && text.unicodeScalars.allSatisfy {
             $0 == "\n" || $0 == "\t" || ($0.value >= 0x20 && $0.value != 0x7F)
         }
@@ -283,7 +284,7 @@ actor GPMCClient {
         if let code = fields["Error"], !code.isEmpty {
             throw GPMCError(kind: .credentialRejected, message: "Google rejected the stored credential (\(code)). Connect the account again.")
         }
-        _ = try checked(data, response)
+        _ = try checked(data, response, operation: "authentication")
         guard let value = fields["Auth"], !value.isEmpty else { throw GPMCError(kind: .credentialRejected, message: "Google did not issue a token. Connect the account again.") }
         token = value; expiry = Date(timeIntervalSince1970: Double(fields["Expiry"] ?? "") ?? Date().addingTimeInterval(300).timeIntervalSince1970)
     }
@@ -297,7 +298,7 @@ actor GPMCClient {
         let check = Proto.bytes(1, Proto.bytes(1, Proto.bytes(1, dummyHash)) + Proto.bytes(2, Data()))
         _ = try await rpc(Self.hashCheckMethod, body: check)
     }
-    private func request(_ url: URL, method: String = "POST", body: Data? = nil, headers: [String: String] = [:], allowReauth: Bool = true) async throws -> (Data, HTTPURLResponse) {
+    private func request(_ url: URL, method: String = "POST", body: Data? = nil, headers: [String: String] = [:], operation: String = "request", allowReauth: Bool = true) async throws -> (Data, HTTPURLResponse) {
         if expiry <= Date().addingTimeInterval(30) { try await authenticate() }
         var request = URLRequest(url: url); request.httpMethod = method; request.timeoutInterval = 120
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
@@ -313,9 +314,9 @@ actor GPMCClient {
         // helper and retain their own upload ID.
         if allowReauth, let http = result.1 as? HTTPURLResponse, http.statusCode == 401 || http.statusCode == 403 {
             expiry = .distantPast
-            return try await self.request(url, method: method, body: body, headers: headers, allowReauth: false)
+            return try await self.request(url, method: method, body: body, headers: headers, operation: operation, allowReauth: false)
         }
-        return try checked(result.0, result.1)
+        return try checked(result.0, result.1, operation: operation)
     }
     // photosdata-pa method ids (gotohp @ 0637c745, backend/api.go).
     private static let hashCheckMethod = "5084965799730810217"
@@ -330,7 +331,8 @@ actor GPMCClient {
     ]
     private func rpc(_ method: String, body: Data, ext: Bool = false) async throws -> Data {
         try await request(URL(string: "https://photosdata-pa.googleapis.com/6439526531001121323/" + method)!,
-                          body: body, headers: ext ? Self.extHeaders : [:]).0
+                          body: body, headers: ext ? Self.extHeaders : [:],
+                          operation: method == Self.commitMethod ? "finalization" : "duplicate check").0
     }
 
     /// Hash and de-duplicate while the app is awake, then obtain the resumable
@@ -356,7 +358,7 @@ actor GPMCClient {
         phase(.preparing)
         let endpoint = URL(string: "https://photos.googleapis.com/data/upload/uploadmedia/interactive")!
         let body = Proto.int(1, 2) + Proto.int(2, 2) + Proto.int(3, 1) + Proto.int(4, 3) + Proto.int(7, size)
-        let (_, response) = try await request(endpoint, body: body, headers: ["X-Goog-Hash": "sha1=" + hash.base64EncodedString(), "X-Upload-Content-Length": String(size)])
+        let (_, response) = try await request(endpoint, body: body, headers: ["X-Goog-Hash": "sha1=" + hash.base64EncodedString(), "X-Upload-Content-Length": String(size)], operation: "upload initialization")
         guard let uploadID = response.value(forHTTPHeaderField: "X-GUploader-UploadID"), !uploadID.isEmpty else { throw GPMCError(message: "Google did not return an upload ID.") }
         var components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false)!
         components.queryItems = [URLQueryItem(name: "upload_id", value: uploadID)]
@@ -366,9 +368,12 @@ actor GPMCClient {
     }
 
     /// Run (or reattach to) the file PUT through the injected transport.
-    func transfer(_ prepared: PreparedUpload, file: URL, transferID: UUID,
+    func transfer(_ prepared: PreparedUpload, file: URL, transferID: UUID, foreground: Bool = false,
                   phase: @escaping @Sendable (UploadPhase) -> Void) async throws -> PreparedUpload {
-        if prepared.receipt != nil { return prepared }
+        if let receipt = prepared.receipt {
+            try Self.validateReceipt(receipt)
+            return prepared
+        }
         if expiry <= Date().addingTimeInterval(30) { try await authenticate() }
         var request = URLRequest(url: prepared.uploadURL)
         request.httpMethod = "PUT"
@@ -380,14 +385,26 @@ actor GPMCClient {
         networkPolicy.apply(to: &request)
         let total = prepared.byteCount
         phase(.sending(sent: 0, total: total))
-        let result = try await fileUploadTransport.upload(request, fromFile: file, transferID: transferID) { sent, expected in
+        let transport: any FileUploadTransport = foreground ? ForegroundFileUploadTransport(session: session) : fileUploadTransport
+        let result = try await transport.upload(request, fromFile: file, transferID: transferID) { sent, expected in
             phase(.sending(sent: sent, total: expected > 0 ? expected : total))
         }
-        let (receipt, _) = try checked(result.data, result.response)
-        _ = try Proto.fields(receipt)
+        let (receipt, _) = try checked(result.data, result.response, operation: "file transfer")
+        try Self.validateReceipt(receipt)
         var completed = prepared
         completed.receipt = receipt
         return completed
+    }
+
+    /// CommitToken's field 2 contains the opaque upload token. Parsing alone
+    /// accepts an empty message (or an unrelated protobuf error) as a receipt.
+    /// Validate both fresh responses and checkpoints written by older builds.
+    static func validateReceipt(_ receipt: Data) throws {
+        guard let fields = try? Proto.fields(receipt),
+              let token = fields[2]?.first, !token.isEmpty else {
+            throw GPMCError(kind: .invalidUploadReceipt,
+                            message: "Google did not return a usable upload receipt. The file must be transferred again.")
+        }
     }
 
     /// Commit the receipt. This is intentionally a small data request that runs
@@ -401,11 +418,20 @@ actor GPMCClient {
         guard let receipt = prepared.receipt else {
             throw GPMCError(message: "The upload has not finished transferring yet.")
         }
+        try Self.validateReceipt(receipt)
         phase(.finalizing)
         let stamp = UInt64(max(0, prepared.modified.timeIntervalSince1970))
         let metadata = Proto.bytes(1, receipt) + Proto.string(2, prepared.filename) + Proto.bytes(3, prepared.hash) + Proto.bytes(4, Proto.int(1, stamp) + Proto.int(2, 46_000_000)) + Proto.int(7, saver ? 1 : 3) + Proto.int(10, 1)
         let device = Proto.string(3, useQuota ? "Pixel 8" : (saver ? "Pixel 2" : "Pixel XL")) + Proto.string(4, "Google") + Proto.int(5, 28)
-        let committed = try await rpc(Self.commitMethod, body: Proto.bytes(1, metadata) + Proto.bytes(2, device) + Proto.bytes(3, Data([1, 3])), ext: true)
+        let committed: Data
+        do {
+            committed = try await rpc(Self.commitMethod, body: Proto.bytes(1, metadata) + Proto.bytes(2, device) + Proto.bytes(3, Data([1, 3])), ext: true)
+        } catch let error as GPMCError where error.kind == .server(400)
+                    && error.message.localizedCaseInsensitiveContains("At least one valid blueprint is required") {
+            // This particular rejection says the receipt cannot be committed.
+            // Retrying the same receipt cannot repair it; other 400s stay fatal.
+            throw GPMCError(kind: .invalidUploadReceipt, message: error.message)
+        }
         guard let key = try Proto.string(at: [1, 3, 1], in: committed) else { throw GPMCError(message: "Google rejected the upload during finalization.") }
         return .uploaded(mediaKey: key)
     }

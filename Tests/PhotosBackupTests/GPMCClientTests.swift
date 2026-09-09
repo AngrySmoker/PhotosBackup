@@ -6,6 +6,11 @@ private final class RecordingFileUploadTransport: FileUploadTransport, @unchecke
     let continuesAfterProcessExit = true
     private let lock = NSLock()
     private(set) var requests: [URLRequest] = []
+    let receipt: Data
+
+    init(receipt: Data = Proto.int(1, 1) + Proto.bytes(2, Data("background-receipt".utf8))) {
+        self.receipt = receipt
+    }
 
     private func record(_ request: URLRequest) {
         lock.lock(); requests.append(request); lock.unlock()
@@ -18,7 +23,7 @@ private final class RecordingFileUploadTransport: FileUploadTransport, @unchecke
         progress(size, size)
         let response = HTTPURLResponse(url: request.url!, statusCode: 200,
                                        httpVersion: "HTTP/1.1", headerFields: [:])!
-        return FileUploadResult(data: Proto.string(1, "receipt"), response: response)
+        return FileUploadResult(data: receipt, response: response)
     }
 
     func forget(transferID: UUID) async {}
@@ -131,6 +136,36 @@ final class GPMCClientTests: XCTestCase {
         XCTAssertFalse(GPMCError(kind: .server(400), message: "x").isRetryable)
         XCTAssertFalse(GPMCError(kind: .credentialRejected, message: "x").isRetryable)
         XCTAssertFalse(GPMCError(kind: .tokenBound, message: "x").isRetryable)
+        XCTAssertTrue(GPMCError(kind: .invalidUploadReceipt, message: "x").isRetryable)
+    }
+
+    func testGoogleProtobufErrorIsReadableAndTruncatedBinaryStillHasHexFallback() {
+        let message = "At least one valid blueprint is required; upload token rejected"
+        let status = Proto.int(1, 3) + Proto.string(2, message)
+        XCTAssertEqual(GPMCClient.explanation(status), " Google said: " + message)
+        XCTAssertEqual(GPMCClient.explanation(status, limit: 12), " Google said: At least one")
+        XCTAssertEqual(GPMCClient.explanation(Data(status.prefix(15))),
+                       " Google said: 0x" + status.prefix(15).map { String(format: "%02x", $0) }.joined())
+        XCTAssertEqual(GPMCClient.explanation(Data("Unavailable".utf8)), " Google said: Unavailable")
+        XCTAssertEqual(GPMCClient.explanation(Data()), "")
+    }
+
+    func testInvalidReceiptsAreRejectedBeforeAnyCommitRequestIncludingRestoredReceipts() async throws {
+        StubProtocol.handler = Self.photosHandler()
+        let client = try GPMCClient(authData: Self.credential, session: StubProtocol.session())
+        let file = try scratchFile()
+        for receipt in [Data(), Proto.int(1, 1), Proto.bytes(2, Data()), Data([0x12, 0x05, 0x01])] {
+            let prepared = PreparedUpload(uploadURL: URL(string: "https://example.test/upload")!,
+                                          hash: Data(repeating: 1, count: 20), filename: "image.jpg",
+                                          modified: Date(), byteCount: 4096, receipt: receipt)
+            await XCTAssertThrowsGPMC(kind: .invalidUploadReceipt) {
+                _ = try await client.commit(prepared, useQuota: false, saver: false) { _ in }
+            }
+            await XCTAssertThrowsGPMC(kind: .invalidUploadReceipt) {
+                _ = try await client.transfer(prepared, file: file, transferID: UUID()) { _ in }
+            }
+        }
+        XCTAssertTrue(StubProtocol.seen.isEmpty)
     }
 
     // MARK: - authenticate()
@@ -213,7 +248,7 @@ final class GPMCClientTests: XCTestCase {
             if path.hasSuffix("/16538846908252377752") {
                 return .ok(Proto.bytes(1, Proto.bytes(3, Proto.string(1, committedKey))))
             }
-            if request.httpMethod == "PUT" { return .ok(Proto.string(1, "receipt")) }
+            if request.httpMethod == "PUT" { return .ok(Proto.int(1, 1) + Proto.bytes(2, Data("receipt".utf8))) }
             return .ok(Data(), headers: ["X-GUploader-UploadID": "upload-123"])
         }
     }
@@ -250,6 +285,155 @@ final class GPMCClientTests: XCTestCase {
         let expected = Data(Insecure.SHA1.hash(data: try Data(contentsOf: file))).base64EncodedString()
         XCTAssertEqual(initiate?.value(forHTTPHeaderField: "X-Goog-Hash"), "sha1=" + expected)
         XCTAssertEqual(initiate?.value(forHTTPHeaderField: "X-Upload-Content-Length"), "4096")
+
+        // Preserve the 0.2.0 commit envelope, including the exact receipt bytes.
+        let commit = try XCTUnwrap(StubProtocol.seen.first { $0.stubPath.hasSuffix("/16538846908252377752") })
+        let receipt = Proto.int(1, 1) + Proto.bytes(2, Data("receipt".utf8))
+        let metadata = Proto.bytes(1, receipt) + Proto.string(2, "IMG_0001.JPG")
+            + Proto.bytes(3, Data(base64Encoded: expected)!)
+            + Proto.bytes(4, Proto.int(1, 1_600_000_000) + Proto.int(2, 46_000_000))
+            + Proto.int(7, 3) + Proto.int(10, 1)
+        let device = Proto.string(3, "Pixel XL") + Proto.string(4, "Google") + Proto.int(5, 28)
+        XCTAssertEqual(Self.body(of: commit), Proto.bytes(1, metadata) + Proto.bytes(2, device) + Proto.bytes(3, Data([1, 3])))
+        XCTAssertEqual(commit.value(forHTTPHeaderField: "x-goog-ext-173412678-bin"), "CgcIAhClARgC")
+        XCTAssertEqual(commit.value(forHTTPHeaderField: "x-goog-ext-174067345-bin"), "CgIIAg==")
+    }
+
+    @MainActor
+    func testBlueprintRejectionRetriesWithFreshPreflightAndForegroundTransfer() async throws {
+        let commits = Counter()
+        let handler = Self.photosHandler()
+        StubProtocol.handler = { request in
+            if request.stubPath.hasSuffix("/16538846908252377752") {
+                commits.bump()
+                let receipt = try? Proto.fields(Self.body(of: request))[1]?.first
+                    .flatMap { try Proto.fields($0)[1]?.first }
+                let token = receipt.flatMap { try? Proto.string(at: [2], in: $0) }
+                if commits.value == 1 {
+                    XCTAssertEqual(token, "background-receipt")
+                    return StubProtocol.Reply(status: 400, body: Proto.int(1, 3)
+                        + Proto.string(2, "At least one valid blueprint is required; upload token rejected"))
+                }
+                XCTAssertEqual(token, "receipt", "the rejected receipt must never be replayed")
+            }
+            return handler(request)
+        }
+        let transport = RecordingFileUploadTransport()
+        let policy = UploadRequestNetworkPolicy()
+        policy.setCellularAllowed(false)
+        let client = try GPMCClient(authData: Self.credential, session: StubProtocol.session(),
+                                    networkPolicy: policy, fileUploadTransport: transport)
+        let worker = PhotosUploader(exporter: MediaExporter()) { client }.worker()
+        let queue = UploadQueue(worker: worker, maxAttempts: 3, sleeper: { _ in await Task.yield() })
+        queue.enqueue([.file(try scratchFile())])
+        let deadline = Date().addingTimeInterval(5)
+        while !queue.isIdle, Date() < deadline { try await Task.sleep(nanoseconds: 2_000_000) }
+        XCTAssertEqual(queue.items.first?.state, .done)
+        XCTAssertEqual(queue.items.first?.attempts, 2)
+        XCTAssertEqual(commits.value, 2)
+        XCTAssertEqual(transport.requests.count, 1)
+        XCTAssertEqual(StubProtocol.seen.filter { $0.stubPath.hasSuffix("/5084965799730810217") }.count, 2)
+        XCTAssertEqual(StubProtocol.seen.filter { $0.httpMethod == "POST" && $0.stubPath.hasSuffix("/interactive") }.count, 2)
+        let put = try XCTUnwrap(StubProtocol.seen.first { $0.httpMethod == "PUT" })
+        XCTAssertFalse(put.allowsCellularAccess)
+        XCTAssertFalse(put.allowsExpensiveNetworkAccess)
+    }
+
+    func testEmptyBackgroundReceiptPersistsForegroundRecoveryAcrossRelaunch() async throws {
+        StubProtocol.handler = Self.photosHandler()
+        let transport = RecordingFileUploadTransport(receipt: Data())
+        let client = try GPMCClient(authData: Self.credential, session: StubProtocol.session(), fileUploadTransport: transport)
+        let file = try scratchFile()
+        let worker = PhotosUploader(exporter: MediaExporter()) { client }.worker()
+        let recorder = CheckpointRecorder()
+        let id = UUID()
+        await XCTAssertThrowsGPMC(kind: .invalidUploadReceipt) {
+            _ = try await worker(id, .file(file), nil, UploadOptions()) { recorder.record($0) }
+        }
+        let saved = try XCTUnwrap(recorder.checkpoint)
+        XCTAssertNil(saved.prepared)
+        XCTAssertEqual(saved.continuesAfterProcessExit, false)
+        XCTAssertFalse(StubProtocol.seen.contains { $0.stubPath.hasSuffix("/16538846908252377752") })
+        let restored = try JSONDecoder().decode(UploadCheckpoint.self, from: JSONEncoder().encode(saved))
+        let relaunched = try GPMCClient(authData: Self.credential, session: StubProtocol.session(), fileUploadTransport: transport)
+        let resumedWorker = PhotosUploader(exporter: MediaExporter()) { relaunched }.worker()
+        let outcome = try await resumedWorker(id, .file(file), restored, UploadOptions()) { recorder.record($0) }
+        XCTAssertEqual(outcome, .uploaded(mediaKey: "MEDIAKEY"))
+        XCTAssertEqual(transport.requests.count, 1, "relaunch must honor the saved transport fallback")
+        XCTAssertEqual(StubProtocol.seen.filter { $0.httpMethod == "PUT" }.count, 1)
+    }
+
+    func testUnrelated400DoesNotTriggerReceiptRecovery() async throws {
+        let handler = Self.photosHandler()
+        StubProtocol.handler = { request in
+            if request.stubPath.hasSuffix("/16538846908252377752") {
+                return StubProtocol.Reply(status: 400, body: Proto.int(1, 3) + Proto.string(2, "Invalid metadata"))
+            }
+            return handler(request)
+        }
+        let client = try GPMCClient(authData: Self.credential, session: StubProtocol.session())
+        let file = try scratchFile()
+        do {
+            _ = try await client.upload(file: file, filename: "image.jpg", useQuota: false, saver: false) { _ in }
+            XCTFail("expected rejection")
+        } catch let error as GPMCError {
+            XCTAssertEqual(error.kind, .server(400))
+            XCTAssertFalse(error.isRetryable)
+            XCTAssertTrue(error.message.contains("during finalization"))
+            XCTAssertTrue(error.message.contains("Invalid metadata"))
+            XCTAssertFalse(error.message.contains("Check your connection"))
+        }
+    }
+
+    @MainActor
+    func testTemporaryCommitFailureReusesReceiptWithoutTransferringAgain() async throws {
+        let commits = Counter()
+        let handler = Self.photosHandler()
+        StubProtocol.handler = { request in
+            if request.stubPath.hasSuffix("/16538846908252377752") {
+                commits.bump()
+                if commits.value == 1 { return .text("Unavailable", status: 503) }
+            }
+            return handler(request)
+        }
+        let transport = RecordingFileUploadTransport()
+        let client = try GPMCClient(authData: Self.credential, session: StubProtocol.session(), fileUploadTransport: transport)
+        let queue = UploadQueue(worker: PhotosUploader(exporter: MediaExporter()) { client }.worker(),
+                                maxAttempts: 3, sleeper: { _ in await Task.yield() })
+        queue.enqueue([.file(try scratchFile())])
+        let deadline = Date().addingTimeInterval(5)
+        while !queue.isIdle, Date() < deadline { try await Task.sleep(nanoseconds: 2_000_000) }
+        XCTAssertEqual(queue.items.first?.state, .done)
+        XCTAssertEqual(commits.value, 2)
+        XCTAssertEqual(transport.requests.count, 1)
+        XCTAssertFalse(StubProtocol.seen.contains { $0.httpMethod == "PUT" })
+        XCTAssertEqual(StubProtocol.seen.filter { $0.stubPath.hasSuffix("/5084965799730810217") }.count, 1)
+    }
+
+    @MainActor
+    func testPersistentBlueprintRejectionStopsAtTheQueueRetryLimit() async throws {
+        let commits = Counter()
+        let handler = Self.photosHandler()
+        StubProtocol.handler = { request in
+            if request.stubPath.hasSuffix("/16538846908252377752") {
+                commits.bump()
+                return StubProtocol.Reply(status: 400, body: Proto.int(1, 3)
+                    + Proto.string(2, "At least one valid blueprint is required"))
+            }
+            return handler(request)
+        }
+        let transport = RecordingFileUploadTransport()
+        let client = try GPMCClient(authData: Self.credential, session: StubProtocol.session(), fileUploadTransport: transport)
+        let queue = UploadQueue(worker: PhotosUploader(exporter: MediaExporter()) { client }.worker(),
+                                maxAttempts: 3, sleeper: { _ in await Task.yield() })
+        queue.enqueue([.file(try scratchFile())])
+        let deadline = Date().addingTimeInterval(5)
+        while !queue.isIdle, Date() < deadline { try await Task.sleep(nanoseconds: 2_000_000) }
+        guard case .failed = queue.items.first?.state else { return XCTFail("expected a bounded failure") }
+        XCTAssertEqual(queue.items.first?.attempts, 3)
+        XCTAssertEqual(commits.value, 3)
+        XCTAssertEqual(transport.requests.count, 1)
+        XCTAssertEqual(StubProtocol.seen.filter { $0.httpMethod == "PUT" }.count, 2)
     }
 
     func testOnlyTheFilePutUsesTheInjectedTransportSeam() async throws {
@@ -365,7 +549,9 @@ final class GPMCClientTests: XCTestCase {
         PreparedUpload(uploadURL: URL(string: "https://example.com/upload")!,
                        hash: Data(repeating: 7, count: 20), filename: "IMG_0009.JPG",
                        modified: Date(timeIntervalSince1970: 1_600_000_000), byteCount: 4096,
-                       receipt: Proto.string(1, "receipt"))
+                       // Field 2 is where Google puts the upload token; a
+                       // receipt without it no longer reaches the wire.
+                       receipt: Proto.string(2, "receipt"))
     }
 
     /// Commit `prepared` under the given settings and return the two
@@ -421,6 +607,16 @@ final class GPMCClientTests: XCTestCase {
 }
 
 // MARK: - Helpers
+
+private final class CheckpointRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: UploadCheckpoint?
+    func record(_ event: UploadEvent) {
+        guard case .checkpoint(let checkpoint) = event else { return }
+        lock.lock(); storage = checkpoint; lock.unlock()
+    }
+    var checkpoint: UploadCheckpoint? { lock.lock(); defer { lock.unlock() }; return storage }
+}
 
 final class PhaseRecorder: @unchecked Sendable {
     private let lock = NSLock()

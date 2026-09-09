@@ -157,7 +157,8 @@ struct PhotosUploader {
             }
             let completed: PreparedUpload
             do {
-                completed = try await client.transfer(prepared, file: checkpoint.fileURL, transferID: id) { phase in
+                completed = try await client.transfer(prepared, file: checkpoint.fileURL, transferID: id,
+                                                      foreground: checkpoint.continuesAfterProcessExit == false) { phase in
                     relay.report(phase.itemState)
                 }
                 await relay.flush()
@@ -166,19 +167,34 @@ struct PhotosUploader {
                 // A failed upload URL may no longer be reusable. Keep the
                 // expensive staged body, but obtain a fresh upload ID on retry.
                 checkpoint.prepared = nil
+                if (error as? GPMCError)?.kind == .invalidUploadReceipt {
+                    // Persist the fallback so a relaunch does not send the
+                    // retry through the same background transport again.
+                    checkpoint.continuesAfterProcessExit = false
+                }
                 await emit(.checkpoint(checkpoint))
                 throw error
             }
             checkpoint.prepared = completed
             await emit(.checkpoint(checkpoint))
 
-            // Read from `options`, not from `completed`: a checkpoint restored
-            // from an earlier session predates any toggle the user has flipped
-            // since, and the committed policy has to be the current one.
-            let outcome = try await client.commit(completed,
+            let outcome: UploadOutcome
+            do {
+                // Read from `options`, not from `completed`: a checkpoint
+                // restored from an earlier session predates any toggle the user
+                // has flipped since, and the committed policy has to be the
+                // current one.
+                outcome = try await client.commit(completed,
                                                   useQuota: options.useQuota,
                                                   saver: options.storageSaver) { phase in
-                relay.report(phase.itemState)
+                    relay.report(phase.itemState)
+                }
+            } catch let error as GPMCError where error.kind == .invalidUploadReceipt {
+                await client.forgetTransfer(id)
+                checkpoint.prepared = nil
+                checkpoint.continuesAfterProcessExit = false
+                await emit(.checkpoint(checkpoint))
+                throw error
             }
             await relay.flush()
             await client.forgetTransfer(id)
