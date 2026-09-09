@@ -143,10 +143,19 @@ DEVELOPER_DIR=/path/to/Xcode.app/Contents/Developer ./Scripts/make-ipa.sh
 The unsigned package is written to `build/PhotosBackup.ipa`. The sideloading
 tool re-signs it with the Apple ID configured on the device.
 
+### Build an IPA without a Mac
+
+A GitHub Actions workflow (`.github/workflows/build-ipa.yml`) runs the same
+packaging script on GitHub's macOS runners, so no local macOS is needed.
+Pushing a `0.x` tag — or triggering **Build unsigned IPA** from the repo's
+Actions tab — produces the unsigned IPA as a workflow artifact, and a tag
+push additionally attaches it to the matching GitHub release with the body
+from `RELEASE_NOTES.md`.
+
 ## Install via SideStore
 
 Prebuilt unsigned IPAs are attached to each
-[GitHub release](https://github.com/g8row/PhotosBackup/releases).
+[GitHub release](https://github.com/AngrySmoker/PhotosBackup/releases).
 
 > [!TIP]
 > On your iPhone (with SideStore or AltStore installed), one-tap install of

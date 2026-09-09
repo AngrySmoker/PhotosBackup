@@ -108,12 +108,13 @@ Everything above the horizontal rule is the paste-ready body for the GitHub
 Release tab.
 
 ```sh
-git push origin main
-git push origin 0.4.0
-# then: GitHub → Releases → Draft new release → choose tag 0.4.0
-#       → paste this file above the rule → Publish
-# or, with the gh CLI:
-gh release create 0.4.0 -F RELEASE_NOTES.md -t "Photos Backup 0.4.0 — Run in Background"
+git push origin main 0.4.0
+
+Pushing the tag also triggers the Actions workflow (.github/workflows/
+build-ipa.yml): a GitHub macOS runner builds the unsigned IPA, attaches it to
+this release, and fills the body from this file — the Release tab is complete
+without any manual editing. Trigger "Build unsigned IPA" from the Actions tab
+for an ad-hoc build of any other commit.
 ```
 </details>
 

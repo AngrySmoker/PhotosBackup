@@ -1,0 +1,61 @@
+name: Build unsigned IPA
+
+# Builds the sideloading package on GitHub's macOS runners: Scripts/make-ipa.sh
+# produces an UNSIGNED .ipa, which is uploaded as a workflow artifact and, for
+# a 0.x tag push, attached to the matching GitHub release with the body from
+# RELEASE_NOTES.md. Install it by opening the downloaded .ipa in SideStore or
+# LiveContainer; the sideloading tool signs it on device.
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - '0.*'
+      - '[1-9].*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      # The packaging script defaults to the maintainer's local Xcode path, so
+      # point DEVELOPER_DIR at the runner's Xcode instead. Prefer 16.4, the
+      # version the project is developed against, when the image has it.
+      - name: Select Xcode
+        run: |
+          for app in Xcode_16.4.0 Xcode_16.4 Xcode_16.3 Xcode_16.2; do
+            if [ -d "/Applications/$app.app" ]; then
+              sudo xcode-select -s "/Applications/$app.app"
+              break
+            fi
+          done
+          xcodebuild -version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Build unsigned IPA
+        run: |
+          export DEVELOPER_DIR="$(xcode-select -p)"
+          Scripts/make-ipa.sh
+
+      - name: Name the IPA for this ref
+        run: |
+          mkdir dist
+          cp build/PhotosBackup.ipa "dist/PhotosBackup-${GITHUB_REF_NAME}.ipa"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PhotosBackup-ipa
+          path: dist/*.ipa
+
+      - name: Attach the IPA to the release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.ipa
+          body_path: RELEASE_NOTES.md
