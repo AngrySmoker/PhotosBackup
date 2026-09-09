@@ -22,6 +22,36 @@ enum BackupConnection: String, CaseIterable, Identifiable {
     }
 }
 
+/// How long one "Run in Background" keep-alive may last. Raw values are
+/// minutes, so the stored form is a plain integer.
+enum BackgroundRunLength: Int, CaseIterable, Identifiable {
+    case minutes30 = 30
+    case hours1 = 60
+    case hours2 = 120
+    case hours3 = 180
+    case hours4 = 240
+    case hours6 = 360
+    case hours8 = 480
+    case hours12 = 720
+
+    var id: Int { rawValue }
+
+    var title: String {
+        switch self {
+        case .minutes30: return "30 Minutes"
+        case .hours1: return "1 Hour"
+        case .hours2: return "2 Hours"
+        case .hours3: return "3 Hours"
+        case .hours4: return "4 Hours"
+        case .hours6: return "6 Hours"
+        case .hours8: return "8 Hours"
+        case .hours12: return "12 Hours"
+        }
+    }
+
+    var timeInterval: TimeInterval { TimeInterval(rawValue) * 60 }
+}
+
 @MainActor
 final class BackupPreferences: ObservableObject {
     private enum Key {
@@ -32,6 +62,8 @@ final class BackupPreferences: ObservableObject {
         static let concurrentUploads = "backup.concurrentUploads"
         static let storageSaver = "backup.storageSaver"
         static let useQuota = "backup.useQuota"
+        static let backgroundKeepAlive = "backup.backgroundKeepAlive"
+        static let backgroundRunLength = "backup.backgroundRunLength"
     }
 
     @Published var selectedAlbumIDs: Set<String> { didSet { saveAlbumIDs() } }
@@ -41,6 +73,11 @@ final class BackupPreferences: ObservableObject {
     @Published var concurrentUploads: Int { didSet { defaults.set(concurrentUploads, forKey: Key.concurrentUploads) } }
     @Published var storageSaver: Bool { didSet { defaults.set(storageSaver, forKey: Key.storageSaver) } }
     @Published var useQuota: Bool { didSet { defaults.set(useQuota, forKey: Key.useQuota) } }
+    /// Plays silent audio after the app is backgrounded so iOS does not suspend
+    /// it and the upload queue keeps draining. Off by default: it costs battery.
+    @Published var backgroundKeepAlive: Bool { didSet { defaults.set(backgroundKeepAlive, forKey: Key.backgroundKeepAlive) } }
+    /// How long one background run may last before it stops itself.
+    @Published var backgroundRunLength: BackgroundRunLength { didSet { defaults.set(backgroundRunLength.rawValue, forKey: Key.backgroundRunLength) } }
 
     private let defaults: UserDefaults
 
@@ -56,6 +93,10 @@ final class BackupPreferences: ObservableObject {
             defaults.object(forKey: Key.concurrentUploads) as? Int ?? 2)
         storageSaver = defaults.bool(forKey: Key.storageSaver)
         useQuota = defaults.bool(forKey: Key.useQuota)
+        backgroundKeepAlive = defaults.bool(forKey: Key.backgroundKeepAlive)
+        // `integer(forKey:)` reads an unset key as 0, which is not a case, so
+        // an unset or corrupt value falls back to the old fixed six hours.
+        backgroundRunLength = BackgroundRunLength(rawValue: defaults.integer(forKey: Key.backgroundRunLength)) ?? .hours6
     }
 
     func toggle(albumID: String) {

@@ -32,6 +32,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
     private let preferences: BackupPreferences
     private let albums: PhotoAlbumStore
     private let network: NetworkPolicyMonitor
+    private let keepAlive: BackgroundKeepAlive
     private let libraryChanges: PhotoLibraryChangeTracker
 
     private var registered = false
@@ -41,6 +42,11 @@ final class AutomaticBackupCoordinator: ObservableObject {
     private var backgroundOperation: Task<Void, Never>?
     private var foregroundOperation: Task<Void, Never>?
     private var foregroundRunID: UUID?
+    /// The keep-alive drain task and its flag: while the silent-audio engine
+    /// holds the process alive after the app is backgrounded, the foreground
+    /// drain loop keeps running instead of stopping at `isForeground == false`.
+    private var backgroundDrainTask: Task<Void, Never>?
+    private var backgroundDrainActive = false
 #if DEBUG
     @Published private(set) var debugSimulationStatus = "Ready"
     static let lldbSimulationCommand = "e -l objc -- (void)[[BGTaskScheduler sharedScheduler] _simulateLaunchForTaskWithIdentifier:@\"\(taskIdentifier)\"]"
@@ -56,6 +62,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
          preferences: BackupPreferences,
          albums: PhotoAlbumStore,
          network: NetworkPolicyMonitor,
+         keepAlive: BackgroundKeepAlive,
          libraryChanges: PhotoLibraryChangeTracker? = nil) {
         self.photos = photos
         self.account = account
@@ -63,6 +70,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
         self.preferences = preferences
         self.albums = albums
         self.network = network
+        self.keepAlive = keepAlive
         self.libraryChanges = libraryChanges ?? PhotoLibraryChangeTracker()
 
         registered = BGTaskScheduler.shared.register(
@@ -106,6 +114,11 @@ final class AutomaticBackupCoordinator: ObservableObject {
         cancelForegroundScan()
         ranForegroundBackup = false
         updateSchedule()
+        if !preferences.backgroundKeepAlive {
+            cancelBackgroundDrain(reason: "Keep Uploading in Background is turned off")
+        } else if let blocker = scheduleBlocker {
+            cancelBackgroundDrain(reason: blocker)
+        }
         runForegroundBackupIfNeeded()
     }
 
@@ -114,6 +127,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
         ranForegroundBackup = false
         queue.activateAccount(account.status.email)
         updateSchedule()
+        if let blocker = scheduleBlocker { cancelBackgroundDrain(reason: blocker) }
         runForegroundBackupIfNeeded()
     }
 
@@ -124,6 +138,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
         queue.setICloudDownloadsAllowed(false)
         shouldRunAfterActivation = true
         updateSchedule()
+        beginBackgroundDrainIfNeeded()
     }
 
     func applicationDidBecomeActive() {
@@ -134,6 +149,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
             shouldRunAfterActivation = false
             ranForegroundBackup = false
         }
+        cancelBackgroundDrain(reason: "App is in the foreground")
         runForegroundBackupIfNeeded()
     }
 
@@ -213,7 +229,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
         // Same reasoning as the background window: earlier transport failures
         // are invisible to the scan and nothing else releases them.
         queue.retryRetryableFailures()
-        while isForeground, !Task.isCancelled, account.status.isUsable,
+        while isDrainAlive, !Task.isCancelled, account.status.isUsable,
               manual || shouldSchedule, !isPausedForAnyReason {
             let accepted = queue.enqueue(sources, skippingExisting: true)
             if accepted.isEmpty { return }
@@ -224,12 +240,57 @@ final class AutomaticBackupCoordinator: ObservableObject {
                 // A pause the queue is honouring must end the loop too,
                 // otherwise this polls every 200 ms for as long as the user
                 // waits for Wi-Fi or leaves the backup paused.
-                if Task.isCancelled || !isForeground || !account.status.isUsable
+                if Task.isCancelled || !isDrainAlive || !account.status.isUsable
                     || !(manual || shouldSchedule)
                     || queue.haltReason != nil || isPausedForAnyReason { return }
                 try? await Task.sleep(nanoseconds: 200_000_000)
             }
         }
+    }
+
+    /// The foreground drain loop keeps running past leaving the foreground
+    /// while the silent-audio keep-alive holds the process alive.
+    private var isDrainAlive: Bool { isForeground || backgroundDrainActive }
+
+    /// Called when the app is backgrounded. With the keep-alive setting on and
+    /// work on the queue, starts the silent-audio engine and keeps the
+    /// foreground drain loop running so the queue empties without waiting for
+    /// an iOS processing window. Every gate the loop already honours — network
+    /// pause, halt, disconnect, an empty queue — ends it, and each of those
+    /// stops the keep-alive so the phone stops paying for playback.
+    private func beginBackgroundDrainIfNeeded() {
+        guard preferences.backgroundKeepAlive, shouldSchedule, queue.hasWorkableItems else { return }
+        guard keepAlive.start(duration: preferences.backgroundRunLength.timeInterval) else { return }
+        backgroundDrainActive = true
+        backgroundDrainTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.albums.refresh()
+            if self.albums.canRead, self.keepAlive.isRunning, !Task.isCancelled {
+                let sources = await self.albums.sources(for: self.preferences.selectedAlbumIDs)
+                await self.performForegroundBackup(sources)
+            } else if !self.albums.canRead {
+                self.keepAlive.stop(reason: "No photo library access in the background")
+            }
+            if !Task.isCancelled { self.finishBackgroundDrain() }
+        }
+    }
+
+    /// Ends a finished keep-alive drain. Called from the drain task itself, so
+    /// it never cancels the task it is running on. A keep-alive that already
+    /// stopped itself — time limit, lost session — keeps that reason.
+    private func finishBackgroundDrain() {
+        backgroundDrainTask = nil
+        backgroundDrainActive = false
+        if keepAlive.isRunning { keepAlive.stop(reason: "The queue is empty") }
+    }
+
+    /// Cancels a keep-alive drain from outside it — the app became active, or
+    /// the configuration no longer permits background draining.
+    private func cancelBackgroundDrain(reason: String) {
+        backgroundDrainActive = false
+        backgroundDrainTask?.cancel()
+        backgroundDrainTask = nil
+        keepAlive.stop(reason: reason)
     }
 
     /// Any condition that stops the queue starting new work. Polling past one

@@ -35,6 +35,8 @@ without a desktop companion or hosted service.
 - Enforce Wi-Fi-only or Wi-Fi-and-cellular policy at queue and request level,
   cancelling in-flight background transfers when the allowed transport is lost.
 - Request recurring iOS background-processing windows for selected-album backup.
+- Keep uploading after you leave the app with a silent-audio background runner
+  you can schedule from 30 minutes to 12 hours.
 - Keep file PUTs running in an iOS-owned background `URLSession`, then commit
   completed receipts when iOS relaunches the app.
 - Track PhotoKit persistent changes on iOS 16+ so backdated imports are found.

@@ -9,6 +9,7 @@ struct PhotosBackupApp: App {
     @StateObject private var queue: UploadQueue
     @StateObject private var preferences: BackupPreferences
     @StateObject private var albums: PhotoAlbumStore
+    @StateObject private var keepAlive: BackgroundKeepAlive
     @Environment(\.scenePhase) private var scenePhase
     private let network: NetworkPolicyMonitor
     private let automaticBackup: AutomaticBackupCoordinator
@@ -23,13 +24,15 @@ struct PhotosBackupApp: App {
         stack.queue.options.storageSaver = preferences.storageSaver
         stack.queue.options.useQuota = preferences.useQuota
         stack.queue.setMaxConcurrent(preferences.concurrentUploads)
+        let keepAlive = BackgroundKeepAlive()
         let automaticBackup = AutomaticBackupCoordinator(
             photos: stack,
             account: stack.account,
             queue: stack.queue,
             preferences: preferences,
             albums: albums,
-            network: network
+            network: network,
+            keepAlive: keepAlive
         )
         BackgroundFileUploadTransport.shared.setEventsDrainer { [weak automaticBackup] in
             await automaticBackup?.handleBackgroundURLSessionEvents()
@@ -43,6 +46,7 @@ struct PhotosBackupApp: App {
         _queue = StateObject(wrappedValue: stack.queue)
         _preferences = StateObject(wrappedValue: preferences)
         _albums = StateObject(wrappedValue: albums)
+        _keepAlive = StateObject(wrappedValue: keepAlive)
         self.network = network
         self.automaticBackup = automaticBackup
         network.onStatusChange = { [weak automaticBackup] _ in automaticBackup?.networkDidChange() }
@@ -59,6 +63,7 @@ struct PhotosBackupApp: App {
                 .environmentObject(queue)
                 .environmentObject(preferences)
                 .environmentObject(albums)
+                .environmentObject(keepAlive)
                 .environmentObject(automaticBackup)
                 .task { await automaticBackup.start() }
                 .onChange(of: scenePhase) { phase in

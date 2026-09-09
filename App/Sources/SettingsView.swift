@@ -7,6 +7,7 @@ struct SettingsView: View {
     @EnvironmentObject private var preferences: BackupPreferences
     @EnvironmentObject private var albums: PhotoAlbumStore
     @EnvironmentObject private var automaticBackup: AutomaticBackupCoordinator
+    @EnvironmentObject private var keepAlive: BackgroundKeepAlive
 
     let showTutorial: () -> Void
     @State private var confirmDisconnect = false
@@ -131,10 +132,28 @@ struct SettingsView: View {
             }
             Toggle("Storage Saver", isOn: $preferences.storageSaver)
             Toggle("Count Against Storage Quota", isOn: $preferences.useQuota)
+            Toggle("Run in Background", isOn: $preferences.backgroundKeepAlive)
+            if preferences.backgroundKeepAlive {
+                Picker("Run For", selection: $preferences.backgroundRunLength) {
+                    ForEach(BackgroundRunLength.allCases) { option in
+                        Text(option.title).tag(option)
+                    }
+                }
+            }
+            if keepAlive.isRunning {
+                Label("Silent-audio keep-alive is active", systemImage: "waveform")
+                    .font(.footnote)
+                    .foregroundStyle(.green)
+            } else if let reason = keepAlive.lastStopReason {
+                Text("Last background keep-alive ended: \(reason)")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         } header: {
             Text("Backup")
         } footer: {
-            Text("More simultaneous uploads finish a large backup sooner. Each one stages a full-size copy on the device while it runs, so high values use more storage, battery and data at once — 2 suits most phones. Lowering it lets uploads already running finish first.\n\nStorage Saver asks Google Photos to reduce file size. Live Photos currently back up as still images.")
+            Text("More simultaneous uploads finish a large backup sooner. Each one stages a full-size copy on the device while it runs, so high values use more storage, battery and data at once — 2 suits most phones. Lowering it lets uploads already running finish first.\n\nStorage Saver asks Google Photos to reduce file size. Live Photos currently back up as still images.\n\nRun in Background plays silent audio after you leave the app, so the queue keeps running instead of waiting for an iOS background window. iOS shows it as a Now Playing entry and it uses extra battery — it stops on its own when the queue is empty or when the run time you chose ends. Leave the app in the app switcher; do not swipe it away.")
         }
     }
 
