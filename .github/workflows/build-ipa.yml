@@ -22,25 +22,34 @@ jobs:
       - uses: actions/checkout@v4
 
       # The packaging script defaults to the maintainer's local Xcode path, so
-      # point DEVELOPER_DIR at the runner's Xcode instead. Prefer 16.4, the
-      # version the project is developed against, when the image has it.
+      # point DEVELOPER_DIR at the runner's Xcode instead. The project pins
+      # SWIFT_VERSION 5.9, which Xcode 16 accepts; list what the image has so a
+      # missing 16.x is visible in the log.
       - name: Select Xcode
         run: |
-          for app in Xcode_16.4.0 Xcode_16.4 Xcode_16.3 Xcode_16.2; do
+          ls /Applications | grep -i xcode || true
+          for app in Xcode_16.4.0 Xcode_16.4 Xcode_16.3.0 Xcode_16.3 Xcode_16.2 Xcode_16.1 Xcode_16.0; do
             if [ -d "/Applications/$app.app" ]; then
               sudo xcode-select -s "/Applications/$app.app"
+              echo "Selected /Applications/$app.app"
               break
             fi
           done
           xcodebuild -version
+          swift --version
 
       - name: Install XcodeGen
         run: brew install xcodegen
 
       - name: Build unsigned IPA
         run: |
+          set -o pipefail
           export DEVELOPER_DIR="$(xcode-select -p)"
-          Scripts/make-ipa.sh
+          Scripts/make-ipa.sh Release 2>&1 | tee build-log.txt || {
+            echo "::error::xcodebuild failed. First errors from the log:"
+            grep -E "error:" build-log.txt | head -20 || true
+            exit 1
+          }
 
       - name: Name the IPA for this ref
         run: |

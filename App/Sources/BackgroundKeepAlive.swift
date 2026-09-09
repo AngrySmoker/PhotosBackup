@@ -101,7 +101,8 @@ extension SilentAudioKeepAliveEngine {
 
     /// A minimal RIFF/WAVE file: 44-byte header plus one second of 8 kHz
     /// 16-bit mono PCM silence. Generated in code rather than bundled so the
-    /// asset cannot go missing and the format is visible to review.
+    /// asset cannot go missing and the format is visible to review. Reads no
+    /// isolated state, so it stays callable from any context.
     nonisolated static func makeSilentWAV(durationSeconds: Int = 1, sampleRate: Int = 8000) -> Data {
         let bytesPerSample = 2
         let channels = 1
@@ -183,13 +184,15 @@ final class BackgroundKeepAlive: ObservableObject {
         return true
     }
 
-    /// Keeps a requested run inside the safety bounds.
-    nonisolated static func clampedDuration(_ duration: TimeInterval) -> TimeInterval {
+    /// Keeps a requested run inside the safety bounds. MainActor-isolated like
+    /// the stored bounds it reads; every caller, including the tests, already
+    /// runs on the main actor.
+    static func clampedDuration(_ duration: TimeInterval) -> TimeInterval {
         min(max(duration, minRuntime), maxRuntime)
     }
 
     /// "6-hour" / "30-minute", for the stop reason shown in Settings.
-    nonisolated static func limitLabel(for duration: TimeInterval) -> String {
+    static func limitLabel(for duration: TimeInterval) -> String {
         duration >= 3600 ? "\(Int(duration / 3600))-hour" : "\(Int(duration / 60))-minute"
     }
 
