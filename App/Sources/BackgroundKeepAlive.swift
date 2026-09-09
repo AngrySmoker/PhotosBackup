@@ -151,15 +151,17 @@ final class BackgroundKeepAlive: ObservableObject {
     private let engine: KeepAliveEngine
     private var timeoutTask: Task<Void, Never>?
 
-    init(engine: KeepAliveEngine = SilentAudioKeepAliveEngine()) {
+    init(engine: KeepAliveEngine) {
         self.engine = engine
     }
 
     /// Starts the engine for one run of at most `duration`. Returns whether
     /// keep-alive is running; `false` means iOS refused and the caller should
-    /// fall back to the normal processing-window path.
+    /// fall back to the normal processing-window path. No default duration:
+    /// default arguments are evaluated outside the main actor, where neither
+    /// this class's initialiser nor `Self` may be referenced.
     @discardableResult
-    func start(duration: TimeInterval = Self.maxRuntime) -> Bool {
+    func start(duration: TimeInterval) -> Bool {
         guard !isRunning else { return true }
         lastStopReason = nil
         engine.onLost = { [weak self] in

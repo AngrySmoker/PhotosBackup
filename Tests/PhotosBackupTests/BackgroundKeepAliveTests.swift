@@ -24,9 +24,9 @@ final class BackgroundKeepAliveTests: XCTestCase {
     func testStartRunsTheEngineOnceAndStopReleasesIt() {
         let engine = StubEngine()
         let keepAlive = BackgroundKeepAlive(engine: engine)
-        XCTAssertTrue(keepAlive.start())
+        XCTAssertTrue(keepAlive.start(duration: 60))
         XCTAssertTrue(keepAlive.isRunning)
-        keepAlive.start()
+        keepAlive.start(duration: 60)
         XCTAssertEqual(engine.startCount, 1)
         keepAlive.stop(reason: "done")
         XCTAssertFalse(keepAlive.isRunning)
@@ -47,7 +47,7 @@ final class BackgroundKeepAliveTests: XCTestCase {
         let engine = StubEngine()
         engine.shouldFail = true
         let keepAlive = BackgroundKeepAlive(engine: engine)
-        XCTAssertFalse(keepAlive.start())
+        XCTAssertFalse(keepAlive.start(duration: 60))
         XCTAssertFalse(keepAlive.isRunning)
         XCTAssertEqual(keepAlive.lastStopReason, "iOS refused the audio session")
     }
@@ -55,7 +55,7 @@ final class BackgroundKeepAliveTests: XCTestCase {
     func testLosingTheAudioSessionStopsKeepAlive() {
         let engine = StubEngine()
         let keepAlive = BackgroundKeepAlive(engine: engine)
-        keepAlive.start()
+        keepAlive.start(duration: 60)
         engine.onLost?()
         XCTAssertFalse(keepAlive.isRunning)
         XCTAssertEqual(keepAlive.lastStopReason, "iOS took the audio session away")

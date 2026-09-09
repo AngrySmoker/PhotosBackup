@@ -24,7 +24,7 @@ struct PhotosBackupApp: App {
         stack.queue.options.storageSaver = preferences.storageSaver
         stack.queue.options.useQuota = preferences.useQuota
         stack.queue.setMaxConcurrent(preferences.concurrentUploads)
-        let keepAlive = BackgroundKeepAlive()
+        let keepAlive = BackgroundKeepAlive(engine: SilentAudioKeepAliveEngine())
         let automaticBackup = AutomaticBackupCoordinator(
             photos: stack,
             account: stack.account,
