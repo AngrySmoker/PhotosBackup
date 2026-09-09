@@ -99,6 +99,13 @@ final class PhotoAlbumStore: ObservableObject {
 
     private var refreshTask: Task<Void, Never>?
     private var countsTask: Task<Void, Never>?
+    private var lastCountsRefreshStartedAt = Date.distantPast
+    /// Shortest gap between two backed-up recounts. One recount enumerates every
+    /// asset in every selected album — the whole library when "All Photos" is
+    /// selected — and the trigger is the completion ledger, which moves once per
+    /// uploaded photo. Without a floor a long backup keeps a full-library
+    /// PhotoKit scan running end to end, competing with the uploads themselves.
+    private static let countsRefreshInterval: TimeInterval = 2
 
     var canRead: Bool { authorization == .authorized || authorization == .limited }
     /// True when the user granted access to a hand-picked subset. Every fetch is
@@ -240,6 +247,15 @@ final class PhotoAlbumStore: ObservableObject {
         guard canRead, !albumIDs.isEmpty else { backedUpCounts = [:]; return }
         countsTask = Task { @MainActor [weak self] in
             guard let self else { return }
+            // Leading edge, then at most one pass per interval: the first call
+            // (a tab appearing, a selection change) is not delayed, and a burst
+            // of upload completions collapses into a single recount.
+            let sinceLast = Date().timeIntervalSince(self.lastCountsRefreshStartedAt)
+            if sinceLast < Self.countsRefreshInterval {
+                try? await Task.sleep(nanoseconds: UInt64((Self.countsRefreshInterval - sinceLast) * 1_000_000_000))
+                guard !Task.isCancelled else { return }
+            }
+            self.lastCountsRefreshStartedAt = Date()
             let byAlbum = await self.assetIdentifiers(for: albumIDs)
             guard !Task.isCancelled else { return }
             let counts = await Task.detached(priority: .utility) {

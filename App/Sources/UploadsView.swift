@@ -110,7 +110,7 @@ struct UploadsView: View {
                 }
             }
 
-            if queue.items.contains(where: { $0.state.isFinished }) {
+            if queue.hasFinishedItems {
                 Button {
                     queue.clearFinished()
                 } label: {

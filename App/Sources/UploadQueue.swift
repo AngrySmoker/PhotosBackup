@@ -125,7 +125,9 @@ final class UploadQueue: ObservableObject {
     /// Set when iOS ends a background execution window before the queue drains.
     @Published private(set) var systemPauseReason: String?
     /// A durable user pause. Current uploads finish; new uploads wait.
-    @Published private(set) var isUserPaused = false
+    /// Resets the scan cursor: a pause changes which rows count as startable,
+    /// so rows the scan already skipped have to be reconsidered.
+    @Published private(set) var isUserPaused = false { didSet { scanCursor = 0 } }
     /// A non-fatal warning when the durable queue cannot be read or written.
     @Published private(set) var persistenceWarning: String?
     @Published var options = UploadOptions()
@@ -154,11 +156,105 @@ final class UploadQueue: ObservableObject {
     /// because the dashboard's "Backed up" metric is derived from its count.
     @Published private(set) var completedSourceKeys: Set<String> = []
     private var completionLedgerHealthy = true
-    private var drainsBackgroundCompletionsOnly = false
+    /// Same reasoning as `isUserPaused`: this narrows what `pump` may start.
+    private var drainsBackgroundCompletionsOnly = false { didSet { scanCursor = 0 } }
     /// Set while a `cancelAll` is settling, so the rows it cancels are dropped
     /// instead of persisted as durable "skip this source" markers.
     private var discardsCancelledRows = false
     private var persistScheduled = false
+
+    // MARK: - Derived state
+    //
+    // A whole-library queue is tens of thousands of rows. Every aggregate below
+    // used to be a `filter` over all of them, recomputed by SwiftUI on both the
+    // dashboard and the activity list for every publish — and there is a publish
+    // for every progress tick. Together with the linear `firstIndex` lookups on
+    // the event path, and a `pump` that rescanned the whole finished prefix on
+    // every completion, the queue's cost grew with the square of its length.
+    // That is what made the activity list, navigation and the backup itself all
+    // slow down as a large backup progressed. Everything here is maintained
+    // incrementally instead, so the per-event cost no longer depends on how many
+    // rows the queue holds.
+
+    private struct RowCounts {
+        /// Rows that are not finished — the queue's "still to do" count.
+        var unfinished = 0
+        var failed = 0
+        var waitingForICloud = 0
+        /// `.done` plus `.alreadyBackedUp`.
+        var completed = 0
+        var finished = 0
+    }
+
+    private var counts = RowCounts()
+    /// Row offset by id, so the event path does not scan for its own row.
+    private var indexByID: [UUID: Int] = [:]
+    /// Dedup keys for every row `items` currently holds, whatever its state, so
+    /// an automatic rescan does not rebuild that set from the whole queue.
+    private var queuedSourceKeys: Set<String> = []
+    /// Rows whose state carries a live progress fraction. Never more than
+    /// `maxConcurrent` of them, so `overallFraction` sums a handful of rows
+    /// rather than the entire queue.
+    private var fractionalIDs: Set<UUID> = []
+    /// Where the search for the next startable row left off. `setState` pulls it
+    /// back whenever an earlier row returns to `.queued`, and the pause flags
+    /// reset it because they change which rows count as startable.
+    private var scanCursor = 0
+
+    private func index(of id: UUID) -> Int? { indexByID[id] }
+
+    private func tally(_ state: UploadItem.State, by delta: Int) {
+        switch state {
+        case .done, .alreadyBackedUp: counts.completed += delta; counts.finished += delta
+        case .failed: counts.failed += delta; counts.finished += delta
+        case .cancelled: counts.finished += delta
+        case .waitingForICloud: counts.waitingForICloud += delta; counts.unfinished += delta
+        default: counts.unfinished += delta
+        }
+    }
+
+    /// The one place a row's state changes, so the counters, the progress set
+    /// and the scan cursor cannot drift away from `items`.
+    private func setState(_ state: UploadItem.State, at index: Int) {
+        let id = items[index].id
+        tally(items[index].state, by: -1)
+        tally(state, by: 1)
+        items[index].state = state
+        if !state.isFinished, state.fraction != nil { fractionalIDs.insert(id) }
+        else { fractionalIDs.remove(id) }
+        if state == .queued { scanCursor = min(scanCursor, index) }
+    }
+
+    /// Append rows and extend the derived state to cover them.
+    private func appendRows(_ rows: [UploadItem]) {
+        guard !rows.isEmpty else { return }
+        indexByID.reserveCapacity(items.count + rows.count)
+        for (offset, row) in rows.enumerated() {
+            indexByID[row.id] = items.count + offset
+            if let key = row.source.queueDeduplicationKey { queuedSourceKeys.insert(key) }
+            tally(row.state, by: 1)
+        }
+        scanCursor = min(scanCursor, items.count)
+        items.append(contentsOf: rows)
+    }
+
+    /// Recompute everything derived from `items`. Row offsets shift on removal,
+    /// so every path that removes or replaces rows ends here — all of them are
+    /// user actions or a one-off restore, never the per-tick event path.
+    private func rebuildDerivedState() {
+        counts = RowCounts()
+        indexByID.removeAll(keepingCapacity: true)
+        queuedSourceKeys.removeAll(keepingCapacity: true)
+        fractionalIDs.removeAll(keepingCapacity: true)
+        scanCursor = 0
+        indexByID.reserveCapacity(items.count)
+        for (offset, item) in items.enumerated() {
+            indexByID[item.id] = offset
+            if let key = item.source.queueDeduplicationKey { queuedSourceKeys.insert(key) }
+            tally(item.state, by: 1)
+            if !item.state.isFinished, item.state.fraction != nil { fractionalIDs.insert(item.id) }
+        }
+    }
 
     init(worker: @escaping UploadWorker,
          maxConcurrent: Int = 2,
@@ -178,20 +274,20 @@ final class UploadQueue: ObservableObject {
 
     // MARK: - Aggregates for the UI
 
-    var activeCount: Int { items.filter { !$0.state.isFinished }.count }
-    var failedCount: Int { items.filter { if case .failed = $0.state { return true }; return false }.count }
+    var activeCount: Int { counts.unfinished }
+    var failedCount: Int { counts.failed }
     /// Items held back because their bytes are only in iCloud. They are not
     /// stalled — they resume when the app is foregrounded — but they do sit in
     /// `activeCount`, so the UI has to be able to explain them.
-    var deferredForICloudCount: Int { items.filter { $0.state == .waitingForICloud }.count }
-    var isIdle: Bool { activeCount == 0 }
+    var deferredForICloudCount: Int { counts.waitingForICloud }
+    var isIdle: Bool { counts.unfinished == 0 }
+    /// Whether the activity list has anything to clear.
+    var hasFinishedItems: Bool { counts.finished > 0 }
     /// Whether any unfinished row can still make progress on its own. Rows
     /// parked on an iCloud download are unfinished but inert until the export
     /// can fetch their bytes, so a caller that waits on `activeCount` alone
-    /// would wait on them forever. `contains` so a large queue short-circuits.
-    var hasWorkableItems: Bool {
-        items.contains { !$0.state.isFinished && $0.state != .waitingForICloud }
-    }
+    /// would wait on them forever.
+    var hasWorkableItems: Bool { counts.unfinished > counts.waitingForICloud }
     var pauseReason: String? {
         haltReason
             ?? (isUserPaused ? "You paused backup. Tap Resume to continue." : nil)
@@ -199,10 +295,20 @@ final class UploadQueue: ObservableObject {
             ?? systemPauseReason
     }
     var retainedStagingURLs: Set<URL> { Set(items.compactMap { $0.checkpoint?.fileURL }) }
+    /// Cancelled and failed rows are excluded, finished ones count as a whole
+    /// item, and the only rows left with a moving fraction are the ones actually
+    /// in flight — so this sums at most `maxConcurrent` rows however long the
+    /// queue is. Both the dashboard hero and the activity header read it on
+    /// every publish, which is why it may not walk the queue.
     var overallFraction: Double {
-        let tracked = items.filter { !$0.state.isFinished || $0.state == .done || $0.state == .alreadyBackedUp }
-        guard !tracked.isEmpty else { return 0 }
-        return tracked.reduce(0) { $0 + ($1.state.fraction ?? 0) } / Double(tracked.count)
+        let tracked = counts.unfinished + counts.completed
+        guard tracked > 0 else { return 0 }
+        var sum = Double(counts.completed)
+        for id in fractionalIDs {
+            guard let index = indexByID[id] else { continue }
+            sum += items[index].state.fraction ?? 0
+        }
+        return sum / Double(tracked)
     }
 
     // MARK: - Commands
@@ -232,7 +338,9 @@ final class UploadQueue: ObservableObject {
         // identical row on every window, and a cancellation the user made
         // deliberately must not silently undo itself on the next scan. Both are
         // released by Retry or Clear Finished in the Activity UI.
-        var trackedKeys = completedSourceKeys.union(items.compactMap(\.source.queueDeduplicationKey))
+        // `queuedSourceKeys` tracks the rows already present, so this no longer
+        // rebuilds a key set over the whole queue every time a scan window runs.
+        var acceptedKeys: Set<String> = []
         for source in sources {
             if let limit, accepted.count >= max(0, limit) {
                 reachedLimit = true
@@ -240,7 +348,8 @@ final class UploadQueue: ObservableObject {
             }
             if skippingExisting {
                 if let key = source.queueDeduplicationKey {
-                    guard trackedKeys.insert(key).inserted else { continue }
+                    guard !completedSourceKeys.contains(key), !queuedSourceKeys.contains(key),
+                          acceptedKeys.insert(key).inserted else { continue }
                 } else {
                     let isAlreadyTracked = items.contains { $0.source == source }
                     if isAlreadyTracked || accepted.contains(where: { $0.source == source }) { continue }
@@ -248,19 +357,19 @@ final class UploadQueue: ObservableObject {
             }
             accepted.append(UploadItem(source: source))
         }
-        items.append(contentsOf: accepted)
+        appendRows(accepted)
         persistNow()
         pump()
         return EnqueueOutcome(accepted: accepted.map(\.id), reachedLimit: reachedLimit)
     }
 
     func cancel(_ id: UUID) {
-        guard let index = items.firstIndex(where: { $0.id == id }), !items[index].state.isFinished else { return }
+        guard let index = index(of: id), !items[index].state.isFinished else { return }
         userCancelled.insert(id)
         if let task = running[id] {
             task.cancel()
         } else {
-            items[index].state = .cancelled
+            setState(.cancelled, at: index)
             userCancelled.remove(id)
             requeueCancelled.remove(id)
             cleanCheckpoint(for: index)
@@ -292,7 +401,7 @@ final class UploadQueue: ObservableObject {
             } else {
                 userCancelled.remove(id)
                 requeueCancelled.remove(id)
-                items[index].state = .cancelled
+                setState(.cancelled, at: index)
                 cleanCheckpoint(for: index)
             }
         }
@@ -300,6 +409,7 @@ final class UploadQueue: ObservableObject {
         // set would silently discard the next single-row cancel as well.
         discardsCancelledRows = cancelledInFlight
         items.removeAll { $0.state == .cancelled }
+        rebuildDerivedState()
         persistNow()
     }
 
@@ -336,7 +446,7 @@ final class UploadQueue: ObservableObject {
     }
 
     func retry(_ id: UUID) {
-        guard let index = items.firstIndex(where: { $0.id == id }), items[index].state.isFinished,
+        guard let index = index(of: id), items[index].state.isFinished,
               items[index].state != .done, items[index].state != .alreadyBackedUp else { return }
         requeue(at: index)
         persistNow()
@@ -381,11 +491,12 @@ final class UploadQueue: ObservableObject {
 
     private func requeue(at index: Int) {
         items[index].attempts = 0
-        items[index].state = .queued
+        setState(.queued, at: index)
     }
 
     func clearFinished() {
         items.removeAll { $0.state.isFinished }
+        rebuildDerivedState()
         persistNow()
     }
 
@@ -418,6 +529,7 @@ final class UploadQueue: ObservableObject {
                   let key = item.source.queueDeduplicationKey else { return false }
             return keys.contains(key)
         }
+        rebuildDerivedState()
         if let accountIdentifier, let persistence {
             do {
                 try persistence.removeCompletedSourceKeys(keys, for: accountIdentifier)
@@ -456,6 +568,7 @@ final class UploadQueue: ObservableObject {
         }
         accountIdentifier = normalized
         items = []
+        rebuildDerivedState()
         completedSourceKeys = []
         completionLedgerHealthy = true
         haltReason = nil
@@ -498,6 +611,7 @@ final class UploadQueue: ObservableObject {
                 }
                 return item
             }
+            rebuildDerivedState()
             if persistence.storesCompletionLedgerSeparately,
                !snapshot.completedSourceKeys.isEmpty { persistNow() }
             pump()
@@ -580,7 +694,7 @@ final class UploadQueue: ObservableObject {
         options.allowsICloudDownload = allowed
         if allowed {
             for index in items.indices where items[index].state == .waitingForICloud {
-                items[index].state = .queued
+                setState(.queued, at: index)
             }
             persist()
             pump()
@@ -596,7 +710,7 @@ final class UploadQueue: ObservableObject {
             if Task.isCancelled { return false }
             if networkPauseReason != nil || systemPauseReason != nil { return false }
             if isUserPaused && running.isEmpty { return false }
-            if running.isEmpty && items.allSatisfy({ $0.state.isFinished || $0.state == .waitingForICloud }) {
+            if running.isEmpty && !hasWorkableItems {
                 return haltReason == nil
             }
             try? await Task.sleep(nanoseconds: 200_000_000)
@@ -625,20 +739,32 @@ final class UploadQueue: ObservableObject {
 
     private func pump() {
         guard haltReason == nil, networkPauseReason == nil, systemPauseReason == nil else { return }
-        while running.count < maxConcurrent, let index = items.firstIndex(where: {
-            guard $0.state == .queued else { return false }
-            let ownsBackgroundTransfer = $0.checkpoint?.isBackgroundTransfer == true
-            if drainsBackgroundCompletionsOnly { return ownsBackgroundTransfer }
-            if isUserPaused { return ownsBackgroundTransfer }
-            return true
-        }) {
-            start(items[index].id)
+        while running.count < maxConcurrent, let index = nextStartableIndex() {
+            start(at: index)
         }
     }
 
-    private func start(_ id: UUID) {
-        guard let index = items.firstIndex(where: { $0.id == id }) else { return }
-        items[index].state = .exporting
+    /// The next row that could start now, resuming from `scanCursor` instead of
+    /// the front of the queue. A full-library backup finishes rows front to
+    /// back, so scanning from zero on every completion re-walked the entire
+    /// finished prefix — the queue got slower the more of it had succeeded, and
+    /// the cost landed on the main actor between every pair of uploads.
+    private func nextStartableIndex() -> Int? {
+        while scanCursor < items.count {
+            if items[scanCursor].state == .queued {
+                // A pause still lets a row whose bytes are already moving in an
+                // iOS-owned background transfer come back to collect its result.
+                guard drainsBackgroundCompletionsOnly || isUserPaused else { return scanCursor }
+                if items[scanCursor].checkpoint?.isBackgroundTransfer == true { return scanCursor }
+            }
+            scanCursor += 1
+        }
+        return nil
+    }
+
+    private func start(at index: Int) {
+        let id = items[index].id
+        setState(.exporting, at: index)
         items[index].attempts += 1
         let source = items[index].source
         let checkpoint = items[index].checkpoint
@@ -657,14 +783,14 @@ final class UploadQueue: ObservableObject {
     }
 
     private func apply(_ event: UploadEvent, to id: UUID) {
-        guard let index = items.firstIndex(where: { $0.id == id }) else { return }
+        guard let index = index(of: id) else { return }
         switch event {
         case .described(let name, let byteCount):
             items[index].name = name; items[index].byteCount = byteCount
             persist()
         case .state(let state):
             guard !items[index].state.isFinished else { return }
-            items[index].state = state
+            setState(state, at: index)
         case .checkpoint(let checkpoint):
             items[index].checkpoint = checkpoint
             // The durable hand-off to the background transfer: this must be on
@@ -676,11 +802,12 @@ final class UploadQueue: ObservableObject {
     private func finish(_ id: UUID, _ outcome: Result<UploadOutcome, Error>) {
         running[id] = nil
         defer { pump() }
-        guard let index = items.firstIndex(where: { $0.id == id }) else { return }
+        guard let index = index(of: id) else { return }
         switch outcome {
         case .success(let result):
+            let settled: UploadItem.State = { if case .alreadyBackedUp = result { return .alreadyBackedUp } else { return .done } }()
             items[index].mediaKey = result.mediaKey
-            items[index].state = { if case .alreadyBackedUp = result { return .alreadyBackedUp } else { return .done } }()
+            setState(settled, at: index)
             if let key = items[index].source.queueDeduplicationKey { completedSourceKeys.insert(key) }
             items[index].checkpoint = nil
             recordCompletion(for: items[index])
@@ -688,10 +815,11 @@ final class UploadQueue: ObservableObject {
         case .failure(let error):
             if userCancelled.remove(id) != nil {
                 requeueCancelled.remove(id)
-                items[index].state = .cancelled
+                setState(.cancelled, at: index)
                 cleanCheckpoint(for: index)
                 if discardsCancelledRows {
                     items.remove(at: index)
+                    rebuildDerivedState()
                     if userCancelled.isEmpty { discardsCancelledRows = false }
                 }
                 persist()
@@ -699,20 +827,20 @@ final class UploadQueue: ObservableObject {
             }
             // Policy, credential and background-expiration pauses all cancel
             // in-flight work for requeue. A later pump restarts it unchanged.
-            if requeueCancelled.remove(id) != nil { items[index].state = .queued; persist(); return }
+            if requeueCancelled.remove(id) != nil { setState(.queued, at: index); persist(); return }
             if error is CancellationError {
-                items[index].state = .cancelled; cleanCheckpoint(for: index); persist(); return
+                setState(.cancelled, at: index); cleanCheckpoint(for: index); persist(); return
             }
             if error as? MediaExporter.Failure == .iCloudDownloadRequired {
                 items[index].attempts = max(0, items[index].attempts - 1)
-                items[index].state = .waitingForICloud
+                setState(.waitingForICloud, at: index)
                 persist()
                 return
             }
             let gpmc = error as? GPMCError
             let reason = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             if let gpmc, gpmc.kind == .credentialRejected || gpmc.kind == .tokenBound {
-                items[index].state = .queued
+                setState(.queued, at: index)
                 persist()
                 halt(gpmc)
                 return
@@ -720,11 +848,11 @@ final class UploadQueue: ObservableObject {
             let retryable = gpmc?.isRetryable ?? false
             if retryable, items[index].attempts < maxAttempts {
                 let attempt = items[index].attempts
-                items[index].state = .waitingToRetry(attempt: attempt)
+                setState(.waitingToRetry(attempt: attempt), at: index)
                 persist()
                 scheduleRetry(id, after: min(30, pow(2, Double(attempt))))
             } else {
-                items[index].state = .failed(reason: reason, retryable: retryable)
+                setState(.failed(reason: reason, retryable: retryable), at: index)
                 cleanCheckpoint(for: index)
                 persist()
             }
@@ -741,7 +869,7 @@ final class UploadQueue: ObservableObject {
     private func cancelRunningForRequeue(includingBackgroundTransfers: Bool = false) {
         for (id, task) in running {
             if !includingBackgroundTransfers,
-               let index = items.firstIndex(where: { $0.id == id }),
+               let index = index(of: id),
                items[index].checkpoint?.isBackgroundTransfer == true {
                 continue
             }
@@ -755,9 +883,9 @@ final class UploadQueue: ObservableObject {
         Task { [weak self] in
             await sleeper(seconds)
             guard let self else { return }
-            guard let index = self.items.firstIndex(where: { $0.id == id }) else { return }
+            guard let index = self.index(of: id) else { return }
             guard case .waitingToRetry = self.items[index].state else { return }
-            self.items[index].state = .queued
+            self.setState(.queued, at: index)
             self.persist()
             self.pump()
         }

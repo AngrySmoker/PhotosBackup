@@ -64,6 +64,35 @@ final class UploadQueueTests: XCTestCase {
         XCTFail("queue never settled: \(queue.items.map { "\($0.state)" })", file: file, line: line)
     }
 
+    /// The queue's aggregates, its id→offset map and its scan cursor are all
+    /// maintained incrementally so a full-library queue does not re-walk itself
+    /// on every progress tick. That trades a `filter` for state that can drift,
+    /// so check each aggregate against the definition it replaced.
+    private func assertAggregatesMatchRows(_ queue: UploadQueue,
+                                           file: StaticString = #filePath, line: UInt = #line) {
+        let rows = queue.items
+        XCTAssertEqual(queue.activeCount, rows.filter { !$0.state.isFinished }.count,
+                       "activeCount", file: file, line: line)
+        XCTAssertEqual(queue.failedCount,
+                       rows.filter { if case .failed = $0.state { return true }; return false }.count,
+                       "failedCount", file: file, line: line)
+        XCTAssertEqual(queue.deferredForICloudCount, rows.filter { $0.state == .waitingForICloud }.count,
+                       "deferredForICloudCount", file: file, line: line)
+        XCTAssertEqual(queue.isIdle, !rows.contains { !$0.state.isFinished },
+                       "isIdle", file: file, line: line)
+        XCTAssertEqual(queue.hasFinishedItems, rows.contains { $0.state.isFinished },
+                       "hasFinishedItems", file: file, line: line)
+        XCTAssertEqual(queue.hasWorkableItems,
+                       rows.contains { !$0.state.isFinished && $0.state != .waitingForICloud },
+                       "hasWorkableItems", file: file, line: line)
+        let tracked = rows.filter { !$0.state.isFinished || $0.state == .done || $0.state == .alreadyBackedUp }
+        let expected = tracked.isEmpty
+            ? 0
+            : tracked.reduce(0) { $0 + ($1.state.fraction ?? 0) } / Double(tracked.count)
+        XCTAssertEqual(queue.overallFraction, expected, accuracy: 0.000_001,
+                       "overallFraction", file: file, line: line)
+    }
+
     private var oneSource: [MediaSource] { [.file(URL(fileURLWithPath: "/dev/null"))] }
     private func sources(_ n: Int) -> [MediaSource] {
         (0..<n).map { .file(URL(fileURLWithPath: "/tmp/item-\($0)")) }
@@ -957,5 +986,110 @@ final class UploadQueueTests: XCTestCase {
         XCTAssertEqual(UploadPhase.sending(sent: 50, total: 200).itemState, .uploading(fraction: 0.25))
         XCTAssertEqual(UploadPhase.sending(sent: 1, total: 0).itemState, .uploading(fraction: 0))
         XCTAssertEqual(UploadPhase.finalizing.itemState, .finalizing)
+    }
+
+    // MARK: - Incrementally maintained aggregates
+
+    /// One pass over every transition the aggregates have to survive: rows in
+    /// flight, a permanent failure, a deferred iCloud row, a cancel, a retry
+    /// and a clear. Each of these used to be counted by walking the queue.
+    func testAggregatesTrackEveryTransitionTheQueueMakes() async {
+        let permanent = GPMCError(kind: .malformed, message: "bad media")
+        let script = WorkerScript([.succeed(.uploaded(mediaKey: "A")),
+                                   .fail(permanent),
+                                   .succeed(.alreadyBackedUp(mediaKey: "B")),
+                                   .fail(MediaExporter.Failure.iCloudDownloadRequired)],
+                                  fallback: .block)
+        let queue = makeQueue(script, maxConcurrent: 1, maxAttempts: 1)
+        queue.setICloudDownloadsAllowed(false)
+        assertAggregatesMatchRows(queue)
+
+        queue.enqueue(sources(5))
+        assertAggregatesMatchRows(queue)
+
+        // Rows one to four settle; the fifth blocks, so the queue is left with
+        // a working row alongside every terminal state at once.
+        await settle(queue) { queue.items[4].state.isWorking }
+        XCTAssertEqual(queue.items[1].state, .failed(reason: "bad media", retryable: false))
+        XCTAssertEqual(queue.items[3].state, .waitingForICloud)
+        assertAggregatesMatchRows(queue)
+
+        queue.cancel(queue.items[4].id)
+        await settle(queue) { queue.items[4].state == .cancelled }
+        assertAggregatesMatchRows(queue)
+
+        queue.retry(queue.items[1].id)
+        assertAggregatesMatchRows(queue)
+
+        queue.clearFinished()
+        assertAggregatesMatchRows(queue)
+    }
+
+    /// `overallFraction` no longer sums every row, only the ones actually in
+    /// flight plus a count of the finished ones — so a partly uploaded row has
+    /// to still move the bar.
+    func testOverallFractionCountsInFlightProgressAndFinishedRows() async {
+        let script = WorkerScript([.succeed(.uploaded(mediaKey: "A"))], fallback: .block)
+        let queue = makeQueue(script, maxConcurrent: 1, maxAttempts: 1)
+        queue.enqueue(sources(2))
+        // The scripted worker reports `.uploading(fraction: 0.5)` and then
+        // blocks, so row two is parked halfway with row one already done.
+        await settle(queue) { queue.items[1].state == .uploading(fraction: 0.5) }
+        XCTAssertEqual(queue.overallFraction, (1 + 0.525) / 2, accuracy: 0.000_001)
+        assertAggregatesMatchRows(queue)
+    }
+
+    /// The scan for the next row to start resumes where it left off instead of
+    /// walking the finished prefix again. Retrying a row the scan has already
+    /// passed therefore has to pull that scan back, or the retry would sit in
+    /// `.queued` forever while the queue reported itself busy.
+    func testRetryingAnEarlyRowStartsItAfterTheRestOfTheQueueDrained() async {
+        let script = WorkerScript([.fail(GPMCError(kind: .malformed, message: "bad media"))],
+                                  fallback: .succeed(.uploaded(mediaKey: "OK")))
+        let queue = makeQueue(script, maxConcurrent: 1, maxAttempts: 1)
+        queue.enqueue(sources(4))
+        await settle(queue) { queue.items.allSatisfy { $0.state.isFinished } }
+        XCTAssertEqual(queue.failedCount, 1)
+
+        queue.retry(queue.items[0].id)
+        await settle(queue) { queue.items[0].state == .done }
+        XCTAssertTrue(queue.isIdle)
+        assertAggregatesMatchRows(queue)
+    }
+
+    /// Same hazard from the other direction: while the queue is paused the scan
+    /// walks past rows it may not start, so resuming has to let it start over.
+    func testResumingStartsRowsThePausedScanAlreadyWalkedPast() async {
+        let script = WorkerScript([])
+        let queue = makeQueue(script, maxConcurrent: 1)
+        queue.pauseAfterCurrentUploads()
+        queue.enqueue(sources(3))
+        await settle(queue) { queue.items.allSatisfy { $0.state == .queued } }
+
+        queue.resumeUserPausedUploads()
+        await settle(queue) { queue.items.allSatisfy { $0.state == .done } }
+        assertAggregatesMatchRows(queue)
+    }
+
+    /// Removing rows shifts every offset after them, so the id→offset map has
+    /// to be rebuilt or a later event lands on the wrong row.
+    func testClearingFinishedRowsKeepsLaterRowsAddressable() async {
+        let script = WorkerScript([.succeed(.uploaded(mediaKey: "A"))], fallback: .block)
+        let queue = makeQueue(script, maxConcurrent: 1, maxAttempts: 1)
+        queue.enqueue(sources(3))
+        await settle(queue) { queue.items[1].state.isWorking }
+
+        queue.clearFinished()
+        XCTAssertEqual(queue.items.count, 2)
+        let workingID = queue.items[0].id
+        let waitingID = queue.items[1].id
+
+        queue.cancel(workingID)
+        await settle(queue) { queue.items[0].state == .cancelled }
+        // The cancel landed on the row whose id was passed, and the row behind
+        // it kept its identity and went on to start in its place.
+        XCTAssertEqual(queue.items[1].id, waitingID)
+        await settle(queue) { queue.items[1].state.isWorking }
+        assertAggregatesMatchRows(queue)
     }
 }

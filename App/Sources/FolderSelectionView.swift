@@ -49,7 +49,11 @@ struct FolderSelectionView: View {
             }
             .onChange(of: preferences.selectedAlbumIDs) { _ in refreshBackedUpCounts() }
             .onChange(of: albums.albums) { _ in refreshBackedUpCounts() }
-            .onChange(of: queue.items) { _ in refreshBackedUpCounts() }
+            // The completion ledger, not the rows: `items` changes on every
+            // progress tick, and each of those kicked off a fresh enumeration of
+            // every asset in every selected album. Only a finished upload can
+            // move a "N of M backed up" count.
+            .onChange(of: queue.completedSourceKeys) { _ in refreshBackedUpCounts() }
         }
         .navigationViewStyle(.stack)
     }
